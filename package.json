@@ -1,0 +1,57 @@
+{
+  "name": "pi-ultracode",
+  "version": "0.1.0",
+  "description": "Claude-Code-style \"ultracode\" for Pi: an effort mode that defaults to deterministic multi-agent workflow orchestration, with worktree isolation, per-agent model overrides, custom agent types, nested workflows, token budgets, resumable runs, and a /workflows manager.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "ultracode",
+    "workflow",
+    "workflows",
+    "agents",
+    "subagents",
+    "orchestration"
+  ],
+  "author": "pi-ultracode",
+  "license": "MIT",
+  "files": [
+    "extensions/",
+    "src/",
+    "types/",
+    "examples/",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/ultracode.ts"
+    ]
+  },
+  "exports": {
+    "./workflow": {
+      "types": "./types/workflow.d.ts"
+    }
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "acorn": "^8.11.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-agent-core": { "optional": true },
+    "@earendil-works/pi-ai": { "optional": true },
+    "@earendil-works/pi-coding-agent": { "optional": true },
+    "@earendil-works/pi-tui": { "optional": true },
+    "typebox": { "optional": true }
+  }
+}
