@@ -5,6 +5,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import extension from "../extensions/ultracode.ts";
 import { createWorkflowTool } from "../src/workflow/tool.ts";
+import { getRegistry } from "../src/workflow/registry.ts";
+import { createSnapshot } from "../src/workflow/display.ts";
 
 function makeMockPi(flagValues: Record<string, unknown> = {}) {
   const state = {
@@ -44,19 +46,22 @@ function makeMockPi(flagValues: Record<string, unknown> = {}) {
 
 function makeCtx(state: any) {
   const notifications: Array<{ m: string; l: string }> = [];
+  const widgets: Record<string, unknown> = {};
   const ctx: any = {
     ui: {
       notify: (m: string, l: string) => notifications.push({ m, l }),
       setStatus: (k: string, v: unknown) => {
         state.statuses[k] = v;
       },
-      setWidget: () => {},
+      setWidget: (k: string, v: unknown) => {
+        widgets[k] = v;
+      },
     },
     hasUI: true,
     cwd: process.cwd(),
     sessionManager: { getEntries: () => state.entries },
   };
-  return { ctx, notifications };
+  return { ctx, notifications, widgets };
 }
 
 test("extension registers the workflow tool, commands, and flag", () => {
@@ -144,6 +149,30 @@ test("--ultracode flag enables the mode at session_start", () => {
   const { ctx } = makeCtx(state);
   state.events.get("session_start")![0]({ reason: "startup" }, ctx);
   assert.equal(state.thinking, "xhigh");
+});
+
+test("/workflows toggles the run panel and /workflows clear hides it", async () => {
+  const { pi, state } = makeMockPi();
+  extension(pi);
+  const { ctx, widgets } = makeCtx(state);
+
+  const snap = createSnapshot({ name: "demo", description: "x" }, "wf_paneltest", null);
+  snap.status = "completed";
+  getRegistry().register("wf_paneltest", snap, () => {});
+
+  const handler = state.commands.get("workflows").handler;
+  const KEY = "ultracode-workflows";
+
+  await handler("", ctx);
+  assert.ok(Array.isArray(widgets[KEY]), "bare /workflows shows the panel");
+
+  await handler("", ctx);
+  assert.equal(widgets[KEY], undefined, "bare /workflows again hides the panel");
+
+  await handler("", ctx); // show again
+  assert.ok(Array.isArray(widgets[KEY]));
+  await handler("clear", ctx);
+  assert.equal(widgets[KEY], undefined, "/workflows clear hides the panel");
 });
 
 test("workflow tool executes a script end-to-end with an injected runner", async () => {

@@ -77,10 +77,15 @@ Press `Esc` to cancel; running subagents are aborted and surfaced as skipped.
 ### Manage runs
 
 ```text
-/workflows               # list recent + active runs (widget above the editor)
-/workflows wf_ab12-3     # inspect one run
-/workflows abort         # abort all active runs
+/workflows               # toggle the run panel above the editor (run again to hide)
+/workflows wf_ab12-3     # show one run's detail
+/workflows clear         # hide the panel
+/workflows abort         # abort all active runs (and hide the panel)
 ```
+
+The panel is a static snapshot taken when you run the command, so re-run
+`/workflows` to refresh it, or `/workflows clear` to dismiss it. Live progress
+while a workflow runs is shown inline in the tool result, not in this panel.
 
 ## Workflow script shape
 

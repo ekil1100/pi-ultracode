@@ -66,34 +66,67 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
     },
   });
 
+  // Tracks whether the run panel is currently shown, so bare /workflows toggles it.
+  let panelVisible = false;
+
   pi.registerCommand("workflows", {
-    description: "Show recent and in-flight workflow runs. Usage: /workflows [runId|abort]",
+    description: "Toggle the workflow-run panel. Usage: /workflows [runId | clear | abort]",
+    getArgumentCompletions(prefix: string) {
+      return ["clear", "abort"]
+        .filter((s) => s.startsWith(prefix))
+        .map((value) => ({ value, label: value }));
+    },
     handler: async (args: string, ctx) => {
       const registry = getRegistry();
       const arg = args.trim();
+      const sub = arg.toLowerCase();
 
-      if (arg === "abort") {
+      const hide = () => {
+        ctx.ui.setWidget("ultracode-workflows", undefined);
+        panelVisible = false;
+      };
+      const show = (lines: string[]) => {
+        ctx.ui.setWidget("ultracode-workflows", lines);
+        panelVisible = true;
+      };
+
+      if (sub === "clear" || sub === "hide" || sub === "off") {
+        hide();
+        ctx.ui.notify("Workflow panel hidden.", "info");
+        return;
+      }
+
+      if (sub === "abort") {
         registry.abortAll();
-        ctx.ui.notify("Requested abort of all active workflow runs.", "info");
+        hide();
+        ctx.ui.notify("Requested abort of all active workflow runs; panel hidden.", "info");
         return;
       }
 
       const runs = registry.list();
-      if (runs.length === 0) {
-        ctx.ui.notify("No workflow runs in this session yet.", "info");
-        ctx.ui.setWidget("ultracode-workflows", undefined);
-        return;
-      }
 
+      // Explicit run id -> show that run's detail.
       if (arg) {
         const handle = registry.get(arg) ?? runs.find((r) => r.snapshot.runId?.startsWith(arg));
         if (!handle) {
-          ctx.ui.notify(`No workflow run matching "${arg}".`, "warn");
+          ctx.ui.notify(`No workflow run matching "${arg}". /workflows to list, /workflows clear to hide.`, "warn");
           return;
         }
-        const lines = renderWorkflowLines(handle.snapshot, { maxAgents: 12, maxLogs: 6, showResultPreviews: true });
-        ctx.ui.setWidget("ultracode-workflows", lines);
-        ctx.ui.notify(lines[0] ?? "workflow", "info");
+        show(renderWorkflowLines(handle.snapshot, { maxAgents: 12, maxLogs: 6, showResultPreviews: true }));
+        ctx.ui.notify(`Showing ${handle.snapshot.runId ?? "run"}. /workflows clear to hide.`, "info");
+        return;
+      }
+
+      // Bare /workflows toggles the panel off if it's already up.
+      if (panelVisible) {
+        hide();
+        ctx.ui.notify("Workflow panel hidden.", "info");
+        return;
+      }
+
+      if (runs.length === 0) {
+        hide();
+        ctx.ui.notify("No workflow runs in this session yet.", "info");
         return;
       }
 
@@ -103,8 +136,11 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
           s.runningCount ? ` (${s.runningCount} running)` : ""
         }`;
       });
-      ctx.ui.setWidget("ultracode-workflows", ["◆ Ultracode workflow runs", ...summary.map((l) => `  ${l}`)]);
-      ctx.ui.notify(`${runs.length} workflow run(s). ${registry.active().length} active. See the widget above the editor.`, "info");
+      show(["◆ Ultracode workflow runs  ·  /workflows clear to hide", ...summary.map((l) => `  ${l}`)]);
+      ctx.ui.notify(
+        `${runs.length} run(s), ${registry.active().length} active. /workflows again (or /workflows clear) to hide.`,
+        "info",
+      );
     },
   });
 }
