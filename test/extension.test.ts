@@ -241,3 +241,97 @@ test("workflow tool resumes a prior run from its journal", async () => {
 
   fs.rmSync(sessionDir, { recursive: true, force: true });
 });
+
+test("workflow tool forwards the ultracode applied thinking level to runWorkflow", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-think-"));
+  try {
+    let captured: { thinkingLevel?: string; budget?: number | null } = {};
+    const fakeRun = async (_script: string, options: any) => {
+      captured.thinkingLevel = options.thinkingLevel;
+      captured.budget = options.tokenBudget;
+      return {
+        meta: { name: "x", description: "x" },
+        result: { ok: true },
+        logs: [],
+        phases: [],
+        agentCount: 1,
+        cachedCount: 0,
+        spentTokens: 0,
+        durationMs: 1,
+      };
+    };
+    const tool = createWorkflowTool({
+      getThinkingLevel: () => "xhigh",
+      runWorkflowFn: fakeRun as any,
+    });
+    const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+    const script = `export const meta = { name: 'x', description: 'x' }\nagent('a', { label: 'a' })`;
+    await tool.execute("tc1", { script } as any, undefined, undefined, ctx);
+    assert.equal(captured.thinkingLevel, "xhigh", "applied thinking level is forwarded to runWorkflow");
+  } finally {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool forwards thinkingLevel=undefined when no getThinkingLevel is wired (ultracode off)", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-think2-"));
+  try {
+    let capturedThinking: unknown = "SENTINEL";
+    const fakeRun = async (_script: string, options: any) => {
+      capturedThinking = options.thinkingLevel;
+      return {
+        meta: { name: "x", description: "x" },
+        result: {},
+        logs: [],
+        phases: [],
+        agentCount: 0,
+        cachedCount: 0,
+        spentTokens: 0,
+        durationMs: 1,
+      };
+    };
+    const tool = createWorkflowTool({ runWorkflowFn: fakeRun as any });
+    const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+    const script = `export const meta = { name: 'x', description: 'x' }\nreturn 1`;
+    await tool.execute("tc2", { script } as any, undefined, undefined, ctx);
+    assert.equal(capturedThinking, undefined, "no thinking override when ultracode is off");
+  } finally {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
+test("extension wires getThinkingLevel so the registered tool forwards xhigh when ultracode is on", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-think-ext-"));
+  try {
+    let capturedThinking: unknown = "SENTINEL";
+    const fakeRun = async (_script: string, options: any) => {
+      capturedThinking = options.thinkingLevel;
+      return {
+        meta: { name: "x", description: "x" },
+        result: {},
+        logs: [],
+        phases: [],
+        agentCount: 0,
+        cachedCount: 0,
+        spentTokens: 0,
+        durationMs: 1,
+      };
+    };
+    // Go through the REAL extension entrypoint (with a runWorkflowFn seam) so the
+    // extension->tool handoff (getThinkingLevel wiring) is exercised, not bypassed.
+    const { pi, state } = makeMockPi();
+    extension(pi, { runWorkflowFn: fakeRun as any });
+    const { ctx } = makeCtx(state);
+
+    // Enable ultracode (raises main thinking to xhigh + wires subagent forwarding).
+    await state.commands.get("ultracode").handler("on", ctx);
+
+    const tool = state.tools[0];
+    const execCtx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+    const script = `export const meta = { name: 'x', description: 'x' }\nreturn 1`;
+    await tool.execute("tc3", { script } as any, undefined, undefined, execCtx);
+    assert.equal(capturedThinking, "xhigh", "extension wires getThinkingLevel so subagents get xhigh when ultracode is on");
+  } finally {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+});

@@ -27,7 +27,9 @@ import {
   hasChanges,
   isGitRepo,
   removeWorktree,
+  writeRescuePatch,
   type Worktree,
+  type WorktreeDiff,
 } from "./worktree.ts";
 
 const MAX_CONCURRENCY = 16;
@@ -238,6 +240,7 @@ class Runtime {
     const run = this.limiter(async () => {
       this.options.onAgentStart?.({ id, label, phase: assignedPhase, prompt, cached: false });
       let worktree: Worktree | undefined;
+      let keepWorktree = false;
       try {
         this.throwIfAborted();
         const agentTypeDef = resolveAgentType(opts.agentType, this.agentTypes);
@@ -259,7 +262,7 @@ class Runtime {
         });
         this.throwIfAborted();
 
-        if (worktree) await this.integrateWorktree(worktree, label, log => this.state.logs.push(log));
+        if (worktree) keepWorktree = await this.integrateWorktree(worktree, id, label);
 
         this.state.spent += result.usage.outputTokens;
         this.options.journal?.recordAgent({
@@ -278,7 +281,7 @@ class Runtime {
         this.options.onAgentEnd?.({ id, label, phase: assignedPhase, result: null, status: "error" });
         return null;
       } finally {
-        if (worktree) {
+        if (worktree && !keepWorktree) {
           try {
             removeWorktree(worktree);
           } catch {
@@ -376,21 +379,81 @@ class Runtime {
     }
   }
 
-  private async integrateWorktree(worktree: Worktree, label: string, _log: (m: string) => void): Promise<void> {
-    const diff = captureWorktreeDiff(worktree);
-    if (!hasChanges(diff)) {
-      this.logLine(`worktree[${label}]: no changes (auto-removed)`);
-      return;
+  /**
+   * Fold a worktree's changes back into the shared working tree. Returns true
+   * when the worktree must be KEPT (its changes are not safely preserved
+   * elsewhere — e.g. apply conflicted AND the rescue write failed). Never throws:
+   * a writeback failure must not discard the agent's already-completed result
+   * or its token spend.
+   */
+  private async integrateWorktree(worktree: Worktree, id: number, label: string): Promise<boolean> {
+    // Outer safety net: a writeback/integration failure (including a host
+    // onUpdate callback throwing during a log line) must never discard the
+    // agent's completed work. Fail-safe toward KEEPING the worktree.
+    try {
+      let diff: WorktreeDiff;
+      try {
+        diff = captureWorktreeDiff(worktree);
+      } catch (error) {
+        this.logLine(
+          `worktree[${label}]: diff capture failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} (branch ${worktree.branch}) — recover with: git -C ${worktree.path} diff`,
+        );
+        return true;
+      }
+      if (!hasChanges(diff)) {
+        this.logLine(`worktree[${label}]: no changes (auto-removed)`);
+        return false;
+      }
+      // Apply patches back to the shared tree sequentially to avoid corruption.
+      let keep = false;
+      await this.applyLock.run(async () => {
+        const applied = applyPatch(this.cwd, diff.patch);
+        if (applied) {
+          this.logLine(
+            `worktree[${label}]: ${diff.filesChanged} file(s), +${diff.insertions}/-${diff.deletions} applied to working tree`,
+          );
+          return;
+        }
+        // 3-way conflict: `applyPatch` already reverted the shared tree to its
+        // pre-apply state. Persist the patch so the agent's work is recoverable
+        // before the worktree is removed.
+        const runId = this.options.journal
+          ? path.basename(this.options.journal.filePath, ".jsonl")
+          : "run";
+        const rescueDir = this.rescueDir();
+        try {
+          const rescue = writeRescuePatch(rescueDir, runId, id, label, diff.patch);
+          this.logLine(
+            `worktree[${label}]: ${diff.filesChanged} file(s), +${diff.insertions}/-${diff.deletions} could NOT be auto-applied (3-way conflict); patch saved to ${rescue} — review and apply with: git apply --3way ${rescue}`,
+          );
+        } catch (error) {
+          // Rescue write failed (disk full / permission / bad path). Keep the
+          // worktree so the user can recover the changes manually.
+          keep = true;
+          this.logLine(
+            `worktree[${label}]: ${diff.filesChanged} file(s) could NOT be auto-applied (3-way conflict) AND rescue write failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} (branch ${worktree.branch}) — recover with: git -C ${worktree.path} diff`,
+          );
+        }
+      });
+      return keep;
+    } catch (error) {
+      try {
+        this.logLine(
+          `worktree[${label}]: integration failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} (branch ${worktree.branch}) — recover with: git -C ${worktree.path} diff`,
+        );
+      } catch {
+        // best-effort logging
+      }
+      return true;
     }
-    // Apply patches back to the shared tree sequentially to avoid corruption.
-    await this.applyLock.run(async () => {
-      const applied = applyPatch(this.cwd, diff.patch);
-      this.logLine(
-        `worktree[${label}]: ${diff.filesChanged} file(s), +${diff.insertions}/-${diff.deletions} ${
-          applied ? "applied to working tree" : "could NOT be auto-applied (review the patch manually)"
-        }`,
-      );
-    });
+  }
+
+  /** Where to write rescue patches: the session runs dir (co-located with the
+   *  journal, never inside the repo working tree), or .pi/ultracode/patches. */
+  private rescueDir(): string {
+    const journalDir = this.options.journal ? path.dirname(this.options.journal.filePath) : undefined;
+    if (journalDir) return path.join(journalDir, "patches");
+    return path.join(this.cwd, ".pi", "ultracode", "patches");
   }
 
   private track(promise: Promise<unknown>): void {

@@ -50,6 +50,16 @@ export class UltracodeMode {
     return this.appliedThinking;
   }
 
+  /** The effort level to forward to workflow subagents: xhigh when ultracode is
+   *  on, so each subagent's own session clamps it to THAT subagent model's max
+   *  (mirroring the parent's "request xhigh, clamp per model" contract). This
+   *  keeps subagents at their respective model's max even when they run a
+   *  different model than the parent. Undefined when off, so subagents fall back
+   *  to the session default. */
+  getSubagentThinkingLevel(): ThinkingLevel | undefined {
+    return this.enabled ? "xhigh" : undefined;
+  }
+
   isEnabled(): boolean {
     return this.enabled;
   }

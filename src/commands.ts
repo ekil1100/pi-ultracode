@@ -109,7 +109,7 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
       if (arg) {
         const handle = registry.get(arg) ?? runs.find((r) => r.snapshot.runId?.startsWith(arg));
         if (!handle) {
-          ctx.ui.notify(`No workflow run matching "${arg}". /workflows to list, /workflows clear to hide.`, "warn");
+          ctx.ui.notify(`No workflow run matching "${arg}". /workflows to list, /workflows clear to hide.`, "warning");
           return;
         }
         show(renderWorkflowLines(handle.snapshot, { maxAgents: 12, maxLogs: 6, showResultPreviews: true }));

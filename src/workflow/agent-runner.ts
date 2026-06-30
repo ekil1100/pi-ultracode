@@ -173,31 +173,14 @@ export class WorkflowAgentRunner {
     pattern: string | undefined,
     role: AgentTypeDef | undefined,
   ): { model?: ModelLike; thinkingLevel?: ThinkingLevel } {
-    const effectivePattern = pattern ?? role?.model;
-    const thinkingFromRole = role?.thinking;
-    if (!effectivePattern) {
-      return { model: this.defaultModel, thinkingLevel: thinkingFromRole ?? this.defaultThinking };
-    }
-    const { base, thinking } = splitThinkingSuffix(effectivePattern);
-    const model = this.matchModel(base) ?? this.defaultModel;
-    return { model, thinkingLevel: thinking ?? thinkingFromRole ?? this.defaultThinking };
-  }
-
-  private matchModel(pattern: string): ModelLike | undefined {
-    if (!this.modelRegistry) return undefined;
-    const models = this.modelRegistry.getAvailable();
-    const lower = pattern.toLowerCase();
-    const slash = lower.includes("/");
-    // 1. exact provider/id, 2. exact id, 3. substring on id / provider/id / name.
-    return (
-      models.find((m) => `${m.provider}/${m.id}`.toLowerCase() === lower) ??
-      models.find((m) => m.id.toLowerCase() === lower) ??
-      models.find((m) =>
-        slash
-          ? `${m.provider}/${m.id}`.toLowerCase().includes(lower)
-          : m.id.toLowerCase().includes(lower) || (m.name?.toLowerCase().includes(lower) ?? false),
-      )
-    );
+    return resolveModelSelection({
+      pattern,
+      roleModel: role?.model,
+      roleThinking: role?.thinking,
+      defaultModel: this.defaultModel,
+      defaultThinking: this.defaultThinking,
+      models: this.modelRegistry?.getAvailable(),
+    });
   }
 }
 
@@ -206,9 +189,59 @@ const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium
 export function splitThinkingSuffix(pattern: string): { base: string; thinking?: ThinkingLevel } {
   const idx = pattern.lastIndexOf(":");
   if (idx === -1) return { base: pattern };
-  const suffix = pattern.slice(idx + 1).trim() as ThinkingLevel;
+  const raw = pattern.slice(idx + 1).trim();
+  const suffix = raw as ThinkingLevel;
   if (THINKING_LEVELS.has(suffix)) return { base: pattern.slice(0, idx).trim(), thinking: suffix };
+  // Trailing colon with no/invalid suffix (e.g. "sonnet:"): strip it so the base
+  // is still matchable instead of silently falling back to the default model.
+  if (raw === "") return { base: pattern.slice(0, idx).trim() };
   return { base: pattern };
+}
+
+/** Match a model pattern against a registry list: exact provider/id, then exact id, then substring. */
+export function matchModelIn(models: ModelLike[] | undefined, pattern: string): ModelLike | undefined {
+  if (!models) return undefined;
+  // An empty pattern must never match: "any-id".includes("") === true would
+  // otherwise silently return the FIRST registered model.
+  if (!pattern.trim()) return undefined;
+  const lower = pattern.trim().toLowerCase();
+  const slash = lower.includes("/");
+  // 1. exact provider/id, 2. exact id, 3. substring on id / provider/id / name.
+  return (
+    models.find((m) => `${m.provider}/${m.id}`.toLowerCase() === lower) ??
+    models.find((m) => m.id.toLowerCase() === lower) ??
+    models.find((m) =>
+      slash
+        ? `${m.provider}/${m.id}`.toLowerCase().includes(lower)
+        : m.id.toLowerCase().includes(lower) || (m.name?.toLowerCase().includes(lower) ?? false),
+    )
+  );
+}
+
+/**
+ * Resolve the model + thinking level for an agent() call.
+ *
+ * `pattern` may carry a thinking suffix like "anthropic/claude:high". A bare
+ * ":high" (empty base) means "keep the default model, only override thinking" —
+ * it must NOT fall through to matching an empty string, which would silently
+ * pick the first registered model (`id.includes("") === true`).
+ */
+export function resolveModelSelection(args: {
+  pattern?: string;
+  roleModel?: string;
+  roleThinking?: ThinkingLevel;
+  defaultModel?: ModelLike;
+  defaultThinking?: ThinkingLevel;
+  models?: ModelLike[];
+}): { model?: ModelLike; thinkingLevel?: ThinkingLevel } {
+  const { pattern, roleModel, roleThinking, defaultModel, defaultThinking, models } = args;
+  const effectivePattern = pattern ?? roleModel;
+  if (!effectivePattern) {
+    return { model: defaultModel, thinkingLevel: roleThinking ?? defaultThinking };
+  }
+  const { base, thinking } = splitThinkingSuffix(effectivePattern);
+  const model = base ? matchModelIn(models, base) ?? defaultModel : defaultModel;
+  return { model, thinkingLevel: thinking ?? roleThinking ?? defaultThinking };
 }
 
 function readUsage(session: any): AgentUsage {

@@ -8,15 +8,17 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { createWorkflowTool } from "../src/workflow/tool.ts";
+import { createWorkflowTool, type WorkflowToolDeps } from "../src/workflow/tool.ts";
 import { UltracodeMode } from "../src/mode.ts";
 import { registerCommands } from "../src/commands.ts";
 
-export default function extension(pi: ExtensionAPI): void {
+export default function extension(pi: ExtensionAPI, extraDeps: Partial<WorkflowToolDeps> = {}): void {
   const mode = new UltracodeMode("workflow");
 
   const workflowTool = createWorkflowTool({
     getDefaultBudget: () => mode.getBudget(),
+    getThinkingLevel: () => mode.getSubagentThinkingLevel(),
+    ...extraDeps,
   });
   pi.registerTool(workflowTool);
 

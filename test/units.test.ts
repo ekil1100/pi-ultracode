@@ -146,3 +146,12 @@ test("parseBudget understands k/m/raw and + prefix", () => {
   assert.equal(parseBudget("1.5m"), 1_500_000);
   assert.equal(parseBudget("garbage"), null);
 });
+
+test("UltracodeMode.getSubagentThinkingLevel: xhigh when enabled, undefined when off", () => {
+  const m = new UltracodeMode("workflow");
+  assert.equal(m.getSubagentThinkingLevel(), undefined, "off before enable");
+  m.enable(miniPi().api);
+  assert.equal(m.getSubagentThinkingLevel(), "xhigh", "xhigh to forward when on");
+  m.disable(miniPi().api);
+  assert.equal(m.getSubagentThinkingLevel(), undefined, "undefined again after disable");
+});

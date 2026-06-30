@@ -40,6 +40,16 @@ function tryGit(cwd: string, args: string[]): string | undefined {
   }
 }
 
+/** Like tryGit but does NOT `.trim()` — required for `git diff --binary` output,
+ *  whose trailing blank lines are part of the patch format and must not be stripped. */
+function tryGitRaw(cwd: string, args: string[]): string | undefined {
+  try {
+    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch {
+    return undefined;
+  }
+}
+
 export function isGitRepo(cwd: string): boolean {
   return tryGit(cwd, ["rev-parse", "--is-inside-work-tree"]) === "true";
 }
@@ -79,9 +89,12 @@ export function createWorktree(cwd: string, runId: string, index: number): Workt
 /** Stage everything and capture the diff vs the base commit. */
 export function captureWorktreeDiff(worktree: Worktree): WorktreeDiff {
   tryGit(worktree.path, ["add", "-A"]);
-  const numstat = tryGit(worktree.path, ["diff", "--cached", "--numstat", worktree.baseCommit]) ?? "";
-  const diffStat = tryGit(worktree.path, ["diff", "--cached", "--stat", worktree.baseCommit]) ?? "";
-  const patch = tryGit(worktree.path, ["diff", "--cached", worktree.baseCommit]) ?? "";
+  // core.quotepath=false keeps non-ASCII paths unquoted in the patch text (so
+  // applyPatch's path parser targets the real file); --binary carries literal
+  // binary patch data so binary changes are applicable + recoverable.
+  const numstat = tryGit(worktree.path, ["-c", "core.quotepath=false", "diff", "--cached", "--numstat", worktree.baseCommit]) ?? "";
+  const diffStat = tryGit(worktree.path, ["-c", "core.quotepath=false", "diff", "--cached", "--stat", worktree.baseCommit]) ?? "";
+  const patch = tryGitRaw(worktree.path, ["-c", "core.quotepath=false", "diff", "--cached", "--binary", worktree.baseCommit]) ?? "";
 
   let filesChanged = 0;
   let insertions = 0;
@@ -103,12 +116,28 @@ export function hasChanges(diff: WorktreeDiff): boolean {
 /** Apply a captured patch back onto the original working tree. */
 export function applyPatch(cwd: string, patch: string): boolean {
   if (!patch.trim()) return false;
+  const paths = patchedFiles(patch);
+  // Snapshot the pre-apply working-tree content of every path the patch touches,
+  // so a failed apply (which leaves conflict markers + an unmerged index) can be
+  // reverted to exactly this state, preserving any pre-existing uncommitted edits.
+  const before = new Map<string, Buffer | null>();
+  for (const p of paths) {
+    try {
+      before.set(p, fs.readFileSync(path.join(cwd, p)));
+    } catch {
+      before.set(p, null); // path does not exist yet (the patch adds it)
+    }
+  }
   const tmp = path.join(os.tmpdir(), `ultracode-patch-${process.pid}-${cwd.length}.patch`);
   try {
     fs.writeFileSync(tmp, patch.endsWith("\n") ? patch : `${patch}\n`);
     git(cwd, ["apply", "--3way", tmp]);
     return true;
   } catch {
+    // `git apply --3way` on a real conflict writes conflict markers into the file
+    // and leaves an unmerged (UU) index entry; `git checkout --` then refuses with
+    // "path is unmerged". Reset the index entry and restore the pre-apply content.
+    revertPatchedPaths(cwd, paths, before);
     return false;
   } finally {
     try {
@@ -117,6 +146,88 @@ export function applyPatch(cwd: string, patch: string): boolean {
       // ignore
     }
   }
+}
+
+/** Every path a patch touches (adds, modifies, deletes, renames). Parses the
+ *  `+++ b/<path>`, `--- a/<path>`, and `diff --git a/<x> b/<y>` headers, skipping
+ *  `/dev/null`. Deletions (`+++ /dev/null`) are captured via their `--- a/` side
+ *  so a failed apply can restore the deleted file too. */
+function patchedFiles(patch: string): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (p: string) => {
+    if (p && p !== "/dev/null" && !seen.has(p)) {
+      seen.add(p);
+      out.push(p);
+    }
+  };
+  for (const line of patch.split("\n")) {
+    let m = line.match(/^\+\+\+ b\/(.+)$/);
+    if (m) {
+      push(m[1]);
+      continue;
+    }
+    m = line.match(/^--- a\/(.+)$/);
+    if (m) {
+      push(m[1]);
+      continue;
+    }
+    m = line.match(/^diff --git a\/(.+) b\/(.+)$/);
+    if (m) {
+      push(m[1]);
+      push(m[2]);
+    }
+  }
+  return out;
+}
+
+/** Restore patched paths to their pre-apply state, clearing conflict markers + UU index. */
+function revertPatchedPaths(
+  cwd: string,
+  paths: string[],
+  before: Map<string, Buffer | null>,
+): void {
+  for (const p of paths) {
+    // Clear any unmerged index entry left by `git apply --3way` (idempotent).
+    tryGit(cwd, ["reset", "HEAD", "--", p]);
+    const prev = before.get(p);
+    if (prev == null) {
+      // Path did not exist before apply; remove any marker file the conflict wrote.
+      try {
+        fs.rmSync(path.join(cwd, p), { force: true });
+      } catch {
+        // ignore
+      }
+    } else {
+      try {
+        fs.writeFileSync(path.join(cwd, p), prev);
+      } catch {
+        // best-effort revert
+      }
+    }
+  }
+}
+
+/**
+ * Persist a patch that could not be auto-applied (3-way conflict) to a durable
+ * file under `<dir>/<runId>-<id>-<label>.patch`. Called before the worktree is
+ * force-removed so the agent's changes are recoverable instead of lost. Includes
+ * the agent sequence id so two same-label agents in one run don't overwrite each
+ * other's rescue patch.
+ */
+export function writeRescuePatch(
+  dir: string,
+  runId: string,
+  id: number,
+  label: string,
+  patch: string,
+): string {
+  fs.mkdirSync(dir, { recursive: true });
+  const safeRun = runId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || "run";
+  const safeLabel = label.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40) || "agent";
+  const file = path.join(dir, `${safeRun}-${id}-${safeLabel}.patch`);
+  fs.writeFileSync(file, patch.endsWith("\n") ? patch : `${patch}\n`);
+  return file;
 }
 
 export function removeWorktree(worktree: Worktree): void {

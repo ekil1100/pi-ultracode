@@ -18,9 +18,13 @@ export { parseWorkflowScript, normalizeScript, type WorkflowMeta, type WorkflowM
 export { jsonSchemaToTypeBox } from "./workflow/json-schema.ts";
 export {
   WorkflowAgentRunner,
+  resolveModelSelection,
+  matchModelIn,
   type AgentRunCall,
   type AgentRunResult,
   type ThinkingLevel,
+  type ModelLike,
+  type ModelRegistryLike,
 } from "./workflow/agent-runner.ts";
 export { createStructuredOutputTool, type StructuredOutputCapture } from "./workflow/structured-output.ts";
 export {
@@ -45,6 +49,7 @@ export {
   captureWorktreeDiff,
   removeWorktree,
   applyPatch,
+  writeRescuePatch,
   isGitRepo,
   type Worktree,
 } from "./workflow/worktree.ts";

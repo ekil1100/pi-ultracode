@@ -17,7 +17,8 @@ import {
 } from "../prompts.ts";
 import { parseWorkflowScript, normalizeScript } from "./parser.ts";
 import { runWorkflow } from "./runtime.ts";
-import { RunJournal } from "./journal.ts";
+import type { ThinkingLevel } from "./agent-runner.ts";
+import { RunJournal, hashString } from "./journal.ts";
 import { getRegistry } from "./registry.ts";
 import {
   createSnapshot,
@@ -57,10 +58,18 @@ const workflowToolSchema = Type.Object({
 export interface WorkflowToolDeps {
   /** Default token budget from ultracode mode, if any. */
   getDefaultBudget?: () => number | null;
-  /** Notify the user that a run finished (used for long runs). */
-  notify?: (message: string, level: "info" | "warn" | "error") => void;
+  /** The ultracode effort level to forward to every workflow subagent as its
+   *  default thinking level (xhigh when ultracode is on, so each subagent's own
+   *  session clamps it to that subagent model's max; undefined when off). Lets
+   *  subagents inherit the parent's ultracode effort instead of falling back to
+   *  the session default. A per-call `model: "X:level"` suffix or an agentType
+   *  `thinking:` override still takes precedence. */
+  getThinkingLevel?: () => ThinkingLevel | undefined;
   /** Test seam: inject a subagent runner so the tool path can run without a model. */
   testRunner?: { run: (call: any) => Promise<any> };
+  /** Test seam: override the workflow runtime (lets tests capture the options,
+   *  including the forwarded thinkingLevel, without spinning up real subagents). */
+  runWorkflowFn?: typeof runWorkflow;
 }
 
 let runCounter = 0;
@@ -86,6 +95,11 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       const runsDir = runsDirFor(ctx);
       const runId = params.resumeFromRunId?.trim() || nextRunId();
       const budgetTotal = params.budget ?? deps.getDefaultBudget?.() ?? null;
+      // Forward the RAW ultracode effort level (xhigh) so each subagent's own
+      // createAgentSession clamps it to THAT subagent model's max — mirroring the
+      // parent's "request xhigh, clamp per model" contract. Undefined when off.
+      const thinkingLevel = deps.getThinkingLevel?.();
+      const run = deps.runWorkflowFn ?? runWorkflow;
 
       // Persist the script next to the session for resume / inspection.
       const scriptPath = path.join(runsDir, `${runId}.workflow.js`);
@@ -101,7 +115,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         type: "run" as const,
         runId,
         name: parsed.meta.name,
-        scriptHash: String(script.length),
+        scriptHash: hashString(script),
         args: params.args,
         startedAt: Date.now(),
       };
@@ -133,11 +147,12 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       };
 
       try {
-        const result = await runWorkflow(script, {
+        const result = await run(script, {
           cwd,
           args: params.args,
           signal: controller.signal,
           tokenBudget: budgetTotal,
+          thinkingLevel,
           modelRegistry: ctx.modelRegistry as any,
           model: ctx.model as any,
           runner: deps.testRunner,
@@ -186,6 +201,11 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         });
         onUpdate?.({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
 
+        ctx.ui?.notify(
+          `Workflow ${result.meta.name} completed: ${result.agentCount} agent(s), ~${result.spentTokens} output tokens.`,
+          "info",
+        );
+
         const cachedNote = result.cachedCount ? ` (${result.cachedCount} cached from resume)` : "";
         return {
           content: [
@@ -218,6 +238,10 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           durationMs: snapshot.durationMs ?? 0,
         });
         onUpdate?.({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
+        ctx.ui?.notify(
+          `Workflow ${parsed.meta.name} ${aborted ? "was aborted" : "failed"}${aborted ? "" : `: ${error instanceof Error ? error.message : String(error)}`}`,
+          aborted ? "warning" : "error",
+        );
         if (aborted) throw new Error(`Workflow ${parsed.meta.name} was aborted (runId: ${runId})`);
         throw error;
       } finally {
