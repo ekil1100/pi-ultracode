@@ -10,7 +10,8 @@ import {
   splitThinkingSuffix,
   type ThinkingLevel,
 } from "../src/workflow/agent-runner.ts";
-import { writeRescuePatch, applyPatch, captureWorktreeDiff } from "../src/workflow/worktree.ts";
+import { writeRescuePatch, applyPatch, captureWorktreeDiff, createWorktree, removeWorktree, reapStaleWorktrees, patchTmpPath } from "../src/workflow/worktree.ts";
+import { createDeterministicMath } from "../src/workflow/runtime.ts";
 
 const MODELS = [
   { provider: "anthropic", id: "claude-sonnet", name: "Sonnet" },
@@ -353,6 +354,190 @@ test("applyPatch: on a binary 3-way conflict, reverts the shared tree to the sha
     const status = gitIn(repo, ["status", "--porcelain"]);
     assert.doesNotMatch(status, /^(UU|AA) /m, "no unmerged index entries remain");
   } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Nit fixes: tmp-filename collision, Math.random determinism, worktree GC.
+// ---------------------------------------------------------------------------
+
+// Covers same-thread uniqueness; cross-realm (worker-thread) uniqueness comes
+// from crypto.randomBytes in patchTmpPath, which is collision-proof by construction.
+test("patchTmpPath: every call yields a unique path (no tmp collision)", () => {
+  const seen = new Set<string>();
+  for (let i = 0; i < 200; i++) {
+    const p = patchTmpPath();
+    assert.equal(seen.has(p), false, `duplicate tmp path on call ${i}: ${p}`);
+    seen.add(p);
+  }
+  for (const p of seen) {
+    assert.ok(p.startsWith(path.join(os.tmpdir(), "ultracode-patch-")), `unexpected path: ${p}`);
+  }
+});
+
+test("createDeterministicMath: Math.max/min/floor work; Math.random throws", () => {
+  const m = createDeterministicMath() as {
+    max: (...a: number[]) => number;
+    min: (...a: number[]) => number;
+    floor: (n: number) => number;
+    round: (n: number) => number;
+    random: () => number;
+  };
+  assert.equal(m.max(1, 2), 2);
+  assert.equal(m.min(4, 5), 4);
+  assert.equal(m.floor(1.7), 1);
+  assert.equal(m.round(2.5), 3);
+  assert.throws(() => m.random(), /Math\.random.*forbidden/);
+});
+
+test("createDeterministicMath: copies every Math member + constants, preserves toStringTag", () => {
+  const m = createDeterministicMath() as Record<string, unknown>;
+  for (const key of Object.getOwnPropertyNames(Math)) {
+    if (key === "random") continue;
+    assert.equal(key in m, true, `Math.${key} should be present on the shim`);
+  }
+  assert.equal(m["PI"], Math.PI);
+  assert.equal(m["E"], Math.E);
+  assert.equal(m["SQRT2"], Math.SQRT2);
+  const max = m["max"] as (...a: number[]) => number;
+  const trunc = m["trunc"] as (n: number) => number;
+  const hypot = m["hypot"] as (...a: number[]) => number;
+  assert.equal(max.apply(null, [3, 1, 2]), 3, "max.apply works (this-binding ok after freeze)");
+  assert.equal(trunc(-1.9), -1);
+  assert.equal(hypot(3, 4), 5);
+  // Symbol.toStringTag is copied (Object.getOwnPropertySymbols), so the shim
+  // stringifies as [object Math] like the real Math.
+  assert.equal(Object.prototype.toString.call(m), "[object Math]", "Symbol.toStringTag preserved");
+});
+
+test("reapStaleWorktrees: removes an orphaned (untracked) ultracode-wt-* dir", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "uc-gc-orphan-"));
+  const orphan = path.join(os.tmpdir(), `ultracode-wt-gcorphan-${Date.now().toString(36)}`);
+  try {
+    gitIn(repo, ["init", "-q"]);
+    gitIn(repo, ["config", "user.email", "t@t"]);
+    gitIn(repo, ["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "x.txt"), "x\n");
+    gitIn(repo, ["add", "."]);
+    gitIn(repo, ["commit", "-qm", "base"]);
+    fs.mkdirSync(orphan);
+    // Age past the 24h threshold. Untracked dirs use the SAME threshold as tracked
+    // worktrees so cross-repo in-flight/kept worktrees (which look untracked from
+    // another repo) survive as long as same-repo ones.
+    const past = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    fs.utimesSync(orphan, past, past);
+    reapStaleWorktrees(repo);
+    assert.equal(fs.existsSync(orphan), false, "stale orphaned ultracode-wt-* dir should be reaped");
+  } finally {
+    try { fs.rmSync(orphan, { recursive: true, force: true }); } catch { /* ignore */ }
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("reapStaleWorktrees: leaves a RECENT untracked ultracode-wt-* dir (cross-repo in-flight safety)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "uc-gc-cross-"));
+  const dir = path.join(os.tmpdir(), `ultracode-wt-crossrepo-${Date.now().toString(36)}`);
+  try {
+    gitIn(repo, ["init", "-q"]);
+    gitIn(repo, ["config", "user.email", "t@t"]);
+    gitIn(repo, ["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "x.txt"), "x\n");
+    gitIn(repo, ["add", "."]);
+    gitIn(repo, ["commit", "-qm", "base"]);
+    fs.mkdirSync(dir);
+    // Recent + untracked by this repo (simulates a different repo's in-flight worktree):
+    // must survive — the 24h threshold protects cross-repo in-flight worktrees.
+    reapStaleWorktrees(repo);
+    assert.ok(fs.existsSync(dir), "recent untracked ultracode-wt-* dir must survive (cross-repo in-flight)");
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("reapStaleWorktrees: removes a stale ultracode-patch-* tmp file (crash leak)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "uc-gc-patch-"));
+  const pf = path.join(os.tmpdir(), `ultracode-patch-deadbeef-${Date.now().toString(36)}.patch`);
+  try {
+    gitIn(repo, ["init", "-q"]);
+    gitIn(repo, ["config", "user.email", "t@t"]);
+    gitIn(repo, ["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "x.txt"), "x\n");
+    gitIn(repo, ["add", "."]);
+    gitIn(repo, ["commit", "-qm", "base"]);
+    fs.writeFileSync(pf, "dummy patch\n");
+    const past = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    fs.utimesSync(pf, past, past);
+    reapStaleWorktrees(repo);
+    assert.equal(fs.existsSync(pf), false, "stale ultracode-patch-* file should be reaped");
+  } finally {
+    try { fs.rmSync(pf, { force: true }); } catch { /* ignore */ }
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("reapStaleWorktrees: removes a stale tracked worktree (kept from an old run)", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "uc-gc-stale-"));
+  let wt: ReturnType<typeof createWorktree> | undefined;
+  try {
+    gitIn(repo, ["init", "-q"]);
+    gitIn(repo, ["config", "user.email", "t@t"]);
+    gitIn(repo, ["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "x.txt"), "x\n");
+    gitIn(repo, ["add", "."]);
+    gitIn(repo, ["commit", "-qm", "base"]);
+    wt = createWorktree(repo, "gctest", 0);
+    assert.ok(fs.existsSync(wt.path), "worktree created");
+    // Age it past the 24h staleness threshold so it looks like a kept worktree from an old run.
+    const past = new Date(Date.now() - 25 * 60 * 60 * 1000);
+    fs.utimesSync(wt.path, past, past);
+    reapStaleWorktrees(repo); // default maxAgeMs = 24h
+    assert.equal(fs.existsSync(wt.path), false, "stale tracked worktree should be reaped");
+    assert.equal(gitIn(repo, ["branch", "--list", "ultracode/gctest-0"]).trim(), "", "stale worktree branch should be deleted");
+  } finally {
+    if (wt) { try { removeWorktree(wt); } catch { /* ignore */ } }
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("reapStaleWorktrees: leaves a recent (in-flight) tracked worktree alone", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "uc-gc-live-"));
+  let wt: ReturnType<typeof createWorktree> | undefined;
+  try {
+    gitIn(repo, ["init", "-q"]);
+    gitIn(repo, ["config", "user.email", "t@t"]);
+    gitIn(repo, ["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "x.txt"), "x\n");
+    gitIn(repo, ["add", "."]);
+    gitIn(repo, ["commit", "-qm", "base"]);
+    wt = createWorktree(repo, "gclive", 0);
+    assert.ok(fs.existsSync(wt.path), "worktree created");
+    reapStaleWorktrees(repo); // recent worktree, default 24h threshold -> not reaped
+    assert.ok(fs.existsSync(wt.path), "recent in-flight worktree must not be reaped");
+    assert.match(gitIn(repo, ["branch", "--list", "ultracode/gclive-0"]), /ultracode\/gclive-0/, "in-flight worktree branch must remain");
+  } finally {
+    if (wt) { try { removeWorktree(wt); } catch { /* ignore */ } }
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("reapStaleWorktrees: does not touch non-ultracode tmpdir entries", () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "uc-gc-skip-"));
+  const other = fs.mkdtempSync(path.join(os.tmpdir(), "other-dir-"));
+  try {
+    gitIn(repo, ["init", "-q"]);
+    gitIn(repo, ["config", "user.email", "t@t"]);
+    gitIn(repo, ["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "x.txt"), "x\n");
+    gitIn(repo, ["add", "."]);
+    gitIn(repo, ["commit", "-qm", "base"]);
+    const past = new Date(Date.now() - 48 * 60 * 60 * 1000);
+    fs.utimesSync(other, past, past);
+    reapStaleWorktrees(repo);
+    assert.ok(fs.existsSync(other), "non-ultracode tmpdir entry must not be touched");
+  } finally {
+    fs.rmSync(other, { recursive: true, force: true });
     fs.rmSync(repo, { recursive: true, force: true });
   }
 });

@@ -10,7 +10,7 @@
 |---|---|---|
 | 已修复 | 7 | H1、C1、G1、A2、I2、commands 类型、effort 转发(均在 `f6e8a42`) |
 | 判定不改 | 4 | F4、D2、J2、D3(设计取舍或 Pi SDK 限制) |
-| 非阻塞 nit | 5 | 见下,均仍存在 |
+| 非阻塞 nit | 3 剩余 | tmp 碰撞 + worktree GC 已修(本轮);剩 patchedFiles 过捕获、integrateWorktree 故障安全泄漏、C-quoted 路径 |
 | 验证 notable | 3 | I2 屏障说法错、B1 漏 flag、G1 只写不读 |
 
 ## ultracode 模式实际做什么
@@ -36,20 +36,28 @@
 
 | 项 | 实际行为(代码确认) | 不改的理由 |
 |---|---|---|
-| **F4** | 确定性设计真实且刻意:`Date` **未**注入 sandbox(脚本里 `Date.now()`/`new Date()` 会 `ReferenceError`);`durationMs` 由 host 在 workflow 返回后盖戳(`runtime.ts:89,105`);guideline 禁止 `Date.now/Math.random/new Date`。**但** `Math` **被注入**(`runtime.ts:189`),所以 `Math.random()` 技术上**可调用**(只靠 guideline 约束,运行时不阻断——严格性有 gap)。`Date.now()` 是 epoch ms,**TZ 无关**,所谓"TZ 不确定性"在代码里**并不存在**。 | 确定性是刻意设计,不是 bug。运行时不阻断 `Math.random` 是严格性 gap(可单独跟进),但不影响 F4"刻意设计"的定性。 |
+| **F4** | 确定性设计真实且刻意:`Date` **未**注入 sandbox(`Date.now()`/`new Date()` 会 `ReferenceError`);`durationMs` 由 host 在 workflow 返回后盖戳(`runtime.ts:89,105`)。`Math` 已换成 `createDeterministicMath` shim——保留 `max/min/floor/PI/E/...` 但**命名 `Math.random()` 运行时抛错**(cooperative guardrail;Node vm 非隔离边界,host-realm `.constructor` 仍可逃逸,已文档化)。`Date.now()` 是 epoch ms、**TZ 无关**,所谓“TZ 不确定性”并不存在。 | 确定性是刻意设计。`Math.random` 的 runtime gap 已用 shim 补(cooperative);硬隔离不在范围(文档已说明)。 |
 | **D2** | 子 agent **无重试**:`run()` 单次 `createAgentSession→prompt→return`;失败分支 `catch → log → return null`(`runtime.ts:280-282,314-315,341-342`)。全仓 `rg tool_choice|toolChoice` **无匹配**。 | 重试是设计选择(确定性 null-on-failure,可组合);`tool_choice` 是 Pi SDK 限制(`createAgentSession` 选项未暴露),pi-ultracode 无法单方面补。 |
 | **J2** | mode 持久化用 `pi.appendEntry`(`mode.ts:165`),append-only;`restore()` 扫所有 entry 取最新匹配(`mode.ts`)。全仓无 trim/compaction 调用(workflow journal 的 `appendFileSync` 同样 append-only,`create()` 只截断同 runId 的陈旧文件)。 | SDK `appendEntry` 只追加、无 trim API;compaction 是 pi 层职责。 |
 | **D3** | structured-output 走"公共子集转换 + `Type.Unsafe` 兜底":识别的子集正常转换,未识别的关键字用 `Type.Unsafe` 保留**原始 schema** 给模型(不丢不崩)。 | 刻意保留全 schema 给模型(非"公共子集"),文件头已说明(`json-schema.ts:5-8`)。 |
 
-## 非阻塞 nit(均仍存在)
+## 非阻塞 nit(3 剩余;tmp 碰撞 + worktree GC 已在本轮修复)
 
 | 项 | 现状 | 证据 |
 |---|---|---|
 | **patchedFiles 过捕获** | parser 对 patch **每一行**跑 header 形态的正则,内容行以 `++ b/` 或 `-- a/` 开头会被误当路径。(影响低:仅用于 pre-apply 快照,null 条目 revert 时忽略。) | `src/workflow/worktree.ts:155-176` |
 | **integrateWorktree 故障安全泄漏** | 外层 try/catch 任一异常 → `keep=true`,**包括成功路径上 `onLog`/`onUpdate` 抛错**——非数据丢失的异常也会保留 worktree。 | `src/workflow/runtime.ts:389-447`(外层 catch `:439-447`) |
 | **C-quoted 路径未处理** | `core.quotepath=false` 只覆盖 unicode(>0x80)引号;含 tab/反斜杠/内嵌双引号的 C-quoted 路径仍被引号包裹,`patchedFiles` 用裸 `(.+)` 捕获、不解引号 → 快照/还原命错文件名。 | `src/workflow/worktree.ts:92-97,155-176` |
-| **保留 worktree 无 GC** | `keep=true` 的 worktree 永不删;仅在下一次 `createWorktree` 时清理**同一 runId+index** 的陈旧路径,无通用 reap。registry 只存内存快照、不跟踪 worktree。 | `src/workflow/worktree.ts:72,77,185-200`;`src/workflow/runtime.ts:284-288`;`src/workflow/registry.ts` |
-| **tmp 文件名碰撞** | tmp 名 = `ultracode-patch-<pid>-<cwd.length>.patch`,只依赖 pid + cwd.length;`applyLock` 是 per-Runtime 实例,不跨 Runtime——同进程并发 workflow(等长 cwd)会撞写/删。 | `src/workflow/worktree.ts:131`;`src/workflow/runtime.ts:128,408` |
+| **保留 worktree 无 GC** | ~~已修:见下“本轮新修”~~ | — |
+| **tmp 文件名碰撞** | ~~已修:见下“本轮新修”~~ | — |
+
+## 本轮新修(nit 收尾,对抗性 review 后)
+
+| 项 | 修复 | 证据 |
+|---|---|---|
+| **tmp 文件名碰撞** | `patchTmpPath()` 用 `crypto.randomBytes(8)`(realm 无关),跨调用/毫秒/进程/worker thread 都不撞;JSDoc 不再过度声称 worker 安全。 | `src/workflow/worktree.ts` `patchTmpPath` |
+| **保留 worktree 无 GC** | `reapStaleWorktrees`:扫 tmpdir,`ultracode-wt-*` 目录 + `ultracode-patch-*` 文件超 24h 才清;tracked 用 `git worktree remove`+branch -D,untracked 用 rmSync;`git worktree list` 失败时 bail-safe;同 24h 阈值保证 cross-repo in-flight/kept worktree 与同仓一样存活。 | `src/workflow/worktree.ts` `reapStaleWorktrees` |
+| **F4 Math.random gap** | sandbox 的 `Math` 换成 `createDeterministicMath` shim:保留 `max/min/floor/PI/E/...` 但命名 `Math.random()` 运行时抛错。**cooperative**(Node vm 非隔离边界,host-realm `.constructor` 可逃逸——已文档化)。 | `src/workflow/runtime.ts` `createDeterministicMath` |
 
 ## effort-level 对齐(本轮补的)
 

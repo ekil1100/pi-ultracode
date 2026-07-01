@@ -3,9 +3,10 @@
  *
  * Parses a workflow script and runs its body inside a Node vm sandbox with the
  * orchestration globals: agent(), parallel(), pipeline(), phase(), log(),
- * workflow(), plus `args`, `cwd`, and `budget`. The sandbox deliberately omits
- * Date.now / Math.random / require / fs / network so runs are reproducible and
- * resumable.
+ * workflow(), plus `args`, `cwd`, and `budget`. The sandbox omits Date / require
+ * / fs / network from the named global surface and neuters Math.random() (it
+ * throws) as a guardrail against accidental nondeterminism; this is cooperative
+ * enforcement, not a hard isolation boundary (see createDeterministicMath).
  */
 
 import vm from "node:vm";
@@ -18,6 +19,40 @@ import { parseWorkflowScript, type WorkflowMeta } from "./parser.ts";
 // they never construct this class; production builds it via getRunner().
 import { WorkflowAgentRunner } from "./agent-runner.ts";
 import type { AgentRunResult, ModelLike, ModelRegistryLike, ThinkingLevel } from "./agent-runner.ts";
+
+/**
+ * A frozen copy of `Math` with `random` replaced by a throwing function. Workflow
+ * scripts get the useful Math surface (max/min/floor/round/PI/E/...) but the
+ * NAMED Math.random() throws, guardrailing against accidental nondeterminism.
+ *
+ * NOTE: this is COOPERATIVE enforcement, not a hard isolation boundary. Node's
+ * `vm` is not a sandbox: a determined script can still reach the real Math.random
+ * (and Date.now/performance/crypto) via any host-realm function's `.constructor`
+ * (the host Function constructor), e.g. `Object.constructor("return Math.random()")()`.
+ * Closing that requires not passing host-realm intrinsics into the context (or
+ * using isolated-vm); the parser's AST check + this shim are defense-in-depth
+ * against ACCIDENTAL nondeterminism, matching the workflow guidelines' "vary
+ * randomness by agent index" framing.
+ */
+export function createDeterministicMath(): Record<string, unknown> {
+  const m = {} as Record<string | symbol, unknown>;
+  for (const key of Object.getOwnPropertyNames(Math)) {
+    if (key === "random") continue;
+    m[key] = (Math as unknown as Record<string | symbol, unknown>)[key];
+  }
+  // Preserve symbol-keyed members (e.g. Symbol.toStringTag = 'Math') for parity.
+  for (const sym of Object.getOwnPropertySymbols(Math)) {
+    m[sym] = (Math as unknown as Record<string | symbol, unknown>)[sym];
+  }
+  m.random = function random() {
+    throw new Error(
+      "Math.random() is non-deterministic and forbidden in workflow scripts; vary randomness by agent index instead (see the workflow guidelines).",
+    );
+  };
+  return Object.freeze(m) as unknown as Record<string, unknown>;
+}
+
+const DETERMINISTIC_MATH = createDeterministicMath();
 import { discoverAgentTypes, resolveAgentType, type AgentTypeDef } from "./agent-types.ts";
 import { agentCallKey, RunJournal } from "./journal.ts";
 import {
@@ -186,7 +221,7 @@ class Runtime {
         error: (m: unknown) => log(`[error] ${String(m)}`),
       },
       JSON,
-      Math,
+      Math: DETERMINISTIC_MATH,
       Array,
       Object,
       String,

@@ -8,6 +8,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -71,6 +72,14 @@ export function createWorktree(cwd: string, runId: string, index: number): Workt
   const branch = `ultracode/${safeRun}-${index}`;
   const worktreePath = path.join(os.tmpdir(), `ultracode-wt-${safeRun}-${index}`);
 
+  // Best-effort GC of orphaned + stale ultracode worktrees from earlier runs.
+  // Rate-limited so a fleet of worktree agents doesn't hammer tmpdir on every create.
+  const _now = Date.now();
+  if (_now - lastReapAt > REAP_INTERVAL_MS) {
+    lastReapAt = _now;
+    reapStaleWorktrees(toplevel);
+  }
+
   // Clean up any stale worktree from a crashed prior run.
   removeWorktreeQuiet(toplevel, worktreePath, branch);
 
@@ -113,6 +122,19 @@ export function hasChanges(diff: WorktreeDiff): boolean {
   return diff.filesChanged > 0;
 }
 
+// GC cadence + staleness threshold for ultracode worktrees + patch files in tmpdir.
+const REAP_INTERVAL_MS = 60_000; // reap at most once per minute per process
+const STALE_WORKTREE_MAX_AGE_MS = 24 * 60 * 60 * 1000; // entries older than this are reaped
+let lastReapAt = 0;
+
+/** Generate a unique tmp path for a patch file. Uses crypto-strong randomness
+ *  (not a per-realm counter) so the name is collision-proof across calls,
+ *  milliseconds, processes, AND worker threads (which share a pid but have
+ *  separate module realms — a per-realm counter would collide on call 0). */
+export function patchTmpPath(): string {
+  return path.join(os.tmpdir(), `ultracode-patch-${process.pid}-${randomBytes(8).toString("hex")}.patch`);
+}
+
 /** Apply a captured patch back onto the original working tree. */
 export function applyPatch(cwd: string, patch: string): boolean {
   if (!patch.trim()) return false;
@@ -128,7 +150,10 @@ export function applyPatch(cwd: string, patch: string): boolean {
       before.set(p, null); // path does not exist yet (the patch adds it)
     }
   }
-  const tmp = path.join(os.tmpdir(), `ultracode-patch-${process.pid}-${cwd.length}.patch`);
+  // Unique per call (see patchTmpPath): previously the name only depended on pid
+  // + cwd.length, so concurrent applies (worker threads sharing a pid, or a
+  // future async apply) with equal-length cwds collided on the same tmp file.
+  const tmp = patchTmpPath();
   try {
     fs.writeFileSync(tmp, patch.endsWith("\n") ? patch : `${patch}\n`);
     git(cwd, ["apply", "--3way", tmp]);
@@ -246,6 +271,95 @@ function removeWorktreeQuiet(repo: string, worktreePath: string, branch: string)
     // ignore
   }
   tryGit(repo, ["branch", "-D", branch]);
+}
+
+/**
+ * Reap stale ultracode worktrees + leaked patch files from tmpdir. Entries
+ * older than the staleness threshold (24h default) are removed: tracked
+ * worktrees (registered with `toplevel`) via full `git worktree remove` + branch
+ * delete; untracked `ultracode-wt-*` dirs via rmSync; `ultracode-patch-*` files
+ * via unlink.
+ *
+ * Limitation: `git worktree list` is repo-scoped, so a worktree owned by a
+ * DIFFERENT repo is "untracked" here and is rmSync'd after the threshold (its
+ * branch in the owning repo is NOT cleaned — there is no safe way to find the
+ * owner from the dir alone). The same 24h threshold applies to untracked dirs as
+ * to tracked worktrees, so cross-repo in-flight and kept worktrees survive as
+ * long as same-repo ones. If git can't list worktrees, the reap bails safe
+ * rather than treating every entry as orphaned.
+ *
+ * Exported for tests; createWorktree calls this rate-limited.
+ */
+export function reapStaleWorktrees(
+  toplevel: string,
+  opts: { maxAgeMs?: number } = {},
+): void {
+  const maxAgeMs = opts.maxAgeMs ?? STALE_WORKTREE_MAX_AGE_MS;
+  // Drop git's tracking of worktrees whose dirs are already gone.
+  tryGit(toplevel, ["worktree", "prune"]);
+  // Bail safe if we can't list worktrees: treating every entry as orphaned would
+  // destroy in-flight/kept worktrees from other repos (git worktree list is
+  // repo-scoped, so only the current repo's worktrees are `tracked` below).
+  const list = tryGit(toplevel, ["worktree", "list", "--porcelain"]);
+  if (list == null) return;
+  const tracked = new Set(
+    list
+      .split("\n")
+      .filter((l) => l.startsWith("worktree "))
+      .map((l) => l.slice("worktree ".length).trim()),
+  );
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(os.tmpdir());
+  } catch {
+    return;
+  }
+  const now = Date.now();
+  for (const name of entries) {
+    if (!name.startsWith("ultracode-wt-")) continue;
+    const wtPath = path.join(os.tmpdir(), name);
+    let mtime: number;
+    try {
+      mtime = fs.statSync(wtPath).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (now - mtime <= maxAgeMs) continue; // recent: in-flight or within the recovery window
+    if (tracked.has(wtPath)) {
+      // Tracked + stale (kept from an old run in THIS repo): full remove + branch delete.
+      const branch = `ultracode/${name.slice("ultracode-wt-".length)}`;
+      removeWorktreeQuiet(toplevel, wtPath, branch);
+    } else {
+      // Untracked by this repo: could be a crash orphan, OR a worktree owned by a
+      // DIFFERENT repo (git worktree list is repo-scoped, so we can't tell). The
+      // 24h threshold matches the same-repo kept-worktree window, so cross-repo
+      // in-flight/kept worktrees survive as long as same-repo ones. The owning
+      // repo's branch is NOT cleaned here (no safe way to find it).
+      try {
+        fs.rmSync(wtPath, { recursive: true, force: true });
+      } catch {
+        // ignore
+      }
+    }
+  }
+  // Also reap crash-leaked patch tmp files (ultracode-patch-*), same threshold.
+  for (const name of entries) {
+    if (!name.startsWith("ultracode-patch-")) continue;
+    const fp = path.join(os.tmpdir(), name);
+    let mtime: number;
+    try {
+      mtime = fs.statSync(fp).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (now - mtime > maxAgeMs) {
+      try {
+        fs.unlinkSync(fp);
+      } catch {
+        // ignore
+      }
+    }
+  }
 }
 
 function linkNodeModules(toplevel: string, worktreePath: string): void {
