@@ -74,6 +74,12 @@ export interface WorkflowToolDeps {
 
 let runCounter = 0;
 
+/** Max chars of live subagent text retained per agent for the inspect view. */
+const STREAM_TAIL_MAX = 240;
+/** Throttle: min ms between activity-driven re-renders (avoids token-by-token
+ *  re-render storms when many subagents stream concurrently). */
+const ACTIVITY_RENDER_INTERVAL_MS = 200;
+
 function nextRunId(): string {
   runCounter += 1;
   return `wf_${Date.now().toString(36)}-${runCounter.toString(36)}`;
@@ -142,9 +148,18 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         onUpdate?.({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
       };
 
+      // Throttle state for activity-driven re-renders. Agent fields below are
+      // mutated on every activity tick; only the TUI re-render is throttled, so
+      // `/workflows <runId>` still reads fully-live fields between renders.
+      let lastActivityRenderMs = 0;
+
       const recordPhase = (title?: string) => {
         if (title && !snapshot.phases.includes(title)) snapshot.phases.push(title);
       };
+
+      // Heartbeat: keep elapsed/idle markers live in the compact panel even when a
+      // subagent emits no events (so a silently-stuck agent actually shows "⚠ idle").
+      const heartbeat = setInterval(() => update(), 1000);
 
       try {
         const result = await run(script, {
@@ -168,11 +183,14 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           },
           onAgentStart(event) {
             recordPhase(event.phase);
+            const startedAt = Date.now();
             snapshot.agents.push({
               id: event.id,
               label: event.label,
               phase: event.phase,
               status: event.cached ? "cached" : "running",
+              startedAt,
+              lastActivityAt: startedAt,
             });
             update();
           },
@@ -182,8 +200,26 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
               if (agent.status !== "cached") agent.status = event.status;
               agent.resultPreview = preview(event.result);
               if (event.status === "error") agent.error = preview(event.result);
+              const endedAt = Date.now();
+              agent.endedAt = endedAt;
+              if (agent.startedAt != null) agent.durationMs = endedAt - agent.startedAt;
             }
             update();
+          },
+          onAgentActivity(event) {
+            const agent = snapshot.agents.find((a) => a.id === event.id);
+            if (!agent) return;
+            const now = Date.now();
+            agent.lastActivityAt = now;
+            agent.activity = event.kind === "tool" ? (event.detail ?? "tool") : event.kind;
+            if (event.kind === "text" && event.detail) {
+              const tail = (agent.streamTail ?? "") + event.detail;
+              agent.streamTail = tail.length > STREAM_TAIL_MAX ? tail.slice(-STREAM_TAIL_MAX) : tail;
+            }
+            if (now - lastActivityRenderMs >= ACTIVITY_RENDER_INTERVAL_MS) {
+              lastActivityRenderMs = now;
+              update();
+            }
           },
         });
 
@@ -245,6 +281,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         if (aborted) throw new Error(`Workflow ${parsed.meta.name} was aborted (runId: ${runId})`);
         throw error;
       } finally {
+        clearInterval(heartbeat);
         signal?.removeEventListener("abort", onOuterAbort);
         journal?.close();
       }

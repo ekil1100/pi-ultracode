@@ -112,7 +112,7 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
           ctx.ui.notify(`No workflow run matching "${arg}". /workflows to list, /workflows clear to hide.`, "warning");
           return;
         }
-        show(renderWorkflowLines(handle.snapshot, { maxAgents: 12, maxLogs: 6, showResultPreviews: true }));
+        show(renderWorkflowLines(handle.snapshot, { maxAgents: 12, maxLogs: 6, showResultPreviews: true, showStream: true }));
         ctx.ui.notify(`Showing ${handle.snapshot.runId ?? "run"}. /workflows clear to hide.`, "info");
         return;
       }

@@ -59,6 +59,12 @@ export interface WorkflowAgentRunnerOptions {
   thinkingLevel?: ThinkingLevel;
 }
 
+/** Normalized activity signal forwarded from inside a running subagent. */
+export interface AgentActivityInput {
+  kind: "text" | "thinking" | "tool";
+  detail?: string;
+}
+
 export interface AgentRunCall {
   prompt: string;
   label: string;
@@ -70,6 +76,8 @@ export interface AgentRunCall {
   agentTypeDef?: AgentTypeDef;
   /** Override cwd (worktree). */
   cwd?: string;
+  /** Live activity stream from the subagent (text deltas / tool calls). */
+  onActivity?: (event: AgentActivityInput) => void;
 }
 
 export class WorkflowAgentRunner {
@@ -121,11 +129,19 @@ export class WorkflowAgentRunner {
     });
 
     let removeAbort: (() => void) | undefined;
+    let unsubscribe: (() => void) | undefined;
     try {
       if (call.signal) {
         const onAbort = () => void session.abort();
         call.signal.addEventListener("abort", onAbort, { once: true });
         removeAbort = () => call.signal?.removeEventListener("abort", onAbort);
+      }
+
+      // Forward live activity (text deltas / tool calls) so the workflow
+      // snapshot can show per-agent progress and detect stuck subagents.
+      if (call.onActivity) {
+        const onActivity = call.onActivity;
+        unsubscribe = session.subscribe((event) => forwardActivity(event, onActivity));
       }
 
       await session.prompt(this.buildPrompt(call, Boolean(call.schema)));
@@ -142,6 +158,7 @@ export class WorkflowAgentRunner {
       return { value, usage: readUsage(session), cwd };
     } finally {
       removeAbort?.();
+      unsubscribe?.();
       session.dispose();
     }
   }
@@ -282,4 +299,31 @@ function lastAssistantText(messages: unknown[]): string {
     if (text.trim()) return text;
   }
   return "";
+}
+
+/**
+ * Map a raw AgentSessionEvent into a normalized activity signal and forward it.
+ * Defensive: activity forwarding must never break the subagent run.
+ */
+export function forwardActivity(event: unknown, onActivity: (e: AgentActivityInput) => void): void {
+  try {
+    const e = event as any;
+    if (e?.type === "message_update") {
+      const ame = e.assistantMessageEvent;
+      if (!ame) return;
+      if (ame.type === "text_delta" && typeof ame.delta === "string") {
+        onActivity({ kind: "text", detail: ame.delta });
+      } else if (ame.type === "thinking_delta") {
+        onActivity({ kind: "thinking" });
+      } else if (ame.type === "toolcall_start" && ame.toolName) {
+        onActivity({ kind: "tool", detail: String(ame.toolName) });
+      }
+      return;
+    }
+    if (e?.type === "tool_execution_start" && e.toolName) {
+      onActivity({ kind: "tool", detail: String(e.toolName) });
+    }
+  } catch {
+    // best-effort: never let observability break the run
+  }
 }

@@ -18,7 +18,7 @@ import { parseWorkflowScript, type WorkflowMeta } from "./parser.ts";
 // loader ("WorkflowAgentRunner is not a constructor"). Tests inject a runner, so
 // they never construct this class; production builds it via getRunner().
 import { WorkflowAgentRunner } from "./agent-runner.ts";
-import type { AgentRunResult, ModelLike, ModelRegistryLike, ThinkingLevel } from "./agent-runner.ts";
+import type { AgentActivityInput, AgentRunResult, ModelLike, ModelRegistryLike, ThinkingLevel } from "./agent-runner.ts";
 
 /**
  * A frozen copy of `Math` with `random` replaced by a throwing function. Workflow
@@ -77,6 +77,12 @@ export interface AgentEventBase {
   phase?: string;
 }
 
+/** Live activity observed inside a running subagent (text deltas / tool calls). */
+export interface AgentActivityEvent extends AgentEventBase {
+  kind: "text" | "thinking" | "tool";
+  detail?: string;
+}
+
 export interface WorkflowRunOptions {
   cwd?: string;
   args?: unknown;
@@ -95,6 +101,7 @@ export interface WorkflowRunOptions {
   onPhase?: (title: string) => void;
   onAgentStart?: (event: AgentEventBase & { prompt: string; cached: boolean }) => void;
   onAgentEnd?: (event: AgentEventBase & { result: unknown; status: "done" | "error" }) => void;
+  onAgentActivity?: (event: AgentActivityEvent) => void;
 }
 
 export interface WorkflowRunResult<T = unknown> {
@@ -285,6 +292,11 @@ class Runtime {
         }
 
         const runner = this.getRunner();
+        const onActivity: ((e: AgentActivityInput) => void) | undefined = this.options.onAgentActivity
+          ? (e: AgentActivityInput) =>
+              this.options.onAgentActivity!({ id, label, phase: assignedPhase, ...e })
+          : undefined;
+        const agentStartedAt = Date.now();
         const result: AgentRunResult = await runner.run({
           prompt,
           label,
@@ -294,6 +306,7 @@ class Runtime {
           modelPattern: opts.model,
           agentTypeDef,
           cwd: worktree?.agentCwd,
+          onActivity,
         });
         this.throwIfAborted();
 
@@ -306,6 +319,8 @@ class Runtime {
           label,
           value: result.value,
           outputTokens: result.usage.outputTokens,
+          startedAt: agentStartedAt,
+          durationMs: Date.now() - agentStartedAt,
         });
         this.options.onAgentEnd?.({ id, label, phase: assignedPhase, result: result.value, status: "done" });
         return result.value;
