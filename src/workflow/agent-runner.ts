@@ -21,6 +21,7 @@ import {
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.ts";
+import { redactCommand, safeCommandPreview, truncateDisplay } from "./display-text.ts";
 import { jsonSchemaToTypeBox } from "./json-schema.ts";
 import {
   LEGACY_ULTRACODE_THINKING_LEVEL,
@@ -92,11 +93,19 @@ export interface WorkflowAgentRunnerOptions {
   supportsMaxThinking?: boolean;
 }
 
-/** Normalized activity signal forwarded from inside a running subagent. */
-export interface AgentActivityInput {
-  kind: "text" | "thinking" | "tool";
-  detail?: string;
-}
+/** Normalized, valid-by-construction activity signals from a running subagent. */
+export type AgentActivityInput =
+  | { kind: "waiting" | "retry" | "compaction"; detail: string }
+  | { kind: "thinking"; detail: string }
+  | { kind: "text"; detail: string; streamDelta?: string }
+  | {
+      kind: "tool";
+      detail: string;
+      toolCallId: string;
+      toolName: string;
+      toolArgs?: string;
+      toolState: "start" | "update" | "end";
+    };
 
 export interface AgentRunCall {
   prompt: string;
@@ -455,22 +464,208 @@ function lastAssistantText(messages: unknown[]): string {
 export function forwardActivity(event: unknown, onActivity: (e: AgentActivityInput) => void): void {
   try {
     const e = event as any;
-    if (e?.type === "message_update") {
-      const ame = e.assistantMessageEvent;
-      if (!ame) return;
-      if (ame.type === "text_delta" && typeof ame.delta === "string") {
-        onActivity({ kind: "text", detail: ame.delta });
-      } else if (ame.type === "thinking_delta") {
-        onActivity({ kind: "thinking" });
-      } else if (ame.type === "toolcall_start" && ame.toolName) {
-        onActivity({ kind: "tool", detail: String(ame.toolName) });
+    switch (e?.type) {
+      case "agent_start":
+        onActivity({ kind: "waiting", detail: "starting agent" });
+        return;
+      case "turn_start":
+        // Pi emits this immediately before authentication/request setup and then
+        // waits for the provider's first stream event.
+        onActivity({ kind: "waiting", detail: "waiting for model" });
+        return;
+      case "message_start":
+        if (e.message?.role === "assistant") {
+          onActivity({ kind: "waiting", detail: "model stream opened" });
+        }
+        return;
+      case "message_update":
+        forwardMessageActivity(e.assistantMessageEvent, onActivity);
+        return;
+      case "message_end":
+        if (e.message?.role === "assistant") {
+          const error = compactText(e.message.errorMessage, 100);
+          onActivity({
+            kind: "waiting",
+            detail: error ? `model response ended: ${error}` : "model response complete",
+          });
+        }
+        return;
+      case "tool_execution_start":
+        forwardToolActivity(e, "start", onActivity);
+        return;
+      case "tool_execution_update":
+        forwardToolActivity(e, "update", onActivity);
+        return;
+      case "tool_execution_end":
+        forwardToolActivity(e, "end", onActivity);
+        return;
+      case "turn_end":
+        onActivity({ kind: "waiting", detail: "turn complete" });
+        return;
+      case "agent_end":
+        onActivity({
+          kind: "waiting",
+          detail: e.willRetry ? "agent ended; retry pending" : "finishing agent",
+        });
+        return;
+      case "agent_settled":
+        onActivity({ kind: "waiting", detail: "agent settled" });
+        return;
+      case "auto_retry_start": {
+        const attempt = finiteNumber(e.attempt) ?? 0;
+        const maxAttempts = finiteNumber(e.maxAttempts) ?? 0;
+        const delay = formatDelay(finiteNumber(e.delayMs) ?? 0);
+        const error = compactText(e.errorMessage, 100);
+        onActivity({
+          kind: "retry",
+          detail: `retry ${attempt}/${maxAttempts} in ${delay}${error ? `: ${error}` : ""}`,
+        });
+        return;
       }
-      return;
-    }
-    if (e?.type === "tool_execution_start" && e.toolName) {
-      onActivity({ kind: "tool", detail: String(e.toolName) });
+      case "auto_retry_end": {
+        const attempt = finiteNumber(e.attempt) ?? 0;
+        const error = compactText(e.finalError, 100);
+        onActivity({
+          kind: "retry",
+          detail: e.success
+            ? `retry ${attempt} succeeded`
+            : `retry ${attempt} failed${error ? `: ${error}` : ""}`,
+        });
+        return;
+      }
+      case "compaction_start":
+        onActivity({ kind: "compaction", detail: compactionStartDetail(e.reason) });
+        return;
+      case "compaction_end": {
+        const error = compactText(e.errorMessage, 100);
+        onActivity({
+          kind: "compaction",
+          detail: error
+            ? `compaction failed: ${error}`
+            : e.aborted
+              ? "compaction aborted"
+              : e.willRetry
+                ? "compaction complete; retrying model"
+                : "compaction complete",
+        });
+        return;
+      }
+      case "queue_update": {
+        const queued = (Array.isArray(e.steering) ? e.steering.length : 0)
+          + (Array.isArray(e.followUp) ? e.followUp.length : 0);
+        if (queued > 0) onActivity({ kind: "waiting", detail: `${queued} queued message${queued === 1 ? "" : "s"}` });
+        return;
+      }
+      case "thinking_level_changed":
+        if (typeof e.level === "string") {
+          onActivity({ kind: "waiting", detail: `thinking level: ${e.level}` });
+        }
+        return;
+      default:
+        return;
     }
   } catch {
     // best-effort: never let observability break the run
   }
+}
+
+function forwardMessageActivity(
+  event: any,
+  onActivity: (e: AgentActivityInput) => void,
+): void {
+  switch (event?.type) {
+    case "text_start":
+    case "text_end":
+      onActivity({ kind: "text", detail: "responding" });
+      return;
+    case "text_delta":
+      if (typeof event.delta === "string") {
+        onActivity({ kind: "text", detail: event.delta, streamDelta: event.delta });
+      }
+      return;
+    case "thinking_start":
+    case "thinking_delta":
+    case "thinking_end":
+      onActivity({ kind: "thinking", detail: "thinking" });
+      return;
+    case "toolcall_start":
+    case "toolcall_delta":
+      // Current Pi events do not expose toolName until toolcall_end.
+      onActivity({ kind: "waiting", detail: "preparing tool call" });
+      return;
+    case "toolcall_end": {
+      const name = typeof event.toolCall?.name === "string" ? event.toolCall.name : "tool";
+      const args = toolArgsPreview(event.toolCall?.arguments);
+      onActivity({
+        kind: "waiting",
+        detail: `preparing ${toolLabel(name, args)}`,
+      });
+      return;
+    }
+  }
+}
+
+function forwardToolActivity(
+  event: any,
+  state: "start" | "update" | "end",
+  onActivity: (e: AgentActivityInput) => void,
+): void {
+  if (typeof event.toolName !== "string") return;
+  const name = event.toolName;
+  const args = state === "end" ? undefined : toolArgsPreview(event.args);
+  onActivity({
+    kind: "tool",
+    detail: state === "end"
+      ? `${name} ${event.isError ? "failed" : "finished"}`
+      : toolLabel(name, args),
+    toolCallId: typeof event.toolCallId === "string" ? event.toolCallId : `${name}:unknown`,
+    toolName: name,
+    ...(args ? { toolArgs: args } : {}),
+    toolState: state,
+  });
+}
+
+function toolLabel(name: string, args: string | undefined): string {
+  const safeName = truncateDisplay(name, 40) || "tool";
+  return args ? `${safeName}: ${args}` : safeName;
+}
+
+/** Keep tool status useful without displaying free-form payload bodies. */
+export function toolArgsPreview(value: unknown, max = 80): string | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const args = value as Record<string, unknown>;
+  const command = scalarPreview(args.command);
+  if (command) return truncateDisplay(safeCommandPreview(command), max);
+  for (const key of ["path", "file_path"]) {
+    const path = scalarPreview(args[key]);
+    if (path) return truncateDisplay(path, max);
+  }
+  return undefined;
+}
+
+function scalarPreview(value: unknown): string | undefined {
+  if (typeof value === "string" && value.trim()) return value;
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  return undefined;
+}
+
+function compactionStartDetail(reason: unknown): string {
+  if (reason === "overflow") return "context overflow; compacting";
+  if (reason === "threshold") return "context threshold reached; compacting";
+  return "compacting context";
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function formatDelay(ms: number): string {
+  if (ms < 1000) return `${Math.max(0, Math.round(ms))}ms`;
+  const seconds = ms / 1000;
+  return `${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)}s`;
+}
+
+function compactText(value: unknown, max: number): string {
+  if (typeof value !== "string") return "";
+  return truncateDisplay(redactCommand(value), max);
 }

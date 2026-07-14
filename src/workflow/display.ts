@@ -3,9 +3,18 @@
  * for streamed tool updates and the final tool result.
  */
 
+import { truncateDisplay, truncateDisplayTail } from "./display-text.ts";
 import type { WorkflowMeta } from "./parser.ts";
 
 export type WorkflowAgentStatus = "running" | "done" | "error" | "skipped" | "cached";
+
+export interface WorkflowActiveToolSnapshot {
+  id: string;
+  name: string;
+  args?: string;
+  startedAt: number;
+  lastUpdateAt: number;
+}
 
 export interface WorkflowAgentSnapshot {
   id: number;
@@ -20,11 +29,13 @@ export interface WorkflowAgentSnapshot {
   endedAt?: number;
   /** Runtime duration in ms (endedAt - startedAt). */
   durationMs?: number;
-  /** Wall-clock ms of the last observed activity inside the subagent. */
+  /** Wall-clock ms of the last observed session event inside the subagent. */
   lastActivityAt?: number;
-  /** Short activity label while running, e.g. "text", "bash", "thinking". */
+  /** Last known factual state, e.g. "waiting for model" or "retry 2/3". */
   activity?: string;
-  /** Ring buffer of recent text output while running (live, not persisted). */
+  /** Tool calls that have started but have not emitted tool_execution_end. */
+  activeTools?: WorkflowActiveToolSnapshot[];
+  /** Ring buffer of recent assistant text while running (live, not persisted). */
   streamTail?: string;
 }
 
@@ -54,15 +65,15 @@ export interface RenderOptions {
   showResultPreviews?: boolean;
   /** Show the live streaming tail under each running agent (inspect view). */
   showStream?: boolean;
-  /** Override `Date.now()` for deterministic elapsed/idle rendering in tests. */
+  /** Override `Date.now()` for deterministic elapsed/activity rendering in tests. */
   now?: number;
 }
 
 export function createSnapshot(meta: WorkflowMeta, runId: string, budgetTotal: number | null): WorkflowSnapshot {
   return {
     runId,
-    name: meta.name,
-    description: meta.description,
+    name: truncateDisplay(meta.name, 120) || "workflow",
+    description: meta.description ? truncateDisplay(meta.description, 240) : undefined,
     phases: meta.phases?.map((p) => p.title) ?? [],
     logs: [],
     agents: [],
@@ -102,7 +113,7 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
         ? `, ${snapshot.runningCount} running`
         : "";
   const cached = snapshot.cachedCount ? ` · ${snapshot.cachedCount} cached` : "";
-  const header = `◆ ${statusMark(snapshot.status)} ${snapshot.name} (${snapshot.doneCount}/${snapshot.agentCount} done${state})${cached}${tokens}`;
+  const header = `◆ ${statusMark(snapshot.status)} ${shorten(snapshot.name, 60)} (${snapshot.doneCount}/${snapshot.agentCount} done${state})${cached}${tokens}`;
   const lines = [header];
 
   const phaseNames = unique([
@@ -122,7 +133,7 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
     const complete = agents.length > 0 && done + errors === agents.length;
     const marker = running > 0 || (!complete && snapshot.currentPhase === phase) ? "▶" : complete ? "✓" : " ";
     lines.push(
-      `  ${marker} ${phase} ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}`,
+      `  ${marker} ${shorten(phase, 60)} ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}`,
     );
     for (const agent of agents.slice(-maxAgents)) {
       lines.push(renderAgentLine(agent, { showResultPreviews, showStream, now }));
@@ -148,9 +159,7 @@ export function renderWorkflowText(snapshot: WorkflowSnapshot, options: RenderOp
 
 export function preview(value: unknown, max = 80): string {
   const text = typeof value === "string" ? value : safeJson(value);
-  if (!text) return "";
-  const oneLine = text.replace(/\s+/g, " ").trim();
-  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+  return text ? truncateDisplay(text, max) : "";
 }
 
 function statusMark(status: WorkflowSnapshot["status"]): string {
@@ -186,8 +195,7 @@ function unique(values: string[]): string[] {
 }
 
 function shorten(value: string, max: number): string {
-  const text = value.replace(/\s+/g, " ").trim();
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  return truncateDisplay(value, max);
 }
 
 function formatTokens(n: number): string {
@@ -204,18 +212,22 @@ function safeJson(value: unknown): string {
   }
 }
 
-/** Seconds of silence after which a running agent is flagged as idle. */
+/** Seconds without an observable session event before visibility escalates. */
 export const IDLE_THRESHOLD_S = 30;
 
 function renderAgentLine(
   agent: WorkflowAgentSnapshot,
-  opts: { showResultPreviews: boolean; showStream: boolean; now: number },
+  opts: {
+    showResultPreviews: boolean;
+    showStream: boolean;
+    now: number;
+  },
 ): string {
   const meta = agentMeta(agent, opts.now);
   const result = opts.showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
   const stream =
     opts.showStream && agent.status === "running" && agent.streamTail
-      ? `\n      ┊ ${shorten(agent.streamTail, 120)}`
+      ? `\n      ┊ ${truncateDisplayTail(agent.streamTail, 120)}`
       : "";
   return `    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${meta}${result}${stream}`;
 }
@@ -226,20 +238,40 @@ function agentMeta(agent: WorkflowAgentSnapshot, now: number): string {
     const startedAt = agent.startedAt ?? now;
     const elapsed = Math.max(0, Math.floor((now - startedAt) / 1000));
     const lastAct = agent.lastActivityAt ?? startedAt;
-    const idle = Math.max(0, Math.floor((now - lastAct) / 1000));
-    if (idle >= IDLE_THRESHOLD_S) return ` · ${elapsed}s · ⚠ idle ${idle}s`;
-    const act = agent.activity ? ` · ${shorten(agent.activity, 20)}` : "";
-    return ` · ${elapsed}s${act}`;
+    const silence = Math.max(0, Math.floor((now - lastAct) / 1000));
+    const activeTools = agent.activeTools ?? [];
+
+    if (activeTools.length > 0) {
+      const tool = visibleTool(activeTools);
+      const toolDuration = formatDuration(Math.max(0, now - tool.startedAt));
+      const toolName = shorten(tool.name, 30) || "tool";
+      const args = tool.args ? `: ${shorten(tool.args, 60)}` : "";
+      const others = activeTools.length > 1 ? ` +${activeTools.length - 1} more` : "";
+      const noToolEvents = Math.max(0, Math.floor((now - tool.lastUpdateAt) / 1000));
+      const warning = noToolEvents >= IDLE_THRESHOLD_S ? ` · ⚠ no tool events ${noToolEvents}s` : "";
+      return ` · ${elapsed}s · running ${toolName}${args} (${toolDuration})${others}${warning}`;
+    }
+
+    if (silence >= IDLE_THRESHOLD_S) {
+      const last = agent.activity ? ` · last: ${shorten(agent.activity, 64)}` : "";
+      return ` · ${elapsed}s · ⚠ no events ${silence}s${last}`;
+    }
+    const activity = agent.activity ? ` · ${shorten(agent.activity, 64)}` : "";
+    return ` · ${elapsed}s${activity}`;
   }
   if (agent.durationMs != null && agent.durationMs > 0) return ` · ${formatDuration(agent.durationMs)}`;
   return "";
 }
 
+function visibleTool(tools: WorkflowActiveToolSnapshot[]): WorkflowActiveToolSnapshot {
+  return tools.reduce((stalest, tool) => tool.lastUpdateAt < stalest.lastUpdateAt ? tool : stalest);
+}
+
 function formatDuration(ms: number): string {
-  const s = ms / 1000;
-  if (s < 1) return "<1s";
-  if (s < 60) return `${Math.round(s)}s`;
-  const m = Math.floor(s / 60);
-  const rem = Math.round(s % 60);
-  return `${m}m${rem ? ` ${rem}s` : ""}`;
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 1) return "<1s";
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m${seconds ? ` ${seconds}s` : ""}`;
 }

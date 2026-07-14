@@ -6,6 +6,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseBudget, type UltracodeMode } from "./mode.ts";
 import { getRegistry } from "./workflow/registry.ts";
 import { renderWorkflowLines } from "./workflow/display.ts";
+import { truncateDisplay } from "./workflow/display-text.ts";
 
 export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
   pi.registerCommand("ultracode", {
@@ -113,11 +114,11 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
       if (arg) {
         const handle = registry.get(arg) ?? runs.find((r) => r.snapshot.runId?.startsWith(arg));
         if (!handle) {
-          ctx.ui.notify(`No workflow run matching "${arg}". /workflows to list, /workflows clear to hide.`, "warning");
+          ctx.ui.notify(`No workflow run matching "${truncateDisplay(arg, 80)}". /workflows to list, /workflows clear to hide.`, "warning");
           return;
         }
         show(renderWorkflowLines(handle.snapshot, { maxAgents: 12, maxLogs: 6, showResultPreviews: true, showStream: true }));
-        ctx.ui.notify(`Showing ${handle.snapshot.runId ?? "run"}. /workflows clear to hide.`, "info");
+        ctx.ui.notify(`Showing ${truncateDisplay(handle.snapshot.runId ?? "run", 128)}. /workflows clear to hide.`, "info");
         return;
       }
 
@@ -136,7 +137,7 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
 
       const summary = runs.map((handle) => {
         const s = handle.snapshot;
-        return `${statusGlyph(s.status)} ${s.runId}  ${s.name}  ${s.doneCount}/${s.agentCount}${
+        return `${statusGlyph(s.status)} ${truncateDisplay(s.runId ?? "run", 128)}  ${truncateDisplay(s.name, 80)}  ${s.doneCount}/${s.agentCount}${
           s.runningCount ? ` (${s.runningCount} running)` : ""
         }`;
       });

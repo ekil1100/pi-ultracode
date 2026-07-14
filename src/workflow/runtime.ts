@@ -77,11 +77,8 @@ export interface AgentEventBase {
   phase?: string;
 }
 
-/** Live activity observed inside a running subagent (text deltas / tool calls). */
-export interface AgentActivityEvent extends AgentEventBase {
-  kind: "text" | "thinking" | "tool";
-  detail?: string;
-}
+/** Live activity observed inside a running subagent. */
+export type AgentActivityEvent = AgentEventBase & AgentActivityInput;
 
 export interface WorkflowRunOptions {
   cwd?: string;
