@@ -302,11 +302,18 @@ export function reapStaleWorktrees(
   // repo-scoped, so only the current repo's worktrees are `tracked` below).
   const list = tryGit(toplevel, ["worktree", "list", "--porcelain"]);
   if (list == null) return;
+  const canonicalPath = (value: string): string => {
+    try {
+      return fs.realpathSync(value);
+    } catch {
+      return path.resolve(value);
+    }
+  };
   const tracked = new Set(
     list
       .split("\n")
       .filter((l) => l.startsWith("worktree "))
-      .map((l) => l.slice("worktree ".length).trim()),
+      .map((l) => canonicalPath(l.slice("worktree ".length).trim())),
   );
   let entries: string[];
   try {
@@ -325,7 +332,7 @@ export function reapStaleWorktrees(
       continue;
     }
     if (now - mtime <= maxAgeMs) continue; // recent: in-flight or within the recovery window
-    if (tracked.has(wtPath)) {
+    if (tracked.has(canonicalPath(wtPath))) {
       // Tracked + stale (kept from an old run in THIS repo): full remove + branch delete.
       const branch = `ultracode/${name.slice("ultracode-wt-".length)}`;
       removeWorktreeQuiet(toplevel, wtPath, branch);
