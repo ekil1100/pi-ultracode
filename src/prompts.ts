@@ -7,7 +7,7 @@
  */
 
 /** One-line description shown by `/ultracode status` and the footer. */
-export const ULTRACODE_TAGLINE = "xhigh thinking + dynamic workflow orchestration";
+export const ULTRACODE_TAGLINE = "max thinking + dynamic workflow orchestration";
 
 /**
  * The standing system-prompt block injected on every turn while ultracode is on.

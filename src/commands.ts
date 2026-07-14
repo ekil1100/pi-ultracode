@@ -9,19 +9,21 @@ import { renderWorkflowLines } from "./workflow/display.ts";
 
 export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
   pi.registerCommand("ultracode", {
-    description: "Toggle ultracode mode (xhigh thinking + default workflow orchestration). Bare /ultracode toggles; subcommands: on|off|status|budget <n>",
+    description: "Toggle ultracode mode (max thinking + default workflow orchestration). Bare /ultracode toggles; subcommands: on|off|status|budget <n>",
     getArgumentCompletions(prefix: string) {
       return ["on", "off", "status", "budget"]
         .filter((s) => s.startsWith(prefix))
         .map((value) => ({ value, label: value }));
     },
     handler: async (args: string, ctx) => {
+      mode.setCurrentModelSupportsThinking(ctx.model ? Boolean(ctx.model.reasoning) : undefined);
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "").toLowerCase();
 
       // Bare `/ultracode` is a toggle.
       if (sub === "") {
         const nowOn = mode.toggle(pi);
+        await mode.flushThinkingPreference();
         ctx.ui.notify(nowOn ? `Ultracode on — ${mode.statusLine()}` : "Ultracode off — thinking restored.", "info");
         ctx.ui.setStatus("ultracode", nowOn ? mode.statusLine() : undefined);
         return;
@@ -34,6 +36,7 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
 
       if (sub === "off") {
         mode.disable(pi);
+        await mode.flushThinkingPreference();
         ctx.ui.notify("Ultracode off — thinking restored, workflow orchestration is opt-in again.", "info");
         ctx.ui.setStatus("ultracode", undefined);
         return;
@@ -58,6 +61,7 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
         if (parsed) budget = parsed;
       }
       mode.enable(pi, budget !== undefined ? { budget } : {});
+      await mode.flushThinkingPreference();
       ctx.ui.notify(
         `Ultracode on — ${mode.statusLine()}${budget ? ` (budget ~${budget} tokens)` : ""}`,
         "info",

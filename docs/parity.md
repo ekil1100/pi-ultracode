@@ -1,6 +1,6 @@
 # pi-ultracode ↔ Claude Code "ultracode" 对齐状态
 
-> **快照时刻**:commit `f6e8a42`。本文由 A1–J3 diff 分析的验证会话结论重构,并经独立 workflow 重新对照当前源码逐条核实(每条带 `file:line` 证据)。
+> **快照起点**:commit `f6e8a42`。本文由 A1–J3 diff 分析的验证会话结论重构,并持续同步当前源码；后续 `max` effort 升级也记录在本文中。
 >
 > **范围说明**:原始 A1–J3 分析文档(23 项)**未落盘**,故本文不是原文复刻,而是"验证结论 + 当前代码状态"的固化。验证会话的元统计(17/23 完全准确、6 部分准确、pi 侧 0 完全错)来自会话记录,无法从代码反推;下方逐项只覆盖会话中留有记录的 notable 项。
 
@@ -15,7 +15,7 @@
 
 ## ultracode 模式实际做什么
 
-- **thinking**:主 agent 请求 `xhigh`,Pi SDK 按模型 clamp(`mode.ts` `applyThinking`)。
+- **thinking**:主 agent 请求 `max`,Pi SDK 按模型 clamp；旧版 Pi 不识别 `max` 时兼容回退到 `xhigh`(`mode.ts` `applyUltracodeThinking`)。
 - **workflow 工具**:始终在 active 列表(`extensions/ultracode.ts` `session_start`,即使 ultracode 关也按需可用)。
 - **standing prompt block**:开启时每轮注入(`mode.ts` `beforeAgentStart` → `prompts.ts` `ultracodeSystemBlock`),把默认倾向调到"substantive task 默认用 workflow",但明文给跳过条件(对话轮 / 琐碎机械改动)。
 - **触发方式 = 按需,不是必定触发**。没有任何 hook 强制调用 workflow;`tool_choice` 无法强制(Pi SDK 不暴露,见 D2)。模型有最终决定权。
@@ -30,13 +30,13 @@
 | **A2** | 删除死掉的 `WorkflowToolDeps.notify`;改用 `ctx.ui?.notify`(完成 + 错误/中止两路)。 | `src/workflow/tool.ts:58-72,204-206,241-243` |
 | **I2** | 补 guideline:no-schema `agent()` 返回子 agent 最后一段 assistant 文本。 | `src/prompts.ts:71` |
 | **commands 类型** | `commands.ts` 的 warn 级 notify 用 `"warning"`(非 `"warn"`,修正类型错误)。 | `src/commands.ts:112` |
-| **effort 转发** | 子 agent 继承 ultracode effort。`mode.getSubagentThinkingLevel()` 开启时返回原始 `"xhigh"`;`tool.ts` 经 `getThinkingLevel` dep 转发进 `runWorkflow` 选项;`extensions/ultracode.ts` 接线。每个子 agent 的 `createAgentSession` 各自按模型 clamp。优先级:per-call `model:"X:level"` > agentType `thinking:` > ultracode 默认。 | `src/mode.ts:59-61`;`src/workflow/tool.ts:67,101,155`;`extensions/ultracode.ts:20` |
+| **effort 转发** | 子 agent 继承 ultracode effort。最初在 `f6e8a42` 转发原始 `xhigh`;当前模式转发原始 `max`,runner 再按各子模型的 `thinkingLevelMap` 选择 `max` 或兼容 `xhigh`,由 Pi 最终 clamp。优先级仍为 per-call `model:"X:level"` > agentType `thinking:` > ultracode 默认。 | `src/mode.ts` `getSubagentThinkingLevel`;`src/workflow/agent-runner.ts` `resolveSessionThinkingLevel`;`src/workflow/tool.ts` `getThinkingLevel` |
 
 ## 判定不改(设计取舍 / SDK 限制)
 
 | 项 | 实际行为(代码确认) | 不改的理由 |
 |---|---|---|
-| **F4** | 确定性设计真实且刻意:`Date` **未**注入 sandbox(`Date.now()`/`new Date()` 会 `ReferenceError`);`durationMs` 由 host 在 workflow 返回后盖戳(`runtime.ts:89,105`)。`Math` 已换成 `createDeterministicMath` shim——保留 `max/min/floor/PI/E/...` 但**命名 `Math.random()` 运行时抛错**(cooperative guardrail;Node vm 非隔离边界,host-realm `.constructor` 仍可逃逸,已文档化)。`Date.now()` 是 epoch ms、**TZ 无关**,所谓“TZ 不确定性”并不存在。 | 确定性是刻意设计。`Math.random` 的 runtime gap 已用 shim 补(cooperative);硬隔离不在范围(文档已说明)。 |
+| **F4** | 确定性设计真实且刻意:AST 静态校验禁止 `Date.now()`/`new Date()`；`durationMs` 由 host 在 workflow 返回后盖戳(`runtime.ts:89,105`)。VM 仅是 cooperative guardrail，并非硬隔离边界。`Math` 已换成 `createDeterministicMath` shim——保留 `max/min/floor/PI/E/...`，但直接调用 `Math.random()` 会在运行时抛错；host-realm `.constructor` 仍可能逃逸，已文档化。`Date.now()` 是 epoch ms、**TZ 无关**，所谓“TZ 不确定性”并不存在。 | 确定性是刻意设计。`Math.random` 的 runtime gap 已用 shim 补(cooperative);硬隔离不在范围(文档已说明)。 |
 | **D2** | 子 agent **无重试**:`run()` 单次 `createAgentSession→prompt→return`;失败分支 `catch → log → return null`(`runtime.ts:280-282,314-315,341-342`)。全仓 `rg tool_choice|toolChoice` **无匹配**。 | 重试是设计选择(确定性 null-on-failure,可组合);`tool_choice` 是 Pi SDK 限制(`createAgentSession` 选项未暴露),pi-ultracode 无法单方面补。 |
 | **J2** | mode 持久化用 `pi.appendEntry`(`mode.ts:165`),append-only;`restore()` 扫所有 entry 取最新匹配(`mode.ts`)。全仓无 trim/compaction 调用(workflow journal 的 `appendFileSync` 同样 append-only,`create()` 只截断同 runId 的陈旧文件)。 | SDK `appendEntry` 只追加、无 trim API;compaction 是 pi 层职责。 |
 | **D3** | structured-output 走"公共子集转换 + `Type.Unsafe` 兜底":识别的子集正常转换,未识别的关键字用 `Type.Unsafe` 保留**原始 schema** 给模型(不丢不崩)。 | 刻意保留全 schema 给模型(非"公共子集"),文件头已说明(`json-schema.ts:5-8`)。 |
@@ -59,12 +59,14 @@
 | **保留 worktree 无 GC** | `reapStaleWorktrees`:扫 tmpdir,`ultracode-wt-*` 目录 + `ultracode-patch-*` 文件超 24h 才清;tracked 用 `git worktree remove`+branch -D,untracked 用 rmSync;`git worktree list` 失败时 bail-safe;同 24h 阈值保证 cross-repo in-flight/kept worktree 与同仓一样存活。 | `src/workflow/worktree.ts` `reapStaleWorktrees` |
 | **F4 Math.random gap** | sandbox 的 `Math` 换成 `createDeterministicMath` shim:保留 `max/min/floor/PI/E/...` 但命名 `Math.random()` 运行时抛错。**cooperative**(Node vm 非隔离边界,host-realm `.constructor` 可逃逸——已文档化)。 | `src/workflow/runtime.ts` `createDeterministicMath` |
 
-## effort-level 对齐(本轮补的)
+## effort-level 对齐（当前）
 
-- **主 agent**:`setThinkingLevel("xhigh")` → SDK `clampThinkingLevel` 按主模型 clamp(`mode.ts` `appliedThinking`)。
-- **workflow 子 agent**:转发**原始 `"xhigh"`**(`mode.ts` `getSubagentThinkingLevel`),各子 agent 的 `createAgentSession` 按各自模型 clamp——跨模型子 agent(如 `agent({model:"opus"})`)各自取自己模型的 max,不被主模型的 clamp 值压低。
-- **ultracode 关时**:`getSubagentThinkingLevel()` = `undefined` → 子 agent 回落 session 默认(`medium`),与改动前一致。
-- **优先级**(沿用 `resolveModelSelection`):per-call `model:"X:level"` > agentType `thinking:` > ultracode 默认。显式意图不会被 ultracode 盖掉。
+- **主 agent**:请求 `setThinkingLevel("max")`;Pi 按主模型 clamp。若旧版 Pi 将未知 `max` 降错,再请求 `xhigh` 保留旧行为。
+- **模型 / effort / session 生命周期**:Ultracode 开启期间切换模型会重新请求 `max`;手动降低 effort 也会立即重新请求 `max`，每轮 provider 调用前还有最终屏障。模式自身产生的事件与过期事件会被忽略,避免递归。由于 Pi 的 setter 同时写全局默认值，扩展会尽力保存并回写语义等价的全局 preference（原本缺省时会显式写为 `medium`）；旧版 active entry 若只有 `previousThinking` 且全局仍是旧实现写入的 `xhigh`，会用该快照迁移回原 baseline。`session_shutdown` 先进入 quiescing 再恢复开启前的有效 effort，但不改持久化 mode 状态，因此 reload/resume/fork replacement 与 `/tree` 导航都会按当前 branch 的 session 记录重新恢复。若中间模型只能表示 `xhigh`，原始待恢复的 `max` 不会被过早消费。Pi 尚无 session-only setter，hard kill、自定义 SDK agentDir 或另一份 live settings cache 仍属于上游 API 限制。
+- **workflow 子 agent**:模式转发**原始 `"max"`**;runner 根据各子模型是否公开非空 `thinkingLevelMap.max` 选择 `max` 或 `xhigh`,再交给 `createAgentSession` clamp。模型未知时先传 `max`，当前 Pi 的正常模型 clamp 不重建；pre-max Pi 或已宣告支持 `max` 却未接受的 runtime 才会销毁尚未运行的内存 session 并以 `xhigh` 重建,避免修改用户全局默认 effort。初始化、异步 preflight 与流式执行都响应取消；运行器等待 `abort()` 后再释放会话，且 cleanup 错误不覆盖原始失败。
+- **状态**:显示真实 clamp 后的 level（`off|minimal|low|medium|high|xhigh|max`），格式为 `ultracode: on · <level>`，可再追加 budget（不额外写 `thinking`）。
+- **ultracode 关时**:`getSubagentThinkingLevel()` = `undefined` → 子 agent 回落 session 默认;主 agent 恢复开启前的 effort。
+- **显式配置**:`model:"X:max"` 与 agent frontmatter `thinking: max` 均受支持。优先级仍为 per-call `model:"X:level"` > agentType `thinking:` > ultracode 默认。
 
 ## 验证 notable(解释为何 6 项"部分准确")
 
@@ -78,4 +80,4 @@
 
 **C1/D2/D3 行为比原分析描述的更差**:验证会话判定这三项实际 pi 侧行为比 A1–J3 写的差距更大(C1 静默切模型更严重、D2 既无重试又无 tool_choice、D3 兜底细节不同),故归为"部分准确"。
 
-*本文为活文档,随修复推进更新;每条结论均以 `file:line` 锚定到 `f6e8a42` 源码。*
+*本文为活文档,随修复推进更新；历史验证条目仍以 `f6e8a42` 为基线，标注“当前”的章节以现行源码为准。*

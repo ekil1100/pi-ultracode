@@ -37,7 +37,7 @@ declare global {
     phase?: string;
     /** JSON Schema for structured output; agent() then returns the validated object. */
     schema?: JsonSchema;
-    /** Override the subagent model by pattern, e.g. "sonnet" or "anthropic/...:high". */
+    /** Override model and optionally effort, e.g. "sonnet", "anthropic/...:high", or "gpt-5.6-sol:max". */
     model?: string;
     /** Run the agent in an isolated git worktree (for parallel file mutation). */
     isolation?: "worktree";

@@ -14,7 +14,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { ThinkingLevel } from "./agent-runner.ts";
+import { isThinkingLevel, type ThinkingLevel } from "../thinking.ts";
 
 export interface AgentTypeDef {
   name: string;
@@ -76,8 +76,6 @@ const BUILTIN_AGENT_TYPES: AgentTypeDef[] = [
   },
 ];
 
-const VALID_THINKING = new Set(["off", "minimal", "low", "medium", "high", "xhigh"]);
-
 export function discoverAgentTypes(cwd: string): Map<string, AgentTypeDef> {
   const map = new Map<string, AgentTypeDef>();
   for (const def of BUILTIN_AGENT_TYPES) map.set(def.name, def);
@@ -138,9 +136,8 @@ export function parseAgentTypeFile(
         .map((t) => t.trim())
         .filter(Boolean)
     : undefined;
-  const thinking = frontmatter.thinking && VALID_THINKING.has(frontmatter.thinking.trim())
-    ? (frontmatter.thinking.trim() as ThinkingLevel)
-    : undefined;
+  const rawThinking = frontmatter.thinking?.trim();
+  const thinking = rawThinking && isThinkingLevel(rawThinking) ? rawThinking : undefined;
   const systemPromptMode = frontmatter.systemPromptMode === "replace" ? "replace" : "append";
   const systemPrompt = (frontmatter.systemPrompt ?? body ?? "").trim();
   return {

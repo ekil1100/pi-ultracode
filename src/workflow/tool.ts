@@ -59,11 +59,9 @@ export interface WorkflowToolDeps {
   /** Default token budget from ultracode mode, if any. */
   getDefaultBudget?: () => number | null;
   /** The ultracode effort level to forward to every workflow subagent as its
-   *  default thinking level (xhigh when ultracode is on, so each subagent's own
-   *  session clamps it to that subagent model's max; undefined when off). Lets
-   *  subagents inherit the parent's ultracode effort instead of falling back to
-   *  the session default. A per-call `model: "X:level"` suffix or an agentType
-   *  `thinking:` override still takes precedence. */
+   *  default thinking level (`max` when ultracode is on, so each subagent's own
+   *  session clamps it independently; undefined when off). A per-call
+   *  `model: "X:level"` suffix or agentType `thinking:` override still wins. */
   getThinkingLevel?: () => ThinkingLevel | undefined;
   /** Test seam: inject a subagent runner so the tool path can run without a model. */
   testRunner?: { run: (call: any) => Promise<any> };
@@ -101,9 +99,8 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       const runsDir = runsDirFor(ctx);
       const runId = params.resumeFromRunId?.trim() || nextRunId();
       const budgetTotal = params.budget ?? deps.getDefaultBudget?.() ?? null;
-      // Forward the RAW ultracode effort level (xhigh) so each subagent's own
-      // createAgentSession clamps it to THAT subagent model's max — mirroring the
-      // parent's "request xhigh, clamp per model" contract. Undefined when off.
+      // Forward the raw `max` request so each subagent session clamps it against
+      // that subagent's model. Undefined when ultracode is off.
       const thinkingLevel = deps.getThinkingLevel?.();
       const run = deps.runWorkflowFn ?? runWorkflow;
 

@@ -5,9 +5,12 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
+  WorkflowAgentRunner,
   resolveModelSelection,
   matchModelIn,
   splitThinkingSuffix,
+  resolveSessionThinkingLevel,
+  type AgentSessionLike,
   type ThinkingLevel,
 } from "../src/workflow/agent-runner.ts";
 import { writeRescuePatch, applyPatch, captureWorktreeDiff, createWorktree, removeWorktree, reapStaleWorktrees, patchTmpPath } from "../src/workflow/worktree.ts";
@@ -19,6 +22,19 @@ const MODELS = [
   { provider: "openai", id: "gpt-4o", name: "GPT-4o" },
 ];
 const DEFAULT = { provider: "anthropic", id: "claude-opus", name: "Opus" };
+
+function fakeSession(overrides: Partial<AgentSessionLike> = {}): AgentSessionLike {
+  return {
+    thinkingLevel: "medium",
+    supportsThinking: () => true,
+    prompt: async () => {},
+    abort: async () => {},
+    subscribe: () => () => {},
+    dispose: () => {},
+    messages: [],
+    ...overrides,
+  };
+}
 
 // ---------------------------------------------------------------------------
 // C1: a bare ":level" pattern must keep the default model, only override thinking.
@@ -33,9 +49,12 @@ test("splitThinkingSuffix: bare :level yields empty base", () => {
   const b = splitThinkingSuffix("anthropic/claude-sonnet:high");
   assert.equal(b.base, "anthropic/claude-sonnet");
   assert.equal(b.thinking, "high");
-  const c = splitThinkingSuffix("sonnet");
-  assert.equal(c.base, "sonnet");
-  assert.equal(c.thinking, undefined);
+  const c = splitThinkingSuffix("gpt-5.6-sol:max");
+  assert.equal(c.base, "gpt-5.6-sol");
+  assert.equal(c.thinking, "max");
+  const d = splitThinkingSuffix("sonnet");
+  assert.equal(d.base, "sonnet");
+  assert.equal(d.thinking, undefined);
 });
 
 test("splitThinkingSuffix: trailing colon (empty suffix) strips to a matchable base", () => {
@@ -68,10 +87,10 @@ test("resolveModelSelection: no pattern and no role falls back to defaults", () 
   assert.equal(r.thinkingLevel, "medium");
 });
 
-test("resolveModelSelection: real pattern matches and applies the thinking suffix", () => {
-  const r = resolveModelSelection({ pattern: "sonnet:high", defaultModel: DEFAULT, models: MODELS });
+test("resolveModelSelection: real pattern matches and applies the max thinking suffix", () => {
+  const r = resolveModelSelection({ pattern: "sonnet:max", defaultModel: DEFAULT, models: MODELS });
   assert.equal(r.model?.id, "claude-sonnet");
-  assert.equal(r.thinkingLevel, "high");
+  assert.equal(r.thinkingLevel, "max");
 });
 
 test("resolveModelSelection: whitespace-padded pattern still matches (trim)", () => {
@@ -85,6 +104,27 @@ test("resolveModelSelection: unmatched pattern falls back to the default model",
   const r = resolveModelSelection({ pattern: "nope:high", defaultModel: DEFAULT, models: MODELS });
   assert.equal(r.model, DEFAULT);
   assert.equal(r.thinkingLevel, "high");
+});
+
+test("resolveModelSelection: an exact model id ending in :max stays literal", () => {
+  const base = { provider: "ollama", id: "coder", name: "Coder" };
+  const literal = { provider: "ollama", id: "coder:max", name: "Coder Max Tag" };
+  const r = resolveModelSelection({
+    pattern: "ollama/coder:max",
+    defaultModel: base,
+    defaultThinking: "medium",
+    models: [base, literal],
+  });
+  assert.equal(r.model, literal);
+  assert.equal(r.thinkingLevel, "medium", "literal id does not imply an effort override");
+
+  const withoutRegistry = resolveModelSelection({
+    pattern: "ollama/coder:max",
+    defaultModel: literal,
+    defaultThinking: "low",
+  });
+  assert.equal(withoutRegistry.model, literal, "the default model is an exact-match candidate");
+  assert.equal(withoutRegistry.thinkingLevel, "low");
 });
 
 test("resolveModelSelection: role model/thinking are used when no per-call pattern is given", () => {
@@ -105,6 +145,288 @@ test("matchModelIn: empty/whitespace pattern does not match (returns undefined, 
   assert.equal(matchModelIn(MODELS, " sonnet ")?.id, "claude-sonnet", "whitespace-padded matches");
   assert.equal(matchModelIn(MODELS, "sonnet")?.id, "claude-sonnet");
   assert.equal(matchModelIn(MODELS, "anthropic/claude-opus")?.id, "claude-opus");
+});
+
+test("resolveSessionThinkingLevel uses max only when the model advertises it", () => {
+  const maxModel = {
+    ...DEFAULT,
+    thinkingLevelMap: { max: "max" },
+  };
+  assert.equal(resolveSessionThinkingLevel("max", maxModel), "max");
+  assert.equal(resolveSessionThinkingLevel("max", { ...DEFAULT, thinkingLevelMap: { max: null } }), "xhigh");
+  assert.equal(resolveSessionThinkingLevel("max", DEFAULT), "xhigh");
+  assert.equal(resolveSessionThinkingLevel("max", undefined), "max");
+  assert.equal(resolveSessionThinkingLevel("high", DEFAULT), "high");
+});
+
+test("WorkflowAgentRunner lets a max-capable default model keep max", async () => {
+  const createdLevels: unknown[] = [];
+  const messages: unknown[] = [];
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    thinkingLevel: "max",
+    createSession: async (options) => {
+      createdLevels.push(options.thinkingLevel);
+      return {
+        session: fakeSession({
+          thinkingLevel: "max",
+          prompt: async () => {
+            messages.push({ role: "assistant", content: [{ type: "text", text: "max" }] });
+          },
+          messages,
+        }),
+      };
+    },
+  });
+  const result = await runner.run({ prompt: "test", label: "default max" });
+  assert.equal(result.value, "max");
+  assert.deepEqual(createdLevels, ["max"]);
+});
+
+test("WorkflowAgentRunner avoids rebuilding a current-Pi default model that clamps max", async () => {
+  const currentLevels: unknown[] = [];
+  const messages: unknown[] = [];
+  const currentRunner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    thinkingLevel: "max",
+    supportsMaxThinking: true,
+    createSession: async (options) => {
+      currentLevels.push(options.thinkingLevel);
+      return {
+        session: fakeSession({
+          thinkingLevel: "xhigh",
+          model: { ...DEFAULT, thinkingLevelMap: { xhigh: "xhigh" } },
+          prompt: async () => {
+            messages.push({ role: "assistant", content: [{ type: "text", text: "xhigh" }] });
+          },
+          messages,
+        }),
+      };
+    },
+  });
+  const current = await currentRunner.run({ prompt: "test", label: "current clamp" });
+  assert.equal(current.value, "xhigh");
+  assert.deepEqual(currentLevels, ["max"], "normal model clamp does not rebuild the session");
+
+  const legacyLevels: unknown[] = [];
+  const legacyRunner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    thinkingLevel: "max",
+    supportsMaxThinking: false,
+    createSession: async (options) => {
+      const index = legacyLevels.length;
+      legacyLevels.push(options.thinkingLevel);
+      return {
+        session: fakeSession({
+          thinkingLevel: index === 0 ? "medium" : "xhigh",
+        }),
+      };
+    },
+  });
+  await legacyRunner.run({ prompt: "test", label: "legacy default" });
+  assert.deepEqual(legacyLevels, ["max", "xhigh"], "pre-max Pi still receives the compatibility retry");
+});
+
+test("WorkflowAgentRunner retries xhigh when a legacy runtime clamps max to medium", async () => {
+  const createdLevels: unknown[] = [];
+  const disposed: number[] = [];
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    model: { ...DEFAULT, thinkingLevelMap: { max: "max" } },
+    thinkingLevel: "max",
+    createSession: async (options) => {
+      const index = createdLevels.length;
+      createdLevels.push(options.thinkingLevel);
+      const messages: unknown[] = [];
+      return {
+        session: fakeSession({
+          thinkingLevel: index === 0 ? "medium" : "xhigh",
+          prompt: async () => {
+            messages.push({ role: "assistant", content: [{ type: "text", text: "done" }] });
+          },
+          dispose: () => {
+            disposed.push(index);
+            if (index === 0) throw new Error("provisional cleanup failed");
+          },
+          messages,
+          getSessionStats: () => ({ tokens: { output: 1, total: 1 }, cost: 0 }),
+        }),
+      };
+    },
+  });
+
+  const result = await runner.run({ prompt: "test", label: "legacy" });
+  assert.equal(result.value, "done");
+  assert.deepEqual(createdLevels, ["max", "xhigh"]);
+  assert.deepEqual(disposed, [0, 1], "both provisional and final sessions are disposed");
+});
+
+test("WorkflowAgentRunner does not prompt when aborted during session creation", async () => {
+  const controller = new AbortController();
+  let release!: (created: { session: AgentSessionLike }) => void;
+  let promptCalls = 0;
+  let disposeCalls = 0;
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    createSession: () => new Promise((resolve) => {
+      release = resolve;
+    }),
+  });
+  const session = fakeSession({
+    prompt: async () => {
+      promptCalls++;
+    },
+    dispose: () => {
+      disposeCalls++;
+    },
+  });
+
+  const pending = runner.run({ prompt: "test", label: "abort", signal: controller.signal });
+  await Promise.resolve();
+  controller.abort();
+  release({ session });
+  await assert.rejects(pending, /Subagent was aborted/);
+  assert.equal(promptCalls, 0);
+  assert.equal(disposeCalls, 1);
+});
+
+test("WorkflowAgentRunner aborts after asynchronous prompt preflight without streaming", async () => {
+  const controller = new AbortController();
+  let enteredPreflight!: () => void;
+  let releasePreflight!: () => void;
+  const entered = new Promise<void>((resolve) => {
+    enteredPreflight = resolve;
+  });
+  const gate = new Promise<void>((resolve) => {
+    releasePreflight = resolve;
+  });
+  let streamCalled = false;
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    createSession: async () => ({
+      session: fakeSession({
+        prompt: async (_prompt, options) => {
+          enteredPreflight();
+          await gate;
+          options?.preflightResult?.(true);
+          streamCalled = true;
+        },
+      }),
+    }),
+  });
+
+  const pending = runner.run({ prompt: "test", label: "preflight", signal: controller.signal });
+  await entered;
+  controller.abort();
+  releasePreflight();
+  await assert.rejects(pending, /Subagent was aborted/);
+  assert.equal(streamCalled, false);
+});
+
+test("WorkflowAgentRunner waits for an in-flight abort before disposal", async () => {
+  const controller = new AbortController();
+  let releaseAbort!: () => void;
+  const abortGate = new Promise<void>((resolve) => {
+    releaseAbort = resolve;
+  });
+  let disposed = false;
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    createSession: async () => ({
+      session: fakeSession({
+        prompt: async () => {
+          controller.abort();
+          throw new Error("prompt failed");
+        },
+        abort: () => abortGate,
+        dispose: () => {
+          disposed = true;
+        },
+      }),
+    }),
+  });
+
+  const pending = runner.run({ prompt: "test", label: "abort wait", signal: controller.signal });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(disposed, false, "abort teardown is still pending");
+  releaseAbort();
+  await assert.rejects(pending, /prompt failed/);
+  assert.equal(disposed, true);
+});
+
+test("WorkflowAgentRunner preserves a prompt error when final cleanup also fails", async () => {
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    createSession: async () => ({
+      session: fakeSession({
+        prompt: async () => {
+          throw new Error("prompt failed");
+        },
+        dispose: () => {
+          throw new Error("cleanup failed");
+        },
+      }),
+    }),
+  });
+
+  await assert.rejects(
+    runner.run({ prompt: "test", label: "cleanup" }),
+    /prompt failed/,
+  );
+});
+
+test("WorkflowAgentRunner contains abort rejection and preserves reject(undefined)", async () => {
+  const controller = new AbortController();
+  const abortingRunner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    createSession: async () => ({
+      session: fakeSession({
+        prompt: async () => {
+          controller.abort();
+          await Promise.resolve();
+        },
+        abort: async () => {
+          throw new Error("abort cleanup failed");
+        },
+      }),
+    }),
+  });
+  await assert.rejects(
+    abortingRunner.run({ prompt: "test", label: "abort rejection", signal: controller.signal }),
+    /Subagent was aborted/,
+  );
+
+  let disposed = false;
+  const undefinedRunner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    createSession: async () => ({
+      session: fakeSession({
+        prompt: () => Promise.reject(undefined),
+        subscribe: () => () => {
+          throw new Error("unsubscribe failed");
+        },
+        dispose: () => {
+          disposed = true;
+          throw new Error("must not replace primary failure");
+        },
+      }),
+    }),
+  });
+  let rejected = false;
+  let reason: unknown = "not set";
+  try {
+    await undefinedRunner.run({
+      prompt: "test",
+      label: "undefined rejection",
+      onActivity: () => {},
+    });
+  } catch (error) {
+    rejected = true;
+    reason = error;
+  }
+  assert.equal(rejected, true);
+  assert.equal(reason, undefined);
+  assert.equal(disposed, true, "unsubscribe failure cannot skip session disposal");
 });
 
 // ---------------------------------------------------------------------------
