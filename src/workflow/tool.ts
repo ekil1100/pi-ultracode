@@ -15,6 +15,7 @@ import {
   WORKFLOW_PROMPT_SNIPPET,
   WORKFLOW_TOOL_DESCRIPTION,
 } from "../prompts.ts";
+import { redactCommand, truncateDisplay } from "./display-text.ts";
 import { parseWorkflowScript, normalizeScript } from "./parser.ts";
 import { runWorkflow } from "./runtime.ts";
 import type { ThinkingLevel } from "./agent-runner.ts";
@@ -97,9 +98,11 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       const cwd = ctx.cwd;
       const { script, sourceLabel } = resolveScript(params, cwd);
       const parsed = parseWorkflowScript(script);
+      const displayName = truncateDisplay(parsed.meta.name, 60) || "workflow";
 
       const runsDir = runsDirFor(ctx);
-      const runId = params.resumeFromRunId?.trim() || nextRunId();
+      const requestedRunId = params.resumeFromRunId?.trim();
+      const runId = requestedRunId ? requireSafeRunId(requestedRunId) : nextRunId();
       const budgetTotal = params.budget ?? deps.getDefaultBudget?.() ?? null;
       // Forward the RAW ultracode effort level (xhigh) so each subagent's own
       // createAgentSession clamps it to THAT subagent model's max — mirroring the
@@ -125,7 +128,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         args: params.args,
         startedAt: Date.now(),
       };
-      const resuming = Boolean(params.resumeFromRunId) && RunJournal.exists(runsDir, runId);
+      const resuming = Boolean(requestedRunId) && RunJournal.exists(runsDir, runId);
       let journal: RunJournal | undefined;
       try {
         journal = resuming
@@ -152,13 +155,14 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       // mutated on every activity tick; only the TUI re-render is throttled, so
       // `/workflows <runId>` still reads fully-live fields between renders.
       let lastActivityRenderMs = 0;
+      let acceptingEvents = true;
 
       const recordPhase = (title?: string) => {
         if (title && !snapshot.phases.includes(title)) snapshot.phases.push(title);
       };
 
-      // Heartbeat: keep elapsed/idle markers live in the compact panel even when a
-      // subagent emits no events (so a silently-stuck agent actually shows "⚠ idle").
+      // Heartbeat: keep elapsed/no-event markers live in the compact panel even
+      // when a subagent emits no events.
       const heartbeat = setInterval(() => update(), 1000);
 
       try {
@@ -173,15 +177,18 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           runner: deps.testRunner,
           journal,
           onLog(message) {
+            if (!acceptingEvents) return;
             snapshot.logs.push(message);
             update();
           },
           onPhase(title) {
+            if (!acceptingEvents) return;
             snapshot.currentPhase = title;
             recordPhase(title);
             update();
           },
           onAgentStart(event) {
+            if (!acceptingEvents) return;
             recordPhase(event.phase);
             const startedAt = Date.now();
             snapshot.agents.push({
@@ -191,10 +198,12 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
               status: event.cached ? "cached" : "running",
               startedAt,
               lastActivityAt: startedAt,
+              activity: event.cached ? "replaying cache" : "starting session",
             });
             update();
           },
           onAgentEnd(event) {
+            if (!acceptingEvents) return;
             const agent = snapshot.agents.find((a) => a.id === event.id);
             if (agent) {
               if (agent.status !== "cached") agent.status = event.status;
@@ -202,18 +211,44 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
               if (event.status === "error") agent.error = preview(event.result);
               const endedAt = Date.now();
               agent.endedAt = endedAt;
+              agent.activeTools = undefined;
+              agent.streamTail = undefined;
               if (agent.startedAt != null) agent.durationMs = endedAt - agent.startedAt;
             }
             update();
           },
           onAgentActivity(event) {
+            if (!acceptingEvents) return;
             const agent = snapshot.agents.find((a) => a.id === event.id);
             if (!agent) return;
             const now = Date.now();
             agent.lastActivityAt = now;
-            agent.activity = event.kind === "tool" ? (event.detail ?? "tool") : event.kind;
-            if (event.kind === "text" && event.detail) {
-              const tail = (agent.streamTail ?? "") + event.detail;
+            agent.activity = activityLabel(event.kind, event.detail);
+
+            if (event.kind === "tool") {
+              const activeTools = agent.activeTools ?? [];
+              const existing = activeTools.find((tool) => tool.id === event.toolCallId);
+              if (event.toolState === "end") {
+                agent.activeTools = activeTools.filter((tool) => tool.id !== event.toolCallId);
+              } else if (existing) {
+                existing.name = event.toolName;
+                existing.args = event.toolArgs ?? existing.args;
+                existing.lastUpdateAt = now;
+              } else {
+                activeTools.push({
+                  id: event.toolCallId,
+                  name: event.toolName,
+                  args: event.toolArgs,
+                  startedAt: now,
+                  lastUpdateAt: now,
+                });
+                agent.activeTools = activeTools;
+              }
+              if (event.toolState === "start") agent.streamTail = undefined;
+            }
+
+            if (event.kind === "text" && event.streamDelta) {
+              const tail = (agent.streamTail ?? "") + event.streamDelta;
               agent.streamTail = tail.length > STREAM_TAIL_MAX ? tail.slice(-STREAM_TAIL_MAX) : tail;
             }
             if (now - lastActivityRenderMs >= ACTIVITY_RENDER_INTERVAL_MS) {
@@ -223,6 +258,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           },
         });
 
+        acceptingEvents = false;
         snapshot.result = result.result;
         snapshot.spentTokens = result.spentTokens;
         snapshot.durationMs = result.durationMs;
@@ -238,7 +274,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         onUpdate?.({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
 
         ctx.ui?.notify(
-          `Workflow ${result.meta.name} completed: ${result.agentCount} agent(s), ~${result.spentTokens} output tokens.`,
+          `Workflow ${displayName} completed: ${result.agentCount} agent(s), ~${result.spentTokens} output tokens.`,
           "info",
         );
 
@@ -248,7 +284,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
             {
               type: "text",
               text:
-                `Workflow ${result.meta.name} completed: ${result.agentCount} agent(s)${cachedNote}, ` +
+                `Workflow ${displayName} completed: ${result.agentCount} agent(s)${cachedNote}, ` +
                 `~${result.spentTokens} output tokens, ${Math.round(result.durationMs)}ms.\n` +
                 `runId: ${runId}  (script: ${scriptPath})\n\n` +
                 `Result:\n${safeJson(result.result)}`,
@@ -258,10 +294,14 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         };
       } catch (error) {
         const aborted = controller.signal.aborted || isAbortError(error);
+        acceptingEvents = false;
+        if (!controller.signal.aborted) controller.abort();
         for (const agent of snapshot.agents) {
           if (agent.status === "running") {
             agent.status = "skipped";
             agent.error = "aborted";
+            agent.activeTools = undefined;
+            agent.streamTail = undefined;
           }
         }
         snapshot.status = aborted ? "aborted" : "failed";
@@ -274,13 +314,15 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           durationMs: snapshot.durationMs ?? 0,
         });
         onUpdate?.({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
+        const errorText = statusText(error);
         ctx.ui?.notify(
-          `Workflow ${parsed.meta.name} ${aborted ? "was aborted" : "failed"}${aborted ? "" : `: ${error instanceof Error ? error.message : String(error)}`}`,
+          `Workflow ${displayName} ${aborted ? "was aborted" : "failed"}${aborted ? "" : `: ${errorText}`}`,
           aborted ? "warning" : "error",
         );
-        if (aborted) throw new Error(`Workflow ${parsed.meta.name} was aborted (runId: ${runId})`);
-        throw error;
+        if (aborted) throw new Error(`Workflow ${displayName} was aborted (runId: ${runId})`);
+        throw new Error(`Workflow ${displayName} failed: ${errorText}`);
       } finally {
+        acceptingEvents = false;
         clearInterval(heartbeat);
         signal?.removeEventListener("abort", onOuterAbort);
         journal?.close();
@@ -347,4 +389,22 @@ function safeJson(value: unknown): string {
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && /\babort(?:ed)?\b/i.test(error.message);
+}
+
+function requireSafeRunId(value: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
+    throw new Error("workflow: resumeFromRunId must contain only letters, numbers, dot, underscore, or hyphen");
+  }
+  return value;
+}
+
+function statusText(value: unknown): string {
+  const text = value instanceof Error ? value.message : String(value);
+  return truncateDisplay(redactCommand(text), 160) || "unknown error";
+}
+
+function activityLabel(kind: string, detail: string | undefined): string {
+  if (kind === "text") return "responding";
+  if (kind === "thinking") return "thinking";
+  return detail?.trim() || kind;
 }
