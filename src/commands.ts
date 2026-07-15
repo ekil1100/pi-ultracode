@@ -117,7 +117,7 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
           ctx.ui.notify(`No workflow run matching "${truncateDisplay(arg, 80)}". /workflows to list, /workflows clear to hide.`, "warning");
           return;
         }
-        show(renderWorkflowLines(handle.snapshot, { maxAgents: 12, maxLogs: 6, showResultPreviews: true, showStream: true }));
+        show(renderWorkflowLines(handle.snapshot, { maxAgents: 12, maxLogs: 6, showResultPreviews: true }));
         ctx.ui.notify(`Showing ${truncateDisplay(handle.snapshot.runId ?? "run", 128)}. /workflows clear to hide.`, "info");
         return;
       }

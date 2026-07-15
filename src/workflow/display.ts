@@ -3,7 +3,7 @@
  * for streamed tool updates and the final tool result.
  */
 
-import { truncateDisplay, truncateDisplayTail } from "./display-text.ts";
+import { safeDisplayText } from "./display-text.ts";
 import type { WorkflowMeta } from "./parser.ts";
 
 export type WorkflowAgentStatus = "running" | "done" | "error" | "skipped" | "cached";
@@ -35,7 +35,7 @@ export interface WorkflowAgentSnapshot {
   activity?: string;
   /** Tool calls that have started but have not emitted tool_execution_end. */
   activeTools?: WorkflowActiveToolSnapshot[];
-  /** Ring buffer of recent assistant text while running (live, not persisted). */
+  /** @deprecated Raw assistant stream text is never captured or rendered. */
   streamTail?: string;
 }
 
@@ -63,7 +63,7 @@ export interface RenderOptions {
   maxAgents?: number;
   maxLogs?: number;
   showResultPreviews?: boolean;
-  /** Show the live streaming tail under each running agent (inspect view). */
+  /** @deprecated No-op retained for source compatibility. */
   showStream?: boolean;
   /** Override `Date.now()` for deterministic elapsed/activity rendering in tests. */
   now?: number;
@@ -72,9 +72,9 @@ export interface RenderOptions {
 export function createSnapshot(meta: WorkflowMeta, runId: string, budgetTotal: number | null): WorkflowSnapshot {
   return {
     runId,
-    name: truncateDisplay(meta.name, 120) || "workflow",
-    description: meta.description ? truncateDisplay(meta.description, 240) : undefined,
-    phases: meta.phases?.map((p) => p.title) ?? [],
+    name: safeDisplayText(meta.name, 120) || "workflow",
+    description: meta.description ? safeDisplayText(meta.description, 240) : undefined,
+    phases: meta.phases?.map((p) => safeDisplayText(p.title, 120)).filter(Boolean) ?? [],
     logs: [],
     agents: [],
     agentCount: 0,
@@ -100,7 +100,6 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
   const maxAgents = options.maxAgents ?? 6;
   const maxLogs = options.maxLogs ?? 2;
   const showResultPreviews = options.showResultPreviews ?? false;
-  const showStream = options.showStream ?? false;
   const now = options.now ?? Date.now();
 
   const tokens = snapshot.spentTokens
@@ -136,7 +135,7 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
       `  ${marker} ${shorten(phase, 60)} ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}`,
     );
     for (const agent of agents.slice(-maxAgents)) {
-      lines.push(renderAgentLine(agent, { showResultPreviews, showStream, now }));
+      lines.push(renderAgentLine(agent, { showResultPreviews, now }));
     }
     if (agents.length > maxAgents) lines.push(`    … ${agents.length - maxAgents} earlier agents`);
   }
@@ -145,7 +144,7 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
   if (unphased.length) {
     lines.push("  (unphased)");
     for (const agent of unphased.slice(-maxAgents)) {
-      lines.push(renderAgentLine(agent, { showResultPreviews, showStream, now }));
+      lines.push(renderAgentLine(agent, { showResultPreviews, now }));
     }
   }
 
@@ -158,8 +157,8 @@ export function renderWorkflowText(snapshot: WorkflowSnapshot, options: RenderOp
 }
 
 export function preview(value: unknown, max = 80): string {
-  const text = typeof value === "string" ? value : safeJson(value);
-  return text ? truncateDisplay(text, max) : "";
+  const text = typeof value === "string" ? value : boundedProjection(value, max);
+  return text ? safeDisplayText(text, max) : "";
 }
 
 function statusMark(status: WorkflowSnapshot["status"]): string {
@@ -195,7 +194,7 @@ function unique(values: string[]): string[] {
 }
 
 function shorten(value: string, max: number): string {
-  return truncateDisplay(value, max);
+  return safeDisplayText(value, max);
 }
 
 function formatTokens(n: number): string {
@@ -204,11 +203,32 @@ function formatTokens(n: number): string {
   return String(n);
 }
 
-function safeJson(value: unknown): string {
+const PREVIEW_MAX_STRING = 256;
+const UNINSPECTABLE_PREVIEW = "[Uninspectable]";
+
+/**
+ * Build a UI-only projection without invoking arbitrary object hooks. Objects
+ * and arrays intentionally remain opaque: JavaScript has no bounded own-key
+ * enumeration API, and Proxy/accessor traps must never affect agent success.
+ */
+function boundedProjection(value: unknown, _max: number): string {
   try {
-    return JSON.stringify(value) ?? "";
+    if (value === null) return "null";
+    if (typeof value === "string") {
+      const bounded = value.length > PREVIEW_MAX_STRING
+        ? `${value.slice(0, PREVIEW_MAX_STRING)}…`
+        : value;
+      return JSON.stringify(bounded);
+    }
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "undefined") {
+      return String(value);
+    }
+    if (typeof value === "bigint") return "[BigInt]";
+    if (typeof value === "symbol") return "[Symbol]";
+    if (typeof value === "function") return "[Function]";
+    return Array.isArray(value) ? "[Array]" : "[Object]";
   } catch {
-    return String(value);
+    return UNINSPECTABLE_PREVIEW;
   }
 }
 
@@ -219,17 +239,14 @@ function renderAgentLine(
   agent: WorkflowAgentSnapshot,
   opts: {
     showResultPreviews: boolean;
-    showStream: boolean;
     now: number;
   },
 ): string {
   const meta = agentMeta(agent, opts.now);
-  const result = opts.showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
-  const stream =
-    opts.showStream && agent.status === "running" && agent.streamTail
-      ? `\n      ┊ ${truncateDisplayTail(agent.streamTail, 120)}`
-      : "";
-  return `    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${meta}${result}${stream}`;
+  const result = opts.showResultPreviews && agent.resultPreview
+    ? ` — ${safeDisplayText(agent.resultPreview, 80)}`
+    : "";
+  return `    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${meta}${result}`;
 }
 
 /** Compact per-agent timing/activity suffix for the live snapshot. */

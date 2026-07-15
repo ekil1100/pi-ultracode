@@ -3,13 +3,26 @@ import assert from "node:assert/strict";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { runWorkflow } from "../src/workflow/runtime.ts";
+import {
+  MAX_WORKFLOW_LOGS,
+  WORKFLOW_LOG_OMITTED_TEXT,
+  runWorkflow,
+} from "../src/workflow/runtime.ts";
 import { createWorkflowTool } from "../src/workflow/tool.ts";
 import { RunJournal } from "../src/workflow/journal.ts";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { forwardActivity, toolArgsPreview, type AgentActivityInput } from "../src/workflow/agent-runner.ts";
 import {
+  DISPLAY_INPUT_LIMIT,
+  DISPLAY_OMITTED_TEXT,
+  redactCommand,
+  safeDisplayTail,
+  safeDisplayText,
+  stripTerminalControls,
+} from "../src/workflow/display-text.ts";
+import {
   createSnapshot,
+  preview,
   recompute,
   renderWorkflowLines,
 } from "../src/workflow/display.ts";
@@ -26,7 +39,7 @@ test("onAgentStart/onAgentEnd fire with timing; onAgentActivity is forwarded wit
   const runner = {
     run: async (call: any) => {
       // Simulate a subagent that streams text, thinks, and calls a tool.
-      call.onActivity?.({ kind: "text", detail: "hi" });
+      call.onActivity?.({ kind: "text", detail: "responding" });
       call.onActivity?.({ kind: "thinking" });
       call.onActivity?.({ kind: "tool", detail: "bash" });
       return { value: `v:${call.label}`, usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: "/tmp" };
@@ -54,7 +67,7 @@ test("onAgentStart/onAgentEnd fire with timing; onAgentActivity is forwarded wit
   assert.equal(ends[0].status, "done");
 
   assert.equal(activity.length, 3, "all three activity signals forwarded");
-  assert.deepEqual(activity[0], { id: 1, label: "lbl", phase: "Work", kind: "text", detail: "hi" });
+  assert.deepEqual(activity[0], { id: 1, label: "lbl", phase: "Work", kind: "text", detail: "responding" });
   assert.deepEqual(activity[1], { id: 1, label: "lbl", phase: "Work", kind: "thinking", detail: undefined });
   assert.deepEqual(activity[2], { id: 1, label: "lbl", phase: "Work", kind: "tool", detail: "bash" });
 });
@@ -105,7 +118,7 @@ test("journal records per-agent startedAt/durationMs in the .jsonl log", async (
   const script = `export const meta = { name: 'jt', description: 'x' }\nreturn await agent('p', { label: 'a' })`;
   const runner = {
     run: async (call: any) => {
-      call.onActivity?.({ kind: "text", detail: "x" });
+      call.onActivity?.({ kind: "text", detail: "responding" });
       return { value: "v", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: "/tmp" };
     },
   };
@@ -155,7 +168,6 @@ test("renderWorkflowLines keeps the last known state visible when an agent stops
       startedAt: 0,
       lastActivityAt: now - 259_000,
       activity: "waiting for model",
-      streamTail: "last model output",
     },
     {
       id: 4,
@@ -165,7 +177,6 @@ test("renderWorkflowLines keeps the last known state visible when an agent stops
       startedAt: now - 2_000,
       lastActivityAt: now - 500,
       activity: "responding",
-      streamTail: "partial output here",
     },
   ];
   const computed = recompute(snap);
@@ -178,13 +189,8 @@ test("renderWorkflowLines keeps the last known state visible when an agent stops
   assert.doesNotMatch(text, /1m 60s/);
   assert.match(text, /running-agent · 23s · waiting for model/);
   assert.match(text, /silent-agent · 337s · ⚠ no events 259s · last: waiting for model/);
-  assert.match(text, /silent-agent[\s\S]*┊ last model output/);
-  assert.match(text, /stream-agent[\s\S]*┊ partial output here/);
-
-  // Compact rendering never exposes raw output without an explicit inspect view.
-  const compact = renderWorkflowLines(computed, { now }).join("\n");
-  assert.doesNotMatch(compact, /┊ last model output/);
-  assert.doesNotMatch(compact, /┊ partial output here/);
+  assert.match(text, /stream-agent · 2s · responding/);
+  assert.doesNotMatch(text, /┊/);
 });
 
 test("renderWorkflowLines surfaces the stalest concurrent tool", () => {
@@ -226,7 +232,7 @@ test("renderWorkflowLines surfaces the stalest concurrent tool", () => {
   assert.doesNotMatch(belowThreshold, /no tool events/);
 });
 
-test("renderWorkflowLines strips terminal controls and keeps the newest output tail", () => {
+test("renderWorkflowLines strips terminal controls and ignores deprecated stream tails", () => {
   const now = 40_000;
   const snap = createSnapshot({ name: "tail\u001b]52;c;name-spoof\u0007", description: "x" }, "wf_tail", null);
   snap.agents = [
@@ -257,8 +263,163 @@ test("renderWorkflowLines strips terminal controls and keeps the newest output t
 
   const text = renderWorkflowLines(recompute(snap), { now, showStream: true }).join("\n");
   assert.match(text, /worker/);
-  assert.match(text, /….*LATEST/);
+  assert.doesNotMatch(text, /LATEST|oldold|┊/);
   assert.doesNotMatch(text, /spoofed|tool-spoof|name-spoof|\u001b|\u0007|\[2J/);
+});
+
+test("display safety consumes structured, escaped, and unterminated secrets", () => {
+  const redacted = [
+    redactCommand('Authorization: "Bearer topsecret"'),
+    redactCommand('Authorization: "Bearer unterminated-secret'),
+    redactCommand("Authorization: 'Bearer unterminated-single"),
+    redactCommand('{"Authorization":"Bearer jsonsecret"}'),
+    redactCommand(String.raw`{"x-api-key":"prefix\"ESCAPED_SECRET"}`),
+    redactCommand('{"Authorization":["Bearer ARRAY_SECRET"]}'),
+    redactCommand('{"client-secret":{"value":"OBJECT_SECRET"}}'),
+    redactCommand("postgres://alice:DSN_SECRET@db.example/app"),
+    redactCommand("Author\u200Bization: Bearer ZERO_WIDTH_SECRET"),
+    redactCommand("Author\u180Fization: Bearer MONGOLIAN_VARIATION_SECRET"),
+    redactCommand('failed(Authorization:"Bearer PAREN_SECRET")'),
+    redactCommand("{'Authorization':'Bearer SINGLE_KEY_SECRET'}"),
+    redactCommand('Authorization: Digest username="alice", realm="r", response="DIGEST_SECRET"'),
+    redactCommand('_postgres://alice:PREFIX_URI_SECRET@db.example/app'),
+    redactCommand('X-Auth-Token: X_AUTH_SECRET'),
+    redactCommand('Cookie: session=COOKIE_SECRET'),
+    redactCommand('Set-Cookie: session=SET_COOKIE_SECRET'),
+    redactCommand('?refresh_token=REFRESH_SECRET&id_token=ID_SECRET'),
+    redactCommand("curl -HAuthorization: Bearer CURL_HEADER_SECRET"),
+    redactCommand("curl -H 'Authorization: Bearer QUOTED_CURL_SECRET'"),
+  ].join(" ");
+  assert.doesNotMatch(
+    redacted,
+    /topsecret|unterminated-secret|unterminated-single|jsonsecret|ESCAPED_SECRET|ARRAY_SECRET|OBJECT_SECRET|DSN_SECRET|ZERO_WIDTH_SECRET|MONGOLIAN_VARIATION_SECRET|PAREN_SECRET|SINGLE_KEY_SECRET|DIGEST_SECRET|PREFIX_URI_SECRET|X_AUTH_SECRET|COOKIE_SECRET|SET_COOKIE_SECRET|REFRESH_SECRET|ID_SECRET|CURL_HEADER_SECRET|QUOTED_CURL_SECRET/,
+  );
+  assert.match(redacted, /Authorization:\s*\*\*\*/i);
+  assert.match(redacted, /x-api-key"?:\s*\*\*\*/i);
+  assert.match(redacted, /postgres:\/\/\*\*\*@db\.example/);
+  assert.match(redacted, /_postgres:\/\/\*\*\*@db\.example/);
+});
+
+test("display helpers bound hostile input before scanning and omit unsafe tails", () => {
+  const hostile = "\u001b]".repeat(DISPLAY_INPUT_LIMIT * 4) + "unterminated";
+  assert.equal(stripTerminalControls(hostile), "…");
+  assert.equal(stripTerminalControls("left\u202Eright\u2066end\u2069"), "leftrightend");
+  assert.equal(stripTerminalControls("Author\u200Bization"), "Authorization");
+  assert.equal(stripTerminalControls("Author\u180Fization"), "Authorization");
+
+  const huge = "A".repeat(DISPLAY_INPUT_LIMIT * 4);
+  const bounded = stripTerminalControls(huge);
+  assert.equal(bounded.length, DISPLAY_INPUT_LIMIT + 1);
+  assert.equal(bounded.endsWith("…"), true);
+  assert.equal(safeDisplayTail(huge, 80), DISPLAY_OMITTED_TEXT);
+  const pathPreview = toolArgsPreview("read", { path: huge }, 80);
+  assert.ok(pathPreview);
+  assert.ok(pathPreview.length <= 80);
+
+  const hugeUri = `https://alice:${"URI_SECRET_".repeat(2_000)}@db.example`;
+  assert.equal(safeDisplayText(hugeUri, 80), DISPLAY_OMITTED_TEXT);
+  assert.doesNotMatch(safeDisplayText(hugeUri, 80), /URI_SECRET/);
+  const hugeTokenUri = `https://${"TOKEN_SECRET_".repeat(2_000)}@db.example`;
+  assert.equal(safeDisplayText(hugeTokenUri, 80), DISPLAY_OMITTED_TEXT);
+  assert.doesNotMatch(safeDisplayText(hugeTokenUri, 80), /TOKEN_SECRET/);
+});
+
+test("public rendering redacts snapshot fields even when callers bypass constructors", () => {
+  const snap = createSnapshot({ name: "safe", description: "x" }, "wf_public", null);
+  snap.name = "visible\u202Espoof";
+  snap.logs = ['Authorization: "Bearer logsecret"'];
+  snap.agents = [{
+    id: 1,
+    label: "agent\u001b]0;label-spoof\u0007",
+    status: "done",
+    resultPreview: '{"x-api-key":"previewsecret"}',
+  }];
+  const text = renderWorkflowLines(recompute(snap), { showResultPreviews: true }).join("\n");
+  assert.doesNotMatch(text, /logsecret|previewsecret|label-spoof|\u202E|\u001b|\u0007/);
+  assert.match(text, /\*\*\*/);
+});
+
+test("result previews use a bounded projection for huge and circular values", () => {
+  const value: any = {
+    Authorization: "Bearer PREVIEW_SECRET",
+    payload: "x".repeat(1_000_000),
+    sparse: [],
+  };
+  value.sparse.length = 1_000_000_000;
+  value.sparse[0] = "first";
+  value.self = value;
+
+  const text = preview(value, 80);
+  assert.equal(text, "[Object]");
+  assert.equal(value.Authorization, "Bearer PREVIEW_SECRET");
+  assert.equal(value.self, value);
+});
+
+test("result previews never inspect object hooks or expand hostile primitives", () => {
+  let getterCalls = 0;
+  const prototype: Record<string, unknown> = {};
+  for (let index = 0; index < 1_000; index++) prototype[`inherited_${index}`] = index;
+  const value = Object.create(prototype) as Record<string, unknown>;
+  value.safe = "visible";
+  Object.defineProperty(value, "dangerous", {
+    enumerable: true,
+    get() {
+      getterCalls++;
+      value.mutated = true;
+      return "must-not-run";
+    },
+  });
+  assert.equal(preview(value, 160), "[Object]");
+  assert.equal(getterCalls, 0);
+  assert.equal(value.mutated, undefined);
+
+  let functionNameReads = 0;
+  const callable = () => {};
+  Object.defineProperty(callable, "name", {
+    configurable: true,
+    get() {
+      functionNameReads++;
+      return "must-not-run";
+    },
+  });
+  assert.equal(preview(callable, 80), "[Function]");
+  assert.equal(functionNameReads, 0);
+  assert.equal(preview(Symbol("x".repeat(100_000)), 80), "[Symbol]");
+  assert.equal(preview(1n << 1_000_000n, 80), "[BigInt]");
+
+  let trapCalls = 0;
+  const arrayProxy = new Proxy([], {
+    ownKeys() {
+      trapCalls++;
+      throw new Error("ownKeys trap");
+    },
+    getOwnPropertyDescriptor() {
+      trapCalls++;
+      throw new Error("descriptor trap");
+    },
+  });
+  const objectProxy = new Proxy({}, {
+    ownKeys() {
+      trapCalls++;
+      throw new Error("ownKeys trap");
+    },
+    getOwnPropertyDescriptor() {
+      trapCalls++;
+      throw new Error("descriptor trap");
+    },
+    getPrototypeOf() {
+      trapCalls++;
+      throw new Error("prototype trap");
+    },
+  });
+  assert.equal(preview(arrayProxy, 80), "[Array]");
+  assert.equal(preview(objectProxy, 80), "[Object]");
+  assert.equal(trapCalls, 0);
+
+  const revoked = Proxy.revocable({}, {});
+  revoked.revoke();
+  assert.doesNotThrow(() => preview(revoked.proxy, 80));
+  assert.equal(preview(revoked.proxy, 80), "[Uninspectable]");
 });
 
 test("running agent with no activity shows elapsed only (no activity suffix)", () => {
@@ -326,7 +487,7 @@ test("workflow tool wires text and tool lifecycle into live snapshots", async ()
   const runningTool = updates.find((update) => update.agents?.[0]?.activeTools?.length > 0);
   assert.equal(runningTool.agents[0].activeTools[0].name, "bash");
   assert.equal(runningTool.agents[0].activeTools[0].args, "npm test");
-  assert.equal(runningTool.agents[0].streamTail, undefined, "tool output is not copied into status");
+  assert.equal(runningTool.agents[0].streamTail, undefined, "raw text is never captured");
 
   const final = updates[updates.length - 1] as any;
   const agent = final.agents[0];
@@ -341,33 +502,133 @@ test("workflow tool wires text and tool lifecycle into live snapshots", async ()
   fs.rmSync(sessionDir, { recursive: true, force: true });
 });
 
-test("workflow tool does not append text lifecycle labels to the output tail", async () => {
-  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-obs-text-"));
-  const runner = {
-    run: async (call: any) => {
-      call.onActivity?.({ kind: "text", detail: "responding" });
-      call.onActivity?.({ kind: "text", detail: "hello", streamDelta: "hello" });
-      await new Promise((resolve) => setTimeout(resolve, 220));
-      call.onActivity?.({ kind: "text", detail: "responding" });
-      return { value: "done", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: process.cwd() };
-    },
+test("workflow tool never exposes raw assistant text deltas", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-obs-private-text-"));
+  const runWorkflowFn = async (_script: string, options: any) => {
+    options.onAgentStart?.({ id: 1, label: "private", prompt: "p", cached: false });
+    options.onAgentActivity?.({
+      id: 1,
+      label: "private",
+      kind: "text",
+      detail: "responding",
+      streamDelta: 'Authorization: "Bearer PRIVATE_STREAM_SECRET"',
+    });
+    options.onAgentActivity?.({
+      id: 1,
+      label: "private",
+      kind: "tool",
+      detail: "read: README.md",
+      toolCallId: "tool-secret-id",
+      toolName: "read",
+      toolArgs: "README.md",
+      toolState: "start",
+    });
+    options.onAgentActivity?.({
+      id: 1,
+      label: "private",
+      kind: "text",
+      detail: "responding",
+      streamDelta: "sk-split-private-suffix",
+    });
+    options.onAgentEnd?.({ id: 1, label: "private", result: "done", status: "done" });
+    return {
+      meta: { name: "private", description: "x" },
+      result: "done",
+      logs: [],
+      phases: [],
+      agentCount: 1,
+      cachedCount: 0,
+      spentTokens: 0,
+      durationMs: 1,
+    };
   };
-  const tool = createWorkflowTool({ testRunner: runner });
+  const tool = createWorkflowTool({ runWorkflowFn: runWorkflowFn as any });
   const updates: any[] = [];
   const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
-  const script = `export const meta = { name: 'text', description: 'x' }\nreturn await agent('p', { label: 'a' })`;
+  const script = `export const meta = { name: 'private', description: 'x' }\nreturn 'done'`;
 
-  await tool.execute(
-    "tc-text",
+  const result = await tool.execute(
+    "tc-private-text",
+    { script } as any,
+    undefined,
+    (update) => updates.push(structuredClone(update)),
+    ctx,
+  );
+
+  const serialized = JSON.stringify([updates, result.details]);
+  assert.doesNotMatch(serialized, /PRIVATE_STREAM_SECRET|split-private-suffix/);
+  assert.equal(
+    updates.every((update) => update.details?.agents?.every((agent: any) => agent.streamTail == null) ?? true),
+    true,
+  );
+  const responding = updates.find((update) => update.details?.agents?.[0]?.activity === "responding");
+  assert.ok(responding, "text events still expose a fixed lifecycle state");
+  assert.equal(typeof responding.details.agents[0].lastActivityAt, "number");
+
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+});
+
+test("completed agents reject late activity while peer agents are still running", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-obs-peer-late-"));
+  const runWorkflowFn = (async (_script: string, options: any) => {
+    options.onAgentStart?.({ id: 1, label: "first", prompt: "a", cached: false });
+    options.onAgentStart?.({ id: 2, label: "second", prompt: "b", cached: false });
+    options.onAgentActivity?.({
+      id: 1,
+      label: "first",
+      kind: "text",
+      detail: "responding",
+      streamDelta: "before",
+    });
+    options.onAgentEnd?.({ id: 1, label: "first", result: "done-a", status: "done" });
+    await Promise.resolve();
+    options.onAgentActivity?.({
+      id: 1,
+      label: "first",
+      kind: "tool",
+      detail: 'Authorization: "Bearer late-secret"',
+      toolCallId: "late",
+      toolName: "bash",
+      toolArgs: "late-secret",
+      toolState: "start",
+    });
+    options.onAgentActivity?.({
+      id: 1,
+      label: "first",
+      kind: "text",
+      detail: "late-secret",
+      streamDelta: "late-secret",
+    });
+    options.onAgentEnd?.({ id: 2, label: "second", result: "done-b", status: "done" });
+    return {
+      result: ["done-a", "done-b"],
+      agentCount: 2,
+      cachedCount: 0,
+      spentTokens: 2,
+      durationMs: 1,
+      logs: [],
+      phases: [],
+    };
+  }) as any;
+  const tool = createWorkflowTool({ runWorkflowFn });
+  const updates: any[] = [];
+  const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+  const script = `export const meta = { name: 'peer_late', description: 'x' }\nreturn await agent('p')`;
+
+  const result = await tool.execute(
+    "tc-peer-late",
     { script } as any,
     undefined,
     (update) => updates.push(structuredClone(update.details)),
     ctx,
   );
-
-  const live = updates.find((update) => update.agents?.[0]?.streamTail === "hello");
-  assert.ok(live, "text_start/text_end labels must not contaminate the streamed text tail");
-  assert.equal(updates.at(-1).agents[0].streamTail, undefined);
+  const first = (result.details as any).agents.find((agent: any) => agent.id === 1);
+  assert.equal(first.status, "done");
+  assert.equal(first.activity, "responding");
+  assert.equal(first.activeTools, undefined);
+  assert.equal(first.streamTail, undefined);
+  assert.doesNotMatch(JSON.stringify(result.details), /late-secret/);
+  assert.equal(updates.at(-1).agents.every((agent: any) => agent.activeTools == null && agent.streamTail == null), true);
   fs.rmSync(sessionDir, { recursive: true, force: true });
 });
 
@@ -379,20 +640,29 @@ test("toolArgsPreview uses a safe command synopsis and ignores free-form payload
     "curl 'https://example.test/?client_secret=hidden'",
   ];
   for (const command of commands) {
-    const preview = toolArgsPreview({ command }, 200);
+    const preview = toolArgsPreview("bash", { command }, 200);
     assert.ok(preview);
     assert.match(preview, /^curl …$/);
     assert.doesNotMatch(preview, /alice|s3cret|user|qwerty|hidden|sk-secret|example/);
   }
   assert.equal(
-    toolArgsPreview({ command: "OPENAI_API_KEY='sk-secret value' curl https://example.test" }, 200),
+    toolArgsPreview("bash", { command: "OPENAI_API_KEY='sk-secret value' curl https://example.test" }, 200),
     "environment-prefixed command",
   );
-  assert.equal(toolArgsPreview({ command: "npm test -- --runInBand" }), "npm test");
-  assert.equal(toolArgsPreview({ command: "https://user:pass@example.test/?token=hidden --flag" }), "command");
-  assert.equal(toolArgsPreview({ command: "constructor anything" }), "command");
-  assert.equal(toolArgsPreview({ command: "./sk-abcdefgh" }), "command");
-  assert.equal(toolArgsPreview({ query: "private search text" }), undefined);
+  assert.equal(toolArgsPreview("bash", { command: "npm test -- --runInBand" }), "npm test");
+  assert.equal(toolArgsPreview("bash", { command: "https://user:pass@example.test/?token=hidden --flag" }), "command");
+  assert.equal(toolArgsPreview("bash", { command: "constructor anything" }), "command");
+  assert.equal(toolArgsPreview("bash", { command: "./sk-abcdefgh" }), "command");
+  assert.equal(toolArgsPreview("bash", { query: "private search text" }), undefined);
+  assert.equal(toolArgsPreview("read", { path: "/Users/alice/private/project/README.md" }), "README.md");
+  assert.equal(
+    toolArgsPreview("read", { path: "https://user:pass@example.test/file?token=hidden" }),
+    "path",
+  );
+  assert.equal(
+    toolArgsPreview("custom_tool", { path: "https://user:pass@example.test/file?token=hidden" }),
+    undefined,
+  );
 });
 
 test("late activity cannot repopulate a failed workflow snapshot", async () => {
@@ -434,6 +704,239 @@ test("late activity cannot repopulate a failed workflow snapshot", async () => {
   assert.equal(final.agents[0].streamTail, undefined);
   assert.equal(notifications.length, 1);
   assert.doesNotMatch(notifications[0], /error-spoof|\u001b|\u0007/);
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+});
+
+test("runWorkflow routes log, console, and nested workflow messages through one safe stream", async () => {
+  const callbackLogs: string[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'all_logs', description: 'x' }
+     log('Authorization: "Bearer LOG_SECRET"')
+     console.log('x-api-key: CONSOLE_LOG_SECRET')
+     console.info('token: CONSOLE_INFO_SECRET')
+     console.warn('password: CONSOLE_WARN_SECRET')
+     console.error('client-secret: CONSOLE_ERROR_SECRET')
+     return await workflow('child')`,
+    {
+      onLog: (message) => callbackLogs.push(message),
+      loadSavedWorkflow: () => ({
+        meta: { name: 'Authorization: "Bearer NESTED_NAME_SECRET"', description: "x" },
+        body: `log('Authorization: Digest username="a", response="NESTED_LOG_SECRET"'); return 'child'`,
+      }),
+    },
+  );
+
+  assert.equal(result.result, "child");
+  assert.deepEqual(callbackLogs, result.logs);
+  assert.equal(result.logs.length, 7);
+  assert.doesNotMatch(
+    JSON.stringify(result.logs),
+    /LOG_SECRET|CONSOLE_LOG_SECRET|CONSOLE_INFO_SECRET|CONSOLE_WARN_SECRET|CONSOLE_ERROR_SECRET|NESTED_NAME_SECRET|NESTED_LOG_SECRET/,
+  );
+  assert.equal(result.logs.every((entry) => entry.length <= 512), true);
+});
+
+test("runWorkflow bounds log retention and callback volume with one omission marker", async () => {
+  const exact = await runWorkflow(
+    `export const meta = { name: 'log_exact', description: 'x' }
+     for (let i = 0; i < ${MAX_WORKFLOW_LOGS}; i++) log('line-' + i)
+     return 'done'`,
+  );
+  assert.equal(exact.logs.length, MAX_WORKFLOW_LOGS);
+  assert.doesNotMatch(exact.logs.join("\n"), /additional workflow logs omitted/);
+
+  const callbackLogs: string[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'log_cap', description: 'x' }
+     for (let i = 0; i < ${MAX_WORKFLOW_LOGS + 50}; i++) log('line-' + i)
+     return 'done'`,
+    { onLog: (message) => callbackLogs.push(message) },
+  );
+
+  assert.equal(result.logs.length, MAX_WORKFLOW_LOGS + 1);
+  assert.deepEqual(callbackLogs, result.logs);
+  assert.equal(result.logs.at(-1), WORKFLOW_LOG_OMITTED_TEXT);
+  assert.equal(result.logs.filter((entry) => entry === WORKFLOW_LOG_OMITTED_TEXT).length, 1);
+});
+
+test("runWorkflow redacts agent failure logs before return and callback", async () => {
+  const callbackLogs: string[] = [];
+  const runner = {
+    run: async () => {
+      throw new Error('Authorization: "Bearer RUNTIME_LOG_SECRET"');
+    },
+  };
+  const script = `export const meta = { name: 'runtime_log', description: 'x' }\nreturn await agent('p', { label: 'failed' })`;
+  const result = await runWorkflow(script, {
+    runner,
+    onLog: (message) => callbackLogs.push(message),
+  });
+
+  assert.equal(result.result, null);
+  assert.equal(result.logs.length, 1);
+  assert.equal(callbackLogs.length, 1);
+  assert.doesNotMatch(JSON.stringify(result.logs), /RUNTIME_LOG_SECRET/);
+  assert.doesNotMatch(JSON.stringify(callbackLogs), /RUNTIME_LOG_SECRET/);
+  assert.match(result.logs[0], /Authorization:\s*\*\*\*/i);
+  assert.equal(callbackLogs[0], result.logs[0]);
+});
+
+test("agent failure logs are redacted before entering workflow snapshots", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-obs-log-redact-"));
+  const runner = {
+    run: async () => {
+      throw new Error('{"Authorization":"Bearer agent-log-secret"}');
+    },
+  };
+  const tool = createWorkflowTool({ testRunner: runner });
+  const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+  const script = `export const meta = { name: 'log_redact', description: 'x' }\nreturn await agent('p', { label: 'failed' })`;
+  const result = await tool.execute("tc-log-redact", { script } as any, undefined, undefined, ctx);
+  const serialized = JSON.stringify(result.details);
+  assert.doesNotMatch(serialized, /agent-log-secret/);
+  assert.match(serialized, /\*\*\*/);
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+});
+
+test("workflow tool bounds logs from an injected runtime", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-obs-tool-log-cap-"));
+  const runWorkflowFn = (async (_script: string, options: any) => {
+    for (let index = 0; index < MAX_WORKFLOW_LOGS + 50; index++) {
+      options.onLog?.(`line-${index}`);
+    }
+    return {
+      result: "done",
+      agentCount: 0,
+      cachedCount: 0,
+      spentTokens: 0,
+      durationMs: 1,
+      logs: [],
+      phases: [],
+    };
+  }) as any;
+  const updates: any[] = [];
+  const tool = createWorkflowTool({ runWorkflowFn });
+  const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+  const script = `export const meta = { name: 'tool_log_cap', description: 'x' }\nreturn 'done'`;
+  const result = await tool.execute(
+    "tc-tool-log-cap",
+    { script } as any,
+    undefined,
+    (update) => updates.push(structuredClone(update.details)),
+    ctx,
+  );
+
+  const logs = (result.details as any).logs as string[];
+  assert.equal(logs.length, MAX_WORKFLOW_LOGS + 1);
+  assert.equal(logs.at(-1), WORKFLOW_LOG_OMITTED_TEXT);
+  assert.equal(logs.filter((entry) => entry === WORKFLOW_LOG_OMITTED_TEXT).length, 1);
+  assert.equal(updates.every((update) => update.logs.length <= MAX_WORKFLOW_LOGS + 1), true);
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+});
+
+test("public runWorkflow preserves structured-cloned results while UI projection stays safe", async () => {
+  const runner = {
+    run: async () => ({
+      value: "agent-done",
+      usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+      cwd: process.cwd(),
+    }),
+  };
+  const result = await runWorkflow(
+    `export const meta = { name: 'raw_runtime_result', description: 'x' }
+     await agent('p')
+     return {
+       Authorization: 'Bearer VM_RESULT_SECRET',
+       nested: { exact: 'unchanged' },
+       list: [1, 2, 3]
+     }`,
+    { runner },
+  );
+
+  assert.deepEqual(result.result, {
+    Authorization: "Bearer VM_RESULT_SECRET",
+    nested: { exact: "unchanged" },
+    list: [1, 2, 3],
+  });
+  const projected = preview(result.result, 80);
+  assert.equal(projected, "[Object]");
+  assert.doesNotMatch(projected, /VM_RESULT_SECRET/);
+});
+
+test("raw structured results are preserved while UI result previews stay safe and bounded", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-obs-result-contract-"));
+  const rawResult = {
+    Authorization: "Bearer RESULT_SECRET",
+    nested: { exact: "unchanged" },
+  };
+  const runWorkflowFn = (async (_script: string, options: any) => {
+    options.onAgentStart?.({ id: 1, label: "result", prompt: "p", cached: false });
+    options.onAgentEnd?.({ id: 1, label: "result", result: rawResult, status: "done" });
+    return {
+      result: rawResult,
+      agentCount: 1,
+      cachedCount: 0,
+      spentTokens: 0,
+      durationMs: 1,
+      logs: [],
+      phases: [],
+    };
+  }) as any;
+  const tool = createWorkflowTool({ runWorkflowFn });
+  const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+  const script = `export const meta = { name: 'result_contract', description: 'x' }\nreturn await agent('p')`;
+  const result = await tool.execute("tc-result-contract", { script } as any, undefined, undefined, ctx);
+  const details = result.details as any;
+  const rendered = renderWorkflowLines(details, { showResultPreviews: true }).join("\n");
+
+  assert.deepEqual(details.result, rawResult, "snapshot result keeps the exact structured value");
+  assert.match((result.content[0] as any).text, /RESULT_SECRET/, "parent tool content keeps the raw result");
+  assert.doesNotMatch(details.agents[0].resultPreview, /RESULT_SECRET/);
+  assert.doesNotMatch(rendered, /RESULT_SECRET/);
+  assert.ok(details.agents[0].resultPreview.length <= 80);
+
+  const journal = fs.readdirSync(path.join(sessionDir, "ultracode-runs"))
+    .find((entry) => entry.endsWith(".jsonl"));
+  assert.ok(journal);
+  assert.match(
+    fs.readFileSync(path.join(sessionDir, "ultracode-runs", journal), "utf8"),
+    /RESULT_SECRET/,
+    "journal preserves the raw result contract",
+  );
+  fs.rmSync(sessionDir, { recursive: true, force: true });
+});
+
+test("top-level workflow errors expose redacted text and retain the original cause", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-obs-error-cause-"));
+  const notifications: string[] = [];
+  const original = new Error('request failed Authorization: "Bearer top-level-secret"');
+  const runWorkflowFn = (async () => {
+    throw original;
+  }) as any;
+  const tool = createWorkflowTool({ runWorkflowFn });
+  const ctx: any = {
+    cwd: process.cwd(),
+    sessionManager: { getSessionDir: () => sessionDir },
+    ui: { notify: (message: string) => notifications.push(message) },
+  };
+  const script = `export const meta = { name: 'error_cause', description: 'x' }\nreturn await agent('p')`;
+
+  await assert.rejects(
+    tool.execute("tc-error-cause", { script } as any, undefined, undefined, ctx),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal(error.cause, original);
+      assert.doesNotMatch(error.message, /top-level-secret/);
+      assert.match(error.message, /\*\*\*/);
+      return true;
+    },
+  );
+  assert.equal(notifications.length, 1);
+  assert.doesNotMatch(notifications[0], /top-level-secret/);
+  const runsDir = path.join(sessionDir, "ultracode-runs");
+  const journalFile = fs.readdirSync(runsDir).find((entry) => entry.endsWith(".jsonl"));
+  assert.ok(journalFile);
+  assert.doesNotMatch(fs.readFileSync(path.join(runsDir, journalFile), "utf8"), /top-level-secret/);
   fs.rmSync(sessionDir, { recursive: true, force: true });
 });
 
@@ -550,7 +1053,7 @@ test("forwardActivity maps streaming message blocks using the installed SDK fiel
     { type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "..." } },
     onActivity,
   );
-  // toolcall_start has no toolName in Pi 0.80.6; the completed tool call does.
+  // toolcall_start has no toolName in the installed Pi SDK; the completed tool call does.
   forwardActivity(
     { type: "message_update", assistantMessageEvent: { type: "toolcall_start", contentIndex: 0 } },
     onActivity,
@@ -571,7 +1074,7 @@ test("forwardActivity maps streaming message blocks using the installed SDK fiel
   forwardActivity({ type: "message_update" }, onActivity);
 
   assert.deepEqual(events, [
-    { kind: "text", detail: "hi", streamDelta: "hi" },
+    { kind: "text", detail: "responding" },
     { kind: "thinking", detail: "thinking" },
     { kind: "waiting", detail: "preparing tool call" },
     { kind: "waiting", detail: "preparing read: README.md" },

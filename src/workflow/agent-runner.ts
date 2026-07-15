@@ -21,7 +21,14 @@ import {
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
 import type { Static, TSchema } from "typebox";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.ts";
-import { redactCommand, safeCommandPreview, truncateDisplay } from "./display-text.ts";
+import {
+  DISPLAY_INPUT_LIMIT,
+  displayOneLine,
+  redactCommand,
+  safeCommandPreview,
+  safeDisplayText,
+  truncateDisplay,
+} from "./display-text.ts";
 import { jsonSchemaToTypeBox } from "./json-schema.ts";
 import {
   LEGACY_ULTRACODE_THINKING_LEVEL,
@@ -97,7 +104,12 @@ export interface WorkflowAgentRunnerOptions {
 export type AgentActivityInput =
   | { kind: "waiting" | "retry" | "compaction"; detail: string }
   | { kind: "thinking"; detail: string }
-  | { kind: "text"; detail: string; streamDelta?: string }
+  | {
+      kind: "text";
+      detail: "responding";
+      /** @deprecated Standard runners never emit raw assistant text. */
+      streamDelta?: string;
+    }
   | {
       kind: "tool";
       detail: string;
@@ -580,7 +592,7 @@ function forwardMessageActivity(
       return;
     case "text_delta":
       if (typeof event.delta === "string") {
-        onActivity({ kind: "text", detail: event.delta, streamDelta: event.delta });
+        onActivity({ kind: "text", detail: "responding" });
       }
       return;
     case "thinking_start":
@@ -595,7 +607,7 @@ function forwardMessageActivity(
       return;
     case "toolcall_end": {
       const name = typeof event.toolCall?.name === "string" ? event.toolCall.name : "tool";
-      const args = toolArgsPreview(event.toolCall?.arguments);
+      const args = toolArgsPreview(name, event.toolCall?.arguments);
       onActivity({
         kind: "waiting",
         detail: `preparing ${toolLabel(name, args)}`,
@@ -612,7 +624,7 @@ function forwardToolActivity(
 ): void {
   if (typeof event.toolName !== "string") return;
   const name = event.toolName;
-  const args = state === "end" ? undefined : toolArgsPreview(event.args);
+  const args = state === "end" ? undefined : toolArgsPreview(name, event.args);
   onActivity({
     kind: "tool",
     detail: state === "end"
@@ -626,25 +638,45 @@ function forwardToolActivity(
 }
 
 function toolLabel(name: string, args: string | undefined): string {
-  const safeName = truncateDisplay(name, 40) || "tool";
+  const safeName = safeDisplayText(name, 40) || "tool";
   return args ? `${safeName}: ${args}` : safeName;
 }
 
+const PATH_PREVIEW_TOOLS = new Set(["read", "write", "edit", "grep", "find", "ls"]);
+
 /** Keep tool status useful without displaying free-form payload bodies. */
-export function toolArgsPreview(value: unknown, max = 80): string | undefined {
+export function toolArgsPreview(toolName: string, value: unknown, max = 80): string | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const args = value as Record<string, unknown>;
-  const command = scalarPreview(args.command);
-  if (command) return truncateDisplay(safeCommandPreview(command), max);
-  for (const key of ["path", "file_path"]) {
-    const path = scalarPreview(args[key]);
-    if (path) return truncateDisplay(path, max);
+  const normalizedName = safeDisplayText(toolName, 40).toLowerCase();
+  if (normalizedName === "bash") {
+    const command = scalarPreview(args.command);
+    if (command) return safeDisplayText(safeCommandPreview(command), max);
+  }
+  if (PATH_PREVIEW_TOOLS.has(normalizedName)) {
+    for (const key of ["path", "file_path"]) {
+      const filePath = scalarPreview(args[key]);
+      if (filePath) return safePathPreview(filePath, max);
+    }
   }
   return undefined;
 }
 
+function safePathPreview(value: string, max: number): string {
+  const clean = displayOneLine(value);
+  if (!clean || /:\/\/|[?&#@]/.test(clean)) return "path";
+  const segments = clean.replace(/\\/g, "/").split("/").filter(Boolean);
+  const basename = segments.at(-1) ?? clean;
+  return safeDisplayText(basename, max) || "path";
+}
+
 function scalarPreview(value: unknown): string | undefined {
-  if (typeof value === "string" && value.trim()) return value;
+  if (typeof value === "string") {
+    const sample = value.length > DISPLAY_INPUT_LIMIT
+      ? value.slice(0, DISPLAY_INPUT_LIMIT)
+      : value;
+    if (sample.trim()) return value;
+  }
   if (typeof value === "number" || typeof value === "boolean") return String(value);
   return undefined;
 }

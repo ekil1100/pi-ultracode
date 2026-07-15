@@ -110,7 +110,7 @@ pi --ultracode
 /workflows abort       # abort active runs and hide the panel
 ```
 
-`/workflows` 面板是执行命令时生成的静态快照；再次运行该命令可刷新，`/workflows clear` 只隐藏面板，不删除 registry 记录。工作流执行期间的实时进度显示在工具结果中。
+`/workflows` 面板是执行命令时生成的静态快照；再次运行该命令可刷新，`/workflows clear` 只隐藏面板，不删除 registry 记录。工作流执行期间的实时进度显示在工具结果中。为缩小隐私边界，进度只包含结构化生命周期状态和安全摘要，不捕获、持久化或展示子代理的原始流式响应正文。
 
 状态行会显示实际生效的思考强度，例如：
 

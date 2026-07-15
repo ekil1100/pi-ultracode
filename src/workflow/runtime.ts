@@ -19,6 +19,7 @@ import { parseWorkflowScript, type WorkflowMeta } from "./parser.ts";
 // they never construct this class; production builds it via getRunner().
 import { WorkflowAgentRunner } from "./agent-runner.ts";
 import type { AgentActivityInput, AgentRunResult, ModelLike, ModelRegistryLike, ThinkingLevel } from "./agent-runner.ts";
+import { safeDisplayText } from "./display-text.ts";
 
 /**
  * A frozen copy of `Math` with `random` replaced by a throwing function. Workflow
@@ -70,6 +71,8 @@ import {
 const MAX_CONCURRENCY = 16;
 const MAX_AGENTS_PER_RUN = 1000;
 const MAX_ITEMS_PER_CALL = 4096;
+export const MAX_WORKFLOW_LOGS = 256;
+export const WORKFLOW_LOG_OMITTED_TEXT = "additional workflow logs omitted";
 
 export interface AgentEventBase {
   id: number;
@@ -202,11 +205,7 @@ class Runtime {
   }
 
   private buildSandbox(args: unknown): Record<string, unknown> {
-    const log = (message: unknown) => {
-      const text = String(message);
-      this.state.logs.push(text);
-      this.options.onLog?.(text);
-    };
+    const log = (message: unknown) => this.logLine(String(message));
     return {
       agent: this.agent.bind(this),
       parallel: this.parallel.bind(this),
@@ -404,7 +403,7 @@ class Runtime {
     const { meta, body } = loader(ref);
     this.depth++;
     try {
-      this.options.onLog?.(`▸ nested workflow: ${meta.name}`);
+      this.logLine(`▸ nested workflow: ${meta.name}`);
       const value = await this.runBody(body, args, this.depth, meta.name);
       return value;
     } finally {
@@ -512,8 +511,14 @@ class Runtime {
   }
 
   private logLine(text: string): void {
-    this.state.logs.push(text);
-    this.options.onLog?.(text);
+    if (this.state.logs.length > MAX_WORKFLOW_LOGS) return;
+    const safe = safeDisplayText(text, 512);
+    if (!safe) return;
+    const entry = this.state.logs.length === MAX_WORKFLOW_LOGS
+      ? WORKFLOW_LOG_OMITTED_TEXT
+      : safe;
+    this.state.logs.push(entry);
+    this.options.onLog?.(entry);
   }
 }
 

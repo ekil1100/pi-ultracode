@@ -15,9 +15,13 @@ import {
   WORKFLOW_PROMPT_SNIPPET,
   WORKFLOW_TOOL_DESCRIPTION,
 } from "../prompts.ts";
-import { redactCommand, truncateDisplay } from "./display-text.ts";
+import { redactCommand, safeDisplayText } from "./display-text.ts";
 import { parseWorkflowScript, normalizeScript } from "./parser.ts";
-import { runWorkflow } from "./runtime.ts";
+import {
+  MAX_WORKFLOW_LOGS,
+  WORKFLOW_LOG_OMITTED_TEXT,
+  runWorkflow,
+} from "./runtime.ts";
 import type { ThinkingLevel } from "./agent-runner.ts";
 import { RunJournal, hashString } from "./journal.ts";
 import { getRegistry } from "./registry.ts";
@@ -73,8 +77,6 @@ export interface WorkflowToolDeps {
 
 let runCounter = 0;
 
-/** Max chars of live subagent text retained per agent for the inspect view. */
-const STREAM_TAIL_MAX = 240;
 /** Throttle: min ms between activity-driven re-renders (avoids token-by-token
  *  re-render storms when many subagents stream concurrently). */
 const ACTIVITY_RENDER_INTERVAL_MS = 200;
@@ -96,7 +98,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       const cwd = ctx.cwd;
       const { script, sourceLabel } = resolveScript(params, cwd);
       const parsed = parseWorkflowScript(script);
-      const displayName = truncateDisplay(parsed.meta.name, 60) || "workflow";
+      const displayName = safeDisplayText(parsed.meta.name, 60) || "workflow";
 
       const runsDir = runsDirFor(ctx);
       const requestedRunId = params.resumeFromRunId?.trim();
@@ -154,8 +156,11 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       let lastActivityRenderMs = 0;
       let acceptingEvents = true;
 
-      const recordPhase = (title?: string) => {
-        if (title && !snapshot.phases.includes(title)) snapshot.phases.push(title);
+      const recordPhase = (title?: string): string | undefined => {
+        if (!title) return undefined;
+        const safe = safeDisplayText(title, 120);
+        if (safe && !snapshot.phases.includes(safe)) snapshot.phases.push(safe);
+        return safe || undefined;
       };
 
       // Heartbeat: keep elapsed/no-event markers live in the compact panel even
@@ -174,24 +179,29 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           runner: deps.testRunner,
           journal,
           onLog(message) {
-            if (!acceptingEvents) return;
-            snapshot.logs.push(message);
+            if (!acceptingEvents || snapshot.logs.length > MAX_WORKFLOW_LOGS) return;
+            const safe = safeDisplayText(message, 512);
+            if (!safe) return;
+            snapshot.logs.push(
+              snapshot.logs.length === MAX_WORKFLOW_LOGS
+                ? WORKFLOW_LOG_OMITTED_TEXT
+                : safe,
+            );
             update();
           },
           onPhase(title) {
             if (!acceptingEvents) return;
-            snapshot.currentPhase = title;
-            recordPhase(title);
+            snapshot.currentPhase = recordPhase(title);
             update();
           },
           onAgentStart(event) {
             if (!acceptingEvents) return;
-            recordPhase(event.phase);
+            const phase = recordPhase(event.phase);
             const startedAt = Date.now();
             snapshot.agents.push({
               id: event.id,
-              label: event.label,
-              phase: event.phase,
+              label: safeDisplayText(event.label, 120) || `agent ${event.id}`,
+              phase,
               status: event.cached ? "cached" : "running",
               startedAt,
               lastActivityAt: startedAt,
@@ -208,8 +218,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
               if (event.status === "error") agent.error = preview(event.result);
               const endedAt = Date.now();
               agent.endedAt = endedAt;
-              agent.activeTools = undefined;
-              agent.streamTail = undefined;
+              clearAgentTransient(agent);
               if (agent.startedAt != null) agent.durationMs = endedAt - agent.startedAt;
             }
             update();
@@ -217,37 +226,36 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           onAgentActivity(event) {
             if (!acceptingEvents) return;
             const agent = snapshot.agents.find((a) => a.id === event.id);
-            if (!agent) return;
+            if (!agent || agent.status !== "running") return;
             const now = Date.now();
             agent.lastActivityAt = now;
-            agent.activity = activityLabel(event.kind, event.detail);
+            agent.activity = safeDisplayText(activityLabel(event.kind, event.detail), 160);
 
             if (event.kind === "tool") {
               const activeTools = agent.activeTools ?? [];
               const existing = activeTools.find((tool) => tool.id === event.toolCallId);
               if (event.toolState === "end") {
                 agent.activeTools = activeTools.filter((tool) => tool.id !== event.toolCallId);
-              } else if (existing) {
-                existing.name = event.toolName;
-                existing.args = event.toolArgs ?? existing.args;
-                existing.lastUpdateAt = now;
               } else {
-                activeTools.push({
-                  id: event.toolCallId,
-                  name: event.toolName,
-                  args: event.toolArgs,
-                  startedAt: now,
-                  lastUpdateAt: now,
-                });
-                agent.activeTools = activeTools;
+                const toolName = safeDisplayText(event.toolName, 80) || "tool";
+                const toolArgs = event.toolArgs ? safeDisplayText(event.toolArgs, 120) : undefined;
+                if (existing) {
+                  existing.name = toolName;
+                  existing.args = toolArgs ?? existing.args;
+                  existing.lastUpdateAt = now;
+                } else {
+                  activeTools.push({
+                    id: event.toolCallId,
+                    name: toolName,
+                    args: toolArgs,
+                    startedAt: now,
+                    lastUpdateAt: now,
+                  });
+                  agent.activeTools = activeTools;
+                }
               }
-              if (event.toolState === "start") agent.streamTail = undefined;
             }
 
-            if (event.kind === "text" && event.streamDelta) {
-              const tail = (agent.streamTail ?? "") + event.streamDelta;
-              agent.streamTail = tail.length > STREAM_TAIL_MAX ? tail.slice(-STREAM_TAIL_MAX) : tail;
-            }
             if (now - lastActivityRenderMs >= ACTIVITY_RENDER_INTERVAL_MS) {
               lastActivityRenderMs = now;
               update();
@@ -256,6 +264,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         });
 
         acceptingEvents = false;
+        for (const agent of snapshot.agents) clearAgentTransient(agent);
         snapshot.result = result.result;
         snapshot.spentTokens = result.spentTokens;
         snapshot.durationMs = result.durationMs;
@@ -297,27 +306,28 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           if (agent.status === "running") {
             agent.status = "skipped";
             agent.error = "aborted";
-            agent.activeTools = undefined;
-            agent.streamTail = undefined;
           }
+          clearAgentTransient(agent);
         }
         snapshot.status = aborted ? "aborted" : "failed";
         snapshot = recompute(snapshot);
         handle.snapshot = snapshot;
+        const errorText = statusText(error);
         journal?.recordResult({
           ok: false,
-          error: error instanceof Error ? error.message : String(error),
+          error: errorText,
           agentCount: snapshot.agentCount,
           durationMs: snapshot.durationMs ?? 0,
         });
         onUpdate?.({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
-        const errorText = statusText(error);
         ctx.ui?.notify(
           `Workflow ${displayName} ${aborted ? "was aborted" : "failed"}${aborted ? "" : `: ${errorText}`}`,
           aborted ? "warning" : "error",
         );
-        if (aborted) throw new Error(`Workflow ${displayName} was aborted (runId: ${runId})`);
-        throw new Error(`Workflow ${displayName} failed: ${errorText}`);
+        if (aborted) {
+          throw new Error(`Workflow ${displayName} was aborted (runId: ${runId})`, { cause: error });
+        }
+        throw new Error(`Workflow ${displayName} failed: ${errorText}`, { cause: error });
       } finally {
         acceptingEvents = false;
         clearInterval(heartbeat);
@@ -397,7 +407,12 @@ function requireSafeRunId(value: string): string {
 
 function statusText(value: unknown): string {
   const text = value instanceof Error ? value.message : String(value);
-  return truncateDisplay(redactCommand(text), 160) || "unknown error";
+  return safeDisplayText(text, 160) || "unknown error";
+}
+
+function clearAgentTransient(agent: WorkflowSnapshot["agents"][number]): void {
+  agent.activeTools = undefined;
+  agent.streamTail = undefined;
 }
 
 function activityLabel(kind: string, detail: string | undefined): string {
