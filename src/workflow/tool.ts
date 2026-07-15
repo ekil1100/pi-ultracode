@@ -68,6 +68,8 @@ export interface WorkflowToolDeps {
    *  session clamps it independently; undefined when off). A per-call
    *  `model: "X:level"` suffix or agentType `thinking:` override still wins. */
   getThinkingLevel?: () => ThinkingLevel | undefined;
+  /** Optional execution gate for mode-scoped registrations. Omit for standalone use. */
+  isExecutionAllowed?: () => boolean;
   /** Test seam: inject a subagent runner so the tool path can run without a model. */
   testRunner?: { run: (call: any) => Promise<any> };
   /** Test seam: override the workflow runtime (lets tests capture the options,
@@ -95,6 +97,10 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
     promptGuidelines: WORKFLOW_GUIDELINES,
     parameters: workflowToolSchema,
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      if (deps.isExecutionAllowed?.() === false) {
+        throw new Error("The workflow tool is disabled. Run /ultracode on before using it.");
+      }
+
       const cwd = ctx.cwd;
       const { script, sourceLabel } = resolveScript(params, cwd);
       const parsed = parseWorkflowScript(script);

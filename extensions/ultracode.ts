@@ -42,6 +42,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     getDefaultBudget: () => mode.getBudget(),
     getThinkingLevel: () => mode.getSubagentThinkingLevel(),
     ...workflowDeps,
+    isExecutionAllowed: () => mode.isEnforcing(),
   });
   pi.registerTool(workflowTool);
 
@@ -51,6 +52,23 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   pi.registerFlag("ultracode", {
     type: "boolean",
     description: "Start the session in ultracode mode (max thinking + default workflow orchestration).",
+  });
+
+  // SDK-created sessions can prompt without emitting session_start. Sync during
+  // input preflight so before_agent_start receives Pi's rebuilt base prompt.
+  pi.on("input", () => {
+    mode.syncWorkflowTool(pi);
+  });
+
+  // Fail closed if another active-tool writer re-exposes workflow while the
+  // mode is off or quiescing.
+  pi.on("tool_call", (event) => {
+    if (event.toolName === workflowTool.name && !mode.isEnforcing()) {
+      return {
+        block: true,
+        reason: "The workflow tool is disabled. Run /ultracode on before using it.",
+      };
+    }
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -74,13 +92,8 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     if (!mode.isEnabled() && pi.getFlag?.("ultracode") === true) {
       mode.enable(pi);
     }
-    // Always keep the workflow tool available so the model can use it on request.
-    try {
-      const active = pi.getActiveTools();
-      if (!active.includes(workflowTool.name)) pi.setActiveTools([...active, workflowTool.name]);
-    } catch {
-      // ignore
-    }
+    // Registration makes extension tools discoverable; activation remains opt-in.
+    mode.syncWorkflowTool(pi);
     await mode.flushThinkingPreference();
     if (ctx.hasUI) {
       ctx.ui.setStatus("ultracode", mode.isEnabled() ? mode.statusLine() : undefined);
@@ -119,7 +132,9 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   });
 
   pi.on("before_agent_start", async (event) => {
-    // Final synchronous effort barrier before Pi starts the provider request.
+    // Reconcile the tool schema and always append the standing block on an
+    // enforcing turn, even when another active-tool writer caused drift.
+    mode.syncWorkflowTool(pi);
     mode.reapplyMaximumThinking(pi);
     await mode.flushThinkingPreference();
     return mode.beforeAgentStart(event);

@@ -154,9 +154,13 @@ export class UltracodeMode {
 
   /** Stop enforcing synchronously, then restore effort before session teardown. */
   suspend(pi: ExtensionAPI): void {
-    if (this.suspended) return;
+    if (this.suspended) {
+      this.syncWorkflowTool(pi);
+      return;
+    }
     this.suspended = true;
     this.restorePreviousThinking(pi);
+    this.syncWorkflowTool(pi);
   }
 
   /**
@@ -191,6 +195,12 @@ export class UltracodeMode {
     return this.budgetTotal;
   }
 
+  /** Keep tool availability aligned with the current mode state. */
+  syncWorkflowTool(pi: ExtensionAPI): void {
+    if (this.isEnforcing()) this.activateWorkflowTool(pi);
+    else this.deactivateWorkflowTool(pi);
+  }
+
   tagline(): string {
     return ULTRACODE_TAGLINE;
   }
@@ -221,13 +231,16 @@ export class UltracodeMode {
       this.enabled = true;
     }
     this.applyUltracodeThinking(pi);
-    this.activateWorkflowTool(pi);
+    this.syncWorkflowTool(pi);
     this.persist(pi);
   }
 
   /** Turn ultracode off, restoring the previous thinking level. */
   disable(pi: ExtensionAPI): void {
-    if (!this.enabled) return;
+    if (!this.enabled) {
+      this.syncWorkflowTool(pi);
+      return;
+    }
     const previous = this.previousThinking;
     this.restorePreviousThinking(pi);
     this.pendingPreviousThinking = previous && !this.pendingRestoreSucceeded(previous)
@@ -236,6 +249,7 @@ export class UltracodeMode {
     this.pendingClearGeneration++;
     this.enabled = false;
     this.suspended = false;
+    this.syncWorkflowTool(pi);
     this.persist(pi);
   }
 
@@ -290,6 +304,7 @@ export class UltracodeMode {
       this.previousDefaultThinking = globalPreference;
       this.legacyDefaultMigrationPending = false;
       this.appliedThinking = current;
+      this.syncWorkflowTool(pi);
       if (target && current !== target) this.applyCompatibleThinking(pi, target);
       if (target && !this.pendingRestoreSucceeded(target)) {
         this.pendingPreviousThinking = target;
@@ -304,6 +319,7 @@ export class UltracodeMode {
     this.suspended = false;
     this.enabled = latest.enabled;
     this.budgetTotal = latest.budgetTotal;
+    this.syncWorkflowTool(pi);
     const maxIsUnknownToRuntime = !this.runtimeSupportsMaxThinking
       && preference.effective === ULTRACODE_THINKING_LEVEL;
     this.previousThinking = latest.previousThinking
@@ -330,7 +346,6 @@ export class UltracodeMode {
     this.pendingPreviousThinking = this.enabled ? undefined : latest.pendingPreviousThinking;
     if (this.enabled) {
       this.applyUltracodeThinking(pi);
-      this.activateWorkflowTool(pi);
       if (migratesLegacyDefault) {
         this.queueDefaultThinkingRestore(() => {
           this.legacyDefaultMigrationPending = false;
@@ -430,7 +445,7 @@ export class UltracodeMode {
     }
   }
 
-  private isEnforcing(): boolean {
+  isEnforcing(): boolean {
     return this.enabled && !this.suspended;
   }
 
@@ -509,7 +524,18 @@ export class UltracodeMode {
         pi.setActiveTools([...active, this.workflowToolName]);
       }
     } catch {
-      // ignore
+      // Mode enforcement remains usable when tool selection is unavailable.
+    }
+  }
+
+  private deactivateWorkflowTool(pi: ExtensionAPI): void {
+    try {
+      const active = pi.getActiveTools();
+      if (active.includes(this.workflowToolName)) {
+        pi.setActiveTools(active.filter((name) => name !== this.workflowToolName));
+      }
+    } catch {
+      // The execution guards still fail closed when selection cannot be updated.
     }
   }
 

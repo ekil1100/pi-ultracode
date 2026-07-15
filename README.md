@@ -2,7 +2,7 @@
 
 **Ultracode** 是 [Pi](https://github.com/badlogic/pi-mono) 的“全力执行”模式。它把 Pi 的 Agentic Loop 从单线程编码助手升级为能够运行子代理团队的编排器。
 
-启用 Ultracode 后，主代理会获得一条 `workflow` 工具，以及一段要求它主动使用该工具处理复杂任务的系统提示词。每个子代理都运行在独立的内存 Pi 会话中，拥有标准编码工具、独立上下文，并可选择结构化输出、模型覆盖、Agent Type 和隔离的 git worktree。
+启用 Ultracode 后，主代理会获得一条 `workflow` 工具，以及一段要求它主动使用该工具处理复杂任务的系统提示词。扩展加载时会先注册该工具，并在模型请求前的 input 与 `before_agent_start` 边界按模式校准 active tools；未启用或已暂停时，残留调用会被拒绝。每个子代理都运行在独立的内存 Pi 会话中，拥有标准编码工具、独立上下文，并可选择结构化输出、模型覆盖、Agent Type 和隔离的 git worktree。
 
 Ultracode 保留 Pi 自身的核心循环、内存模型、工具系统、扩展 API 与会话格式。它是在 Pi 之上增加编排能力，而不是替换 Pi。
 
@@ -10,7 +10,7 @@ Ultracode 保留 Pi 自身的核心循环、内存模型、工具系统、扩展
 
 | 能力 | 说明 |
 | --- | --- |
-| `workflow` 工具 | 运行确定性的 JavaScript 编排脚本，并调用 `agent()`、`parallel()`、`pipeline()` 和 `workflow()`。 |
+| `workflow` 工具 | 模型请求前按 Ultracode 状态校准；运行确定性的 JavaScript 编排脚本，并调用 `agent()`、`parallel()`、`pipeline()` 和 `workflow()`。 |
 | 独立子代理 | 每次 `agent()` 调用都会创建一条带标准编码工具的新 Pi 会话。 |
 | 并行执行 | `parallel()` 并发运行任务，且保留输入顺序。 |
 | 流水线 | `pipeline()` 让任务独立流经多个阶段，无需全局屏障。 |
@@ -100,7 +100,7 @@ pi --ultracode
 /ultracode             # toggle on/off
 /ultracode on          # enable orchestration mode
 /ultracode on 500k     # enable it with an output-token budget
-/ultracode off         # disable it and restore the previous thinking level
+/ultracode off         # disable the tool and restore the previous thinking level
 /ultracode status      # show status and the configured budget
 /ultracode budget 500k # set a token budget
 /ultracode budget off  # remove the budget
@@ -133,7 +133,7 @@ Ultracode 请求的是**当前模型支持的最高强度**，不是固定标签
 
 ## 工作原理
 
-扩展注册单个 `workflow` 工具。工具输入是 JavaScript 源码，其中必须包含纯字面量 `meta` 导出：
+扩展注册单个 `workflow` 工具，并在 input preflight 与 `before_agent_start` 边界按 Ultracode 状态校准 active tools，同时保留其他 active tools。关闭或暂停时，`tool_call` 与实际执行入口会双重 fail-closed 拒绝残留调用。工具输入是 JavaScript 源码，其中必须包含纯字面量 `meta` 导出：
 
 ```js
 export const meta = {

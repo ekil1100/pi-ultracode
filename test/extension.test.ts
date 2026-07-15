@@ -89,15 +89,76 @@ test("extension registers the workflow tool, commands, and flag", () => {
   assert.ok(state.events.has("model_select"));
   assert.ok(state.events.has("thinking_level_select"));
   assert.ok(state.events.has("session_shutdown"));
+  assert.ok(state.events.has("input"));
+  assert.ok(state.events.has("tool_call"));
   assert.ok(state.events.has("before_agent_start"));
 });
 
-test("session_start activates the workflow tool", async () => {
+test("session_start keeps the workflow tool inactive until Ultracode is enabled", async () => {
+  const { pi, state } = makeMockPi();
+  extension(pi);
+  state.activeTools = ["read", "workflow"];
+  const { ctx } = makeCtx(state);
+  await state.events.get("session_start")![0]({ reason: "startup" }, ctx);
+  assert.deepEqual(state.activeTools, ["read"]);
+});
+
+test("SDK-style prompt barriers keep workflow disabled without session_start", async () => {
+  const { pi, state } = makeMockPi();
+  extension(pi);
+  state.activeTools = ["read", "workflow"];
+
+  await state.events.get("input")![0]({ type: "input", text: "test", source: "interactive" });
+  assert.deepEqual(state.activeTools, ["read"], "input preflight removes auto-activated extension tools");
+
+  // Simulate a later input handler restoring a stale active-tools snapshot.
+  state.activeTools = ["read", "grep", "workflow"];
+  const turn = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" });
+  assert.equal(turn, undefined, "a disabled turn injects no Ultracode prompt");
+  assert.deepEqual(state.activeTools, ["read", "grep"], "the final barrier removes only workflow");
+
+  const blocked = await state.events.get("tool_call")![0]({
+    type: "tool_call",
+    toolName: "workflow",
+    toolCallId: "wf-off",
+    input: {},
+  });
+  assert.equal(blocked?.block, true);
+  assert.match(blocked?.reason ?? "", /disabled/);
+  assert.equal(
+    await state.events.get("tool_call")![0]({
+      type: "tool_call",
+      toolName: "read",
+      toolCallId: "read-ok",
+      input: { path: "README.md" },
+    }),
+    undefined,
+    "the guard does not affect other tools",
+  );
+});
+
+test("before_agent_start restores workflow and the standing block in the same enabled turn", async () => {
   const { pi, state } = makeMockPi();
   extension(pi);
   const { ctx } = makeCtx(state);
-  await state.events.get("session_start")![0]({ reason: "startup" }, ctx);
-  assert.ok(state.activeTools.includes("workflow"));
+  await state.commands.get("ultracode").handler("on", ctx);
+
+  // Simulate another active-tool writer removing workflow after activation.
+  state.activeTools = ["read", "grep"];
+  const driftTurn = await state.events.get("before_agent_start")![0]({ systemPrompt: "CURRENT BASE" });
+  assert.deepEqual(state.activeTools, ["read", "grep", "workflow"]);
+  assert.ok(driftTurn?.systemPrompt.includes("CURRENT BASE"));
+  assert.ok(driftTurn?.systemPrompt.includes("<ultracode>"));
+  assert.equal(
+    await state.events.get("tool_call")![0]({
+      type: "tool_call",
+      toolName: "workflow",
+      toolCallId: "wf-on",
+      input: {},
+    }),
+    undefined,
+    "enabled workflow calls are allowed",
+  );
 });
 
 test("/ultracode on raises thinking to max and injects the system block", async () => {
@@ -108,6 +169,7 @@ test("/ultracode on raises thinking to max and injects the system block", async 
   await state.commands.get("ultracode").handler("on", ctx);
   assert.equal(state.thinking, "max");
   assert.equal(state.statuses.ultracode, "ultracode: on · max");
+  assert.equal(state.activeTools.includes("workflow"), true);
   assert.ok(notifications.some((n) => /Ultracode on/.test(n.m)));
   // Persisted enabled state.
   const last = state.entries.filter((e) => e.customType === "ultracode-mode").pop();
@@ -123,11 +185,13 @@ test("/ultracode on raises thinking to max and injects the system block", async 
 test("/ultracode off restores the previous thinking level", async () => {
   const { pi, state } = makeMockPi();
   extension(pi);
+  state.activeTools = ["read"];
   const { ctx } = makeCtx(state);
   await state.commands.get("ultracode").handler("on", ctx);
   assert.equal(state.thinking, "max");
   await state.commands.get("ultracode").handler("off", ctx);
   assert.equal(state.thinking, "medium");
+  assert.deepEqual(state.activeTools, ["read"]);
   // before_agent_start now injects nothing.
   assert.equal(await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }), undefined);
 });
@@ -141,6 +205,7 @@ test("session shutdown restores effort without disabling persisted Ultracode sta
 
   await state.events.get("session_shutdown")![0]({ reason: "reload" }, ctx);
   assert.equal(state.thinking, "medium", "max does not leak into another session");
+  assert.equal(state.activeTools.includes("workflow"), false, "workflow does not leak from a quiescing runtime");
   const latest = state.entries.filter((entry) => entry.customType === "ultracode-mode").pop();
   assert.equal(latest.data.enabled, true, "shutdown does not persistently disable the mode");
 
@@ -157,6 +222,7 @@ test("session shutdown restores effort without disabling persisted Ultracode sta
 
   await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
   assert.equal(state.thinking, "max", "replacement session restores persisted mode state");
+  assert.equal(state.activeTools.includes("workflow"), true, "replacement session reactivates workflow");
 });
 
 test("extension preserves the raw global effort preference while max is active", async () => {
@@ -312,6 +378,7 @@ test("mode state is restored from persisted entries on a fresh load", async () =
   const { ctx } = makeCtx(state);
   await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
   assert.equal(state.thinking, "max");
+  assert.equal(state.activeTools.includes("workflow"), true);
   // before_agent_start injects (enabled restored).
   const result = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" });
   assert.ok(result?.systemPrompt.includes("<ultracode>"));
@@ -351,6 +418,7 @@ test("session_tree rehydrates branch-local Ultracode state", async () => {
   branch = [];
   await state.events.get("session_tree")![0]({ newLeafId: null, oldLeafId: "enabled" }, ctx);
   assert.equal(state.thinking, "medium");
+  assert.equal(state.activeTools.includes("workflow"), false);
   assert.equal(state.statuses.ultracode, undefined);
   assert.equal(
     await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }, ctx),
@@ -361,6 +429,7 @@ test("session_tree rehydrates branch-local Ultracode state", async () => {
   branch = enabledBranch;
   await state.events.get("session_tree")![0]({ newLeafId: "enabled", oldLeafId: null }, ctx);
   assert.equal(state.thinking, "max");
+  assert.equal(state.activeTools.includes("workflow"), true);
   assert.equal(state.statuses.ultracode, "ultracode: on · max");
   const restored = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }, ctx);
   assert.ok(restored?.systemPrompt.includes("<ultracode>"));
@@ -372,6 +441,7 @@ test("--ultracode flag enables the mode at session_start", async () => {
   const { ctx } = makeCtx(state);
   await state.events.get("session_start")![0]({ reason: "startup" }, ctx);
   assert.equal(state.thinking, "max");
+  assert.equal(state.activeTools.includes("workflow"), true);
 });
 
 test("model and manual effort changes reassert max and refresh status", async () => {
@@ -545,11 +615,13 @@ test("workflow tool forwards thinkingLevel=undefined when no getThinkingLevel is
   }
 });
 
-test("extension wires getThinkingLevel so the registered tool forwards max when ultracode is on", async () => {
+test("registered workflow execution fails closed off and forwards max when Ultracode is on", async () => {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-think-ext-"));
   try {
     let capturedThinking: unknown = "SENTINEL";
+    let runCalls = 0;
     const fakeRun = async (_script: string, options: any) => {
+      runCalls++;
       capturedThinking = options.thinkingLevel;
       return {
         meta: { name: "x", description: "x" },
@@ -562,20 +634,25 @@ test("extension wires getThinkingLevel so the registered tool forwards max when 
         durationMs: 1,
       };
     };
-    // Go through the REAL extension entrypoint (with a runWorkflowFn seam) so the
-    // extension->tool handoff (getThinkingLevel wiring) is exercised, not bypassed.
+    // Go through the real extension entrypoint so both mode wiring and the
+    // registered tool's execution gate are exercised.
     const { pi, state } = makeMockPi();
     extension(pi, { runWorkflowFn: fakeRun as any });
     const { ctx } = makeCtx(state);
-
-    // Enable ultracode (raises main thinking to max + wires subagent forwarding).
-    await state.commands.get("ultracode").handler("on", ctx);
-
     const tool = state.tools[0];
     const execCtx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'x', description: 'x' }\nreturn 1`;
-    await tool.execute("tc3", { script } as any, undefined, undefined, execCtx);
-    assert.equal(capturedThinking, "max", "extension wires getThinkingLevel so subagents get max when ultracode is on");
+
+    await assert.rejects(
+      tool.execute("tc-off", { script } as any, undefined, undefined, execCtx),
+      /workflow tool is disabled/i,
+    );
+    assert.equal(runCalls, 0, "disabled execution is rejected before the runtime starts");
+
+    await state.commands.get("ultracode").handler("on", ctx);
+    await tool.execute("tc-on", { script } as any, undefined, undefined, execCtx);
+    assert.equal(runCalls, 1);
+    assert.equal(capturedThinking, "max", "enabled subagents inherit the Ultracode max request");
   } finally {
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }

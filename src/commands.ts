@@ -25,7 +25,10 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
       if (sub === "") {
         const nowOn = mode.toggle(pi);
         await mode.flushThinkingPreference();
-        ctx.ui.notify(nowOn ? `Ultracode on — ${mode.statusLine()}` : "Ultracode off — thinking restored.", "info");
+        ctx.ui.notify(
+          nowOn ? `Ultracode on — ${mode.statusLine()}` : "Ultracode off — thinking restored and workflow tool disabled.",
+          "info",
+        );
         ctx.ui.setStatus("ultracode", nowOn ? mode.statusLine() : undefined);
         return;
       }
@@ -38,7 +41,7 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
       if (sub === "off") {
         mode.disable(pi);
         await mode.flushThinkingPreference();
-        ctx.ui.notify("Ultracode off — thinking restored, workflow orchestration is opt-in again.", "info");
+        ctx.ui.notify("Ultracode off — thinking restored and workflow tool disabled.", "info");
         ctx.ui.setStatus("ultracode", undefined);
         return;
       }

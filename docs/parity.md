@@ -16,9 +16,9 @@
 ## ultracode 模式实际做什么
 
 - **thinking**:主 agent 请求 `max`,Pi SDK 按模型 clamp；旧版 Pi 不识别 `max` 时兼容回退到 `xhigh`(`mode.ts` `applyUltracodeThinking`)。
-- **workflow 工具**:始终在 active 列表(`extensions/ultracode.ts` `session_start`,即使 ultracode 关也按需可用)。
+- **workflow 工具**:扩展加载时完成注册，并在 input preflight 与 `before_agent_start` 边界按 ultracode 状态校准 active tools；关闭、暂停或导航到未开启的 session branch 时会请求移除它，同时保留其他 active tools。禁用态即使被其他 active-tool writer 重新暴露，`tool_call` 与实际执行入口也会双重 fail-closed 拒绝执行。
 - **standing prompt block**:开启时每轮注入(`mode.ts` `beforeAgentStart` → `prompts.ts` `ultracodeSystemBlock`),把默认倾向调到"substantive task 默认用 workflow",但明文给跳过条件(对话轮 / 琐碎机械改动)。
-- **触发方式 = 按需,不是必定触发**。没有任何 hook 强制调用 workflow;`tool_choice` 无法强制(Pi SDK 不暴露,见 D2)。模型有最终决定权。
+- **触发方式 = 开启后按需,不是必定触发**。ultracode 关闭时模型不可调用未激活的 workflow；开启后没有任何 hook 强制调用它，且 `tool_choice` 无法强制(Pi SDK 不暴露,见 D2)，模型仍有最终决定权。
 
 ## 已修复(`f6e8a42`)
 
@@ -65,7 +65,7 @@
 - **模型 / effort / session 生命周期**:Ultracode 开启期间切换模型会重新请求 `max`;手动降低 effort 也会立即重新请求 `max`，每轮 provider 调用前还有最终屏障。模式自身产生的事件与过期事件会被忽略,避免递归。由于 Pi 的 setter 同时写全局默认值，扩展会尽力保存并回写语义等价的全局 preference（原本缺省时会显式写为 `medium`）；旧版 active entry 若只有 `previousThinking` 且全局仍是旧实现写入的 `xhigh`，会用该快照迁移回原 baseline。`session_shutdown` 先进入 quiescing 再恢复开启前的有效 effort，但不改持久化 mode 状态，因此 reload/resume/fork replacement 与 `/tree` 导航都会按当前 branch 的 session 记录重新恢复。若中间模型只能表示 `xhigh`，原始待恢复的 `max` 不会被过早消费。Pi 尚无 session-only setter，hard kill、自定义 SDK agentDir 或另一份 live settings cache 仍属于上游 API 限制。
 - **workflow 子 agent**:模式转发**原始 `"max"`**;runner 根据各子模型是否公开非空 `thinkingLevelMap.max` 选择 `max` 或 `xhigh`,再交给 `createAgentSession` clamp。模型未知时先传 `max`，当前 Pi 的正常模型 clamp 不重建；pre-max Pi 或已宣告支持 `max` 却未接受的 runtime 才会销毁尚未运行的内存 session 并以 `xhigh` 重建,避免修改用户全局默认 effort。初始化、异步 preflight 与流式执行都响应取消；运行器等待 `abort()` 后再释放会话，且 cleanup 错误不覆盖原始失败。
 - **状态**:显示真实 clamp 后的 level（`off|minimal|low|medium|high|xhigh|max`），格式为 `ultracode: on · <level>`，可再追加 budget（不额外写 `thinking`）。
-- **ultracode 关时**:`getSubagentThinkingLevel()` = `undefined` → 子 agent 回落 session 默认;主 agent 恢复开启前的 effort。
+- **ultracode 关时**:`workflow` 不在 active tools；`getSubagentThinkingLevel()` = `undefined`，主 agent 恢复开启前的 effort。
 - **显式配置**:`model:"X:max"` 与 agent frontmatter `thinking: max` 均受支持。优先级仍为 per-call `model:"X:level"` > agentType `thinking:` > ultracode 默认。
 
 ## 验证 notable(解释为何 6 项"部分准确")

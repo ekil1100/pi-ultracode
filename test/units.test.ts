@@ -109,13 +109,16 @@ test("mode.toggle requests max and restores the prior thinking level", () => {
   const m = new UltracodeMode("workflow");
   const { api, s } = miniPi();
   s.thinking = "low";
+  s.active = ["read"];
   assert.equal(m.toggle(api), true);
   assert.equal(m.isEnabled(), true);
   assert.equal(s.thinking, "max");
   assert.ok(s.active.includes("workflow"), "toggle on activates the workflow tool");
+  s.active.push("grep");
   assert.equal(m.toggle(api), false);
   assert.equal(m.isEnabled(), false);
   assert.equal(s.thinking, "low", "toggle off restores the prior level");
+  assert.deepEqual(s.active, ["read", "grep"], "toggle off removes only the workflow tool");
 });
 
 test("restore migrates an enabled entry that lacks a previous effort", () => {
@@ -596,12 +599,17 @@ test("UltracodeMode.getSubagentThinkingLevel: max when enabled, undefined when o
   assert.equal(m.getSubagentThinkingLevel(), undefined, "undefined again after disable");
 });
 
-test("suspend quiesces all effort and prompt enforcement", () => {
+test("suspend quiesces all effort, tool, and prompt enforcement", () => {
   const m = new UltracodeMode("workflow");
   const { api, s } = miniPi();
+  s.active = ["read"];
   m.enable(api);
   m.suspend(api);
   assert.equal(s.thinking, "medium");
+  assert.deepEqual(s.active, ["read"]);
+  s.active.push("workflow");
+  m.suspend(api);
+  assert.deepEqual(s.active, ["read"], "repeated suspend removes externally restored workflow");
   assert.equal(m.getSubagentThinkingLevel(), undefined);
   s.thinking = "high";
   assert.equal(m.reapplyMaximumThinking(api), false);

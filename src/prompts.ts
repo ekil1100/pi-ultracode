@@ -59,7 +59,7 @@ export const WORKFLOW_PROMPT_SNIPPET =
 
 /** Guideline bullets appended to the Guidelines section when the tool is active. */
 export const WORKFLOW_GUIDELINES: string[] = [
-  "Use the workflow tool to decompose-and-cover in parallel, to gather independent perspectives that adversarially verify each other, or to take on scale a single context can't hold. Outside ultracode mode, reserve it for explicit fan-out / multi-agent requests.",
+  "While Ultracode is enabled, use the workflow tool to decompose-and-cover in parallel, gather independent perspectives that adversarially verify each other, or take on scale one context can't hold.",
   "For the workflow tool, pass one raw JavaScript string in the required `script` parameter; no Markdown fences, no prose around the script.",
   "For the workflow tool, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`. meta must be a pure literal: no variables, function calls, spreads, or template interpolation. meta.phases is optional and should mirror your phase() titles.",
   "For the workflow tool, write plain JavaScript after the meta export. No TypeScript syntax, imports, require(), fs, network, Date.now(), Math.random(), or new Date() (they break determinism and resume). Stamp timestamps after the workflow returns; vary randomness by agent index.",
