@@ -23,8 +23,13 @@ import {
   runWorkflow,
 } from "./runtime.ts";
 import type { ThinkingLevel } from "./agent-runner.ts";
-import { RunJournal, hashString } from "./journal.ts";
+import { RunJournal, hashString, type JournalAgentRecord } from "./journal.ts";
 import { getRegistry } from "./registry.ts";
+import {
+  WorkflowRunDetails,
+  normalizeTaskUsage,
+  type WorkflowTaskSummary,
+} from "./run-details.ts";
 import {
   createSnapshot,
   preview,
@@ -81,7 +86,7 @@ let runCounter = 0;
 
 /** Throttle: min ms between activity-driven re-renders (avoids token-by-token
  *  re-render storms when many subagents stream concurrently). */
-const ACTIVITY_RENDER_INTERVAL_MS = 200;
+const ACTIVITY_RENDER_INTERVAL_MS = 100;
 
 function nextRunId(): string {
   runCounter += 1;
@@ -106,7 +111,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       const parsed = parseWorkflowScript(script);
       const displayName = safeDisplayText(parsed.meta.name, 60) || "workflow";
 
-      const runsDir = runsDirFor(ctx);
+      const runsDir = workflowRunsDir(ctx);
       const requestedRunId = params.resumeFromRunId?.trim();
       const runId = requestedRunId ? requireSafeRunId(requestedRunId) : nextRunId();
       const budgetTotal = params.budget ?? deps.getDefaultBudget?.() ?? null;
@@ -114,6 +119,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       // that subagent's model. Undefined when ultracode is off.
       const thinkingLevel = deps.getThinkingLevel?.();
       const run = deps.runWorkflowFn ?? runWorkflow;
+      const workflowStartedAt = Date.now();
 
       // Persist the script next to the session for resume / inspection.
       const scriptPath = path.join(runsDir, `${runId}.workflow.js`);
@@ -145,14 +151,30 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
 
       // Snapshot + registry + abort plumbing.
       let snapshot = createSnapshot(parsed.meta, runId, budgetTotal);
+      const restoredDetails = resuming
+        ? WorkflowRunDetails.restore(path.join(runsDir, `${runId}.details.json`))?.details
+        : undefined;
+      const runDetails = restoredDetails ?? new WorkflowRunDetails({
+        runId,
+        name: parsed.meta.name,
+        runsDir,
+      });
+      snapshot.detailsManifestPath = runDetails.manifestPath;
       const controller = new AbortController();
       const onOuterAbort = () => controller.abort();
       signal?.addEventListener("abort", onOuterAbort, { once: true });
-      const handle = getRegistry().register(runId, snapshot, () => controller.abort());
+      const registry = getRegistry();
+      registry.setScope(runsDir);
+      const handle = registry.register(runId, snapshot, () => controller.abort(), runDetails);
 
       const update = () => {
+        const totals = representedUsage(snapshot);
+        snapshot.newTokens = totals.newTokens;
+        snapshot.replayedTokens = totals.replayedTokens;
+        snapshot.spentTokens = totals.outputTokens;
         snapshot = recompute(snapshot);
         handle.snapshot = snapshot;
+        registry.notify();
         onUpdate?.({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
       };
 
@@ -204,30 +226,74 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
             if (!acceptingEvents) return;
             const phase = recordPhase(event.phase);
             const startedAt = Date.now();
-            snapshot.agents.push({
+            const summary = runDetails.startTask({
+              id: event.id,
+              label: event.label,
+              phase,
+              workflowPath: event.workflowPath,
+              prompt: event.prompt,
+              modelPattern: event.modelPattern,
+              requestedEffort: event.requestedEffort,
+              agentType: event.agentType,
+              isolation: event.isolation,
+              structuredOutput: event.structuredOutput,
+              cached: event.cached,
+              cachedRecord: event.cachedRecord ? cachedRecordSummary(event.cachedRecord) : undefined,
+            });
+            const agent: WorkflowSnapshot["agents"][number] = {
               id: event.id,
               label: safeDisplayText(event.label, 120) || `agent ${event.id}`,
               phase,
+              workflowPath: event.workflowPath,
               status: event.cached ? "cached" : "running",
-              startedAt,
+              startedAt: summary.startedAt ?? startedAt,
               lastActivityAt: startedAt,
               activity: event.cached ? "replaying cache" : "starting session",
-            });
+            };
+            applyTaskSummary(agent, summary);
+            snapshot.agents.push(agent);
             update();
+            runDetails.persist(snapshot);
           },
           onAgentEnd(event) {
             if (!acceptingEvents) return;
             const agent = snapshot.agents.find((a) => a.id === event.id);
+            const summary = runDetails.finishTask(event.id, {
+              status: event.cachedRecord ? "cached" : event.status,
+              result: event.result,
+              error: event.error,
+              usage: event.usage,
+              modelId: event.modelId,
+              effort: event.effort,
+            });
             if (agent) {
               if (agent.status !== "cached") agent.status = event.status;
               agent.resultPreview = preview(event.result);
-              if (event.status === "error") agent.error = preview(event.result);
+              if (event.status === "error") agent.error = event.error ? statusText(event.error) : preview(event.result);
               const endedAt = Date.now();
               agent.endedAt = endedAt;
               clearAgentTransient(agent);
               if (agent.startedAt != null) agent.durationMs = endedAt - agent.startedAt;
+              if (summary) applyTaskSummary(agent, summary);
             }
             update();
+            runDetails.persist(snapshot);
+          },
+          onAgentTelemetry(event) {
+            if (!acceptingEvents) return;
+            const agent = snapshot.agents.find((candidate) => candidate.id === event.id);
+            if (!agent || agent.status !== "running") return;
+            const summary = runDetails.record(event.id, event);
+            if (summary) applyTaskSummary(agent, summary);
+            const now = Date.now();
+            agent.lastActivityAt = now;
+            if (event.kind !== "text_delta" && event.kind !== "thinking_start") {
+              runDetails.persist(snapshot);
+            }
+            if (now - lastActivityRenderMs >= ACTIVITY_RENDER_INTERVAL_MS) {
+              lastActivityRenderMs = now;
+              update();
+            }
           },
           onAgentActivity(event) {
             if (!acceptingEvents) return;
@@ -273,10 +339,14 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         for (const agent of snapshot.agents) clearAgentTransient(agent);
         snapshot.result = result.result;
         snapshot.spentTokens = result.spentTokens;
+        snapshot.newTokens = result.newTokens;
+        snapshot.replayedTokens = result.replayedTokens;
         snapshot.durationMs = result.durationMs;
         snapshot.status = "completed";
         snapshot = recompute(snapshot);
         handle.snapshot = snapshot;
+        runDetails.close(snapshot);
+        registry.notify();
         journal?.recordResult({
           ok: true,
           result: result.result,
@@ -310,14 +380,26 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         if (!controller.signal.aborted) controller.abort();
         for (const agent of snapshot.agents) {
           if (agent.status === "running") {
-            agent.status = "skipped";
-            agent.error = "aborted";
+            agent.status = aborted ? "cancelled" : "error";
+            agent.error ??= aborted ? "cancelled" : "workflow failed";
+            const summary = runDetails.finishTask(agent.id, {
+              status: aborted ? "cancelled" : "error",
+              error: agent.error,
+            });
+            if (summary) applyTaskSummary(agent, summary);
           }
           clearAgentTransient(agent);
         }
         snapshot.status = aborted ? "aborted" : "failed";
+        snapshot.durationMs = Math.max(0, Date.now() - workflowStartedAt);
+        const totals = representedUsage(snapshot);
+        snapshot.newTokens = totals.newTokens;
+        snapshot.replayedTokens = totals.replayedTokens;
+        snapshot.spentTokens = totals.outputTokens;
         snapshot = recompute(snapshot);
         handle.snapshot = snapshot;
+        runDetails.close(snapshot);
+        registry.notify();
         const errorText = statusText(error);
         journal?.recordResult({
           ok: false,
@@ -338,16 +420,21 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         acceptingEvents = false;
         clearInterval(heartbeat);
         signal?.removeEventListener("abort", onOuterAbort);
+        runDetails.close(snapshot);
         journal?.close();
       }
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("workflow")), 0, 0);
     },
-    renderResult(result, { isPartial }, theme) {
+    renderResult(result, { isPartial, expanded }, theme) {
       const snapshot = result.details as WorkflowSnapshot | undefined;
       if (snapshot?.name) {
-        return new Text(renderWorkflowText(snapshot, { showResultPreviews: !isPartial }), 0, 0);
+        return new Text(renderWorkflowText(snapshot, {
+          maxAgents: expanded ? Number.MAX_SAFE_INTEGER : undefined,
+          maxLogs: expanded ? 12 : undefined,
+          showResultPreviews: expanded && !isPartial,
+        }), 0, 0);
       }
       const text = result.content?.[0];
       return new Text(text?.type === "text" ? text.text : theme.fg("muted", "workflow"), 0, 0);
@@ -382,7 +469,7 @@ function resolveScript(
   throw new Error("workflow requires one of: `script`, `scriptPath`, or `name`.");
 }
 
-function runsDirFor(ctx: { sessionManager?: { getSessionDir?: () => string }; cwd: string }): string {
+export function workflowRunsDir(ctx: { sessionManager?: { getSessionDir?: () => string }; cwd: string }): string {
   try {
     const sessionDir = ctx.sessionManager?.getSessionDir?.();
     if (sessionDir) return path.join(sessionDir, "ultracode-runs");
@@ -414,6 +501,76 @@ function requireSafeRunId(value: string): string {
 function statusText(value: unknown): string {
   const text = value instanceof Error ? value.message : String(value);
   return safeDisplayText(text, 160) || "unknown error";
+}
+
+function representedUsage(snapshot: WorkflowSnapshot): { newTokens: number; replayedTokens: number; outputTokens: number } {
+  let newTokens = 0;
+  let replayedTokens = 0;
+  let outputTokens = 0;
+  for (const agent of snapshot.agents) {
+    const tokens = agent.legacyCache ? 0 : agent.usage?.totalTokens ?? 0;
+    outputTokens += agent.usage?.outputTokens ?? 0;
+    if (agent.status === "cached") replayedTokens += tokens;
+    else newTokens += tokens;
+  }
+  return { newTokens, replayedTokens, outputTokens };
+}
+
+function cachedRecordSummary(record: JournalAgentRecord): Partial<WorkflowTaskSummary> {
+  return {
+    id: record.seq,
+    label: record.label,
+    status: "cached",
+    promptPreview: "",
+    workflowPath: [],
+    requestedModelId: record.requestedModelId,
+    requestedEffort: record.requestedEffort,
+    modelId: record.modelId,
+    effort: record.effort,
+    agentType: record.agentType,
+    isolation: record.isolation,
+    structuredOutput: record.structuredOutput,
+    usage: normalizeTaskUsage({ ...record, totalTokens: record.totalTokens ?? 0 }),
+    startedAt: record.startedAt,
+    durationMs: record.durationMs,
+    endedAt: record.startedAt != null && record.durationMs != null
+      ? record.startedAt + record.durationMs
+      : undefined,
+    resultPreview: preview(record.value),
+    cached: true,
+    legacyCache: !record.modelId
+      || !record.effort
+      || record.inputTokens == null
+      || record.totalTokens == null
+      || record.cacheReadTokens == null
+      || record.cacheWriteTokens == null
+      || record.turns == null
+      || record.toolUses == null,
+    transcriptPath: record.transcriptPath,
+  };
+}
+
+function applyTaskSummary(
+  agent: WorkflowSnapshot["agents"][number],
+  summary: WorkflowTaskSummary,
+): void {
+  agent.status = summary.status;
+  agent.workflowPath = [...summary.workflowPath];
+  agent.requestedModelId = summary.requestedModelId;
+  agent.requestedEffort = summary.requestedEffort;
+  agent.modelId = summary.modelId;
+  agent.effort = summary.effort;
+  agent.agentType = summary.agentType;
+  agent.isolation = summary.isolation;
+  agent.structuredOutput = summary.structuredOutput;
+  agent.usage = { ...summary.usage };
+  agent.currentTurn = summary.currentTurn;
+  agent.legacyCache = summary.legacyCache;
+  agent.transcriptPath = summary.transcriptPath;
+  agent.startedAt = summary.startedAt ?? agent.startedAt;
+  agent.endedAt = summary.endedAt ?? agent.endedAt;
+  agent.durationMs = summary.durationMs ?? agent.durationMs;
+  agent.error = summary.error ?? agent.error;
 }
 
 function clearAgentTransient(agent: WorkflowSnapshot["agents"][number]): void {

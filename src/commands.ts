@@ -5,8 +5,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parseBudget, type UltracodeMode } from "./mode.ts";
 import { getRegistry } from "./workflow/registry.ts";
-import { renderWorkflowLines } from "./workflow/display.ts";
-import { truncateDisplay } from "./workflow/display-text.ts";
+import { workflowRunsDir } from "./workflow/tool.ts";
+import { openWorkflowOverlay } from "./workflow/workflow-overlay.ts";
 
 export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
   pi.registerCommand("ultracode", {
@@ -74,96 +74,36 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
     },
   });
 
-  // Tracks whether the run panel is currently shown, so bare /workflows toggles it.
-  let panelVisible = false;
+  const openWorkflows = async (ctx: any, runId?: string) => {
+    const registry = getRegistry();
+    registry.restoreRuns(workflowRunsDir(ctx));
+    await openWorkflowOverlay(ctx, registry, runId);
+  };
 
   pi.registerCommand("workflows", {
-    description: "Toggle the workflow-run panel. Usage: /workflows [runId | clear | abort]",
+    description: "Open the interactive workflow/task detail overlay. Usage: /workflows [runId | abort]",
     getArgumentCompletions(prefix: string) {
-      return ["clear", "abort"]
-        .filter((s) => s.startsWith(prefix))
+      const values = [
+        "abort",
+        ...getRegistry().list().map((handle) => handle.snapshot.runId).filter((runId): runId is string => Boolean(runId)),
+      ];
+      return [...new Set(values)]
+        .filter((value) => value.startsWith(prefix))
         .map((value) => ({ value, label: value }));
     },
     handler: async (args: string, ctx) => {
-      const registry = getRegistry();
       const arg = args.trim();
-      const sub = arg.toLowerCase();
-
-      const hide = () => {
-        ctx.ui.setWidget("ultracode-workflows", undefined);
-        panelVisible = false;
-      };
-      const show = (lines: string[]) => {
-        ctx.ui.setWidget("ultracode-workflows", lines);
-        panelVisible = true;
-      };
-
-      if (sub === "clear" || sub === "hide" || sub === "off") {
-        hide();
-        ctx.ui.notify("Workflow panel hidden.", "info");
+      if (arg.toLowerCase() === "abort") {
+        getRegistry().abortAll();
+        ctx.ui.notify("Requested abort of all active workflow runs.", "warning");
         return;
       }
-
-      if (sub === "abort") {
-        registry.abortAll();
-        hide();
-        ctx.ui.notify("Requested abort of all active workflow runs; panel hidden.", "info");
-        return;
-      }
-
-      const runs = registry.list();
-
-      // Explicit run id -> show that run's detail.
-      if (arg) {
-        const handle = registry.get(arg) ?? runs.find((r) => r.snapshot.runId?.startsWith(arg));
-        if (!handle) {
-          ctx.ui.notify(`No workflow run matching "${truncateDisplay(arg, 80)}". /workflows to list, /workflows clear to hide.`, "warning");
-          return;
-        }
-        show(renderWorkflowLines(handle.snapshot, { maxAgents: 12, maxLogs: 6, showResultPreviews: true }));
-        ctx.ui.notify(`Showing ${truncateDisplay(handle.snapshot.runId ?? "run", 128)}. /workflows clear to hide.`, "info");
-        return;
-      }
-
-      // Bare /workflows toggles the panel off if it's already up.
-      if (panelVisible) {
-        hide();
-        ctx.ui.notify("Workflow panel hidden.", "info");
-        return;
-      }
-
-      if (runs.length === 0) {
-        hide();
-        ctx.ui.notify("No workflow runs in this session yet.", "info");
-        return;
-      }
-
-      const summary = runs.map((handle) => {
-        const s = handle.snapshot;
-        return `${statusGlyph(s.status)} ${truncateDisplay(s.runId ?? "run", 128)}  ${truncateDisplay(s.name, 80)}  ${s.doneCount}/${s.agentCount}${
-          s.runningCount ? ` (${s.runningCount} running)` : ""
-        }`;
-      });
-      show(["◆ Ultracode workflow runs  ·  /workflows clear to hide", ...summary.map((l) => `  ${l}`)]);
-      ctx.ui.notify(
-        `${runs.length} run(s), ${registry.active().length} active. /workflows again (or /workflows clear) to hide.`,
-        "info",
-      );
+      await openWorkflows(ctx, arg || undefined);
     },
   });
-}
 
-function statusGlyph(status: string): string {
-  switch (status) {
-    case "completed":
-      return "✓";
-    case "running":
-      return "▶";
-    case "aborted":
-      return "■";
-    case "failed":
-      return "✗";
-    default:
-      return "·";
-  }
+  pi.registerShortcut("f6", {
+    description: "Open workflow task details",
+    handler: async (ctx) => openWorkflows(ctx),
+  });
 }

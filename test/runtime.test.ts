@@ -192,6 +192,36 @@ test("workflow() runs a nested workflow inline sharing state", async () => {
   assert.equal(result.agentCount, 2, "nested + parent agents share the counter");
 });
 
+test("concurrent sibling workflows keep independent breadcrumb paths", async () => {
+  const paths = new Map<string, string[]>();
+  const phases = new Map<string, string | undefined>();
+  const result = await runWorkflow(
+    `export const meta = { name: 'parent', description: 'x' }
+     return await parallel([() => workflow('alpha'), () => workflow('beta')])`,
+    {
+      runner: {
+        run: async (call: any) => {
+          await new Promise((resolve) => setTimeout(resolve, call.label === "alpha" ? 5 : 1));
+          return { value: call.label, usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: "/tmp" };
+        },
+      },
+      loadSavedWorkflow: (name) => ({
+        meta: { name: String(name), description: "child" },
+        body: `phase('${String(name)} phase'); return await agent('${String(name)}', { label: '${String(name)}' })`,
+      }),
+      onAgentStart: (event) => {
+        paths.set(event.label, event.workflowPath ?? []);
+        phases.set(event.label, event.phase);
+      },
+    },
+  );
+  assert.deepEqual(result.result, ["alpha", "beta"]);
+  assert.deepEqual(paths.get("alpha"), ["parent", "alpha"]);
+  assert.deepEqual(paths.get("beta"), ["parent", "beta"]);
+  assert.equal(phases.get("alpha"), "alpha phase");
+  assert.equal(phases.get("beta"), "beta phase");
+});
+
 test("nested workflow() inside a child throws", async () => {
   await assert.rejects(
     runWorkflow(

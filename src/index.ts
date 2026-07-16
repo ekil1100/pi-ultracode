@@ -22,6 +22,9 @@ export {
   matchModelIn,
   type AgentRunCall,
   type AgentRunResult,
+  type AgentTelemetryEvent,
+  type AgentTurnUsage,
+  type AgentUsage,
   type ThinkingLevel,
   type ModelLike,
   type ModelRegistryLike,
@@ -42,8 +45,22 @@ export {
   renderWorkflowLines,
   renderWorkflowText,
   preview,
+  type WorkflowAgentSnapshot,
+  type WorkflowAgentUsageSnapshot,
   type WorkflowSnapshot,
 } from "./workflow/display.ts";
+export {
+  WorkflowRunDetails,
+  MAX_LIVE_TASK_BYTES,
+  MAX_LIVE_TASK_LINES,
+  MAX_LIVE_RUN_BYTES,
+  MAX_TASK_TRANSCRIPT_BYTES,
+  MAX_RUN_TRANSCRIPT_BYTES,
+  type WorkflowTaskDetail,
+  type WorkflowTaskSummary,
+  type WorkflowTaskUsage,
+  type WorkflowTimelineEvent,
+} from "./workflow/run-details.ts";
 export {
   createWorktree,
   captureWorktreeDiff,

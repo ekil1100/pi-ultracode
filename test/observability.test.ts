@@ -699,7 +699,7 @@ test("late activity cannot repopulate a failed workflow snapshot", async () => {
 
   const final = updates.at(-1);
   assert.equal(final.status, "failed");
-  assert.equal(final.agents[0].status, "skipped");
+  assert.equal(final.agents[0].status, "error");
   assert.equal(final.agents[0].activeTools, undefined);
   assert.equal(final.agents[0].streamTail, undefined);
   assert.equal(notifications.length, 1);

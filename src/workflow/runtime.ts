@@ -10,6 +10,7 @@
  */
 
 import vm from "node:vm";
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -18,7 +19,15 @@ import { parseWorkflowScript, type WorkflowMeta } from "./parser.ts";
 // loader ("WorkflowAgentRunner is not a constructor"). Tests inject a runner, so
 // they never construct this class; production builds it via getRunner().
 import { WorkflowAgentRunner } from "./agent-runner.ts";
-import type { AgentActivityInput, AgentRunResult, ModelLike, ModelRegistryLike, ThinkingLevel } from "./agent-runner.ts";
+import type {
+  AgentActivityInput,
+  AgentRunResult,
+  AgentTelemetryEvent,
+  AgentUsage,
+  ModelLike,
+  ModelRegistryLike,
+  ThinkingLevel,
+} from "./agent-runner.ts";
 import { safeDisplayText } from "./display-text.ts";
 
 /**
@@ -55,7 +64,7 @@ export function createDeterministicMath(): Record<string, unknown> {
 
 const DETERMINISTIC_MATH = createDeterministicMath();
 import { discoverAgentTypes, resolveAgentType, type AgentTypeDef } from "./agent-types.ts";
-import { agentCallKey, RunJournal } from "./journal.ts";
+import { agentCallKey, RunJournal, type JournalAgentRecord } from "./journal.ts";
 import {
   applyPatch,
   captureWorktreeDiff,
@@ -78,6 +87,7 @@ export interface AgentEventBase {
   id: number;
   label: string;
   phase?: string;
+  workflowPath?: string[];
 }
 
 /** Live activity observed inside a running subagent. */
@@ -99,9 +109,27 @@ export interface WorkflowRunOptions {
   loadSavedWorkflow?: (nameOrRef: string | { scriptPath: string }) => { meta: WorkflowMeta; body: string };
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
-  onAgentStart?: (event: AgentEventBase & { prompt: string; cached: boolean }) => void;
-  onAgentEnd?: (event: AgentEventBase & { result: unknown; status: "done" | "error" }) => void;
+  onAgentStart?: (event: AgentEventBase & {
+    prompt: string;
+    cached: boolean;
+    modelPattern?: string;
+    requestedEffort?: ThinkingLevel;
+    agentType?: string;
+    isolation?: string;
+    structuredOutput?: boolean;
+    cachedRecord?: JournalAgentRecord;
+  }) => void;
+  onAgentEnd?: (event: AgentEventBase & {
+    result: unknown;
+    status: "done" | "error";
+    usage?: AgentUsage;
+    modelId?: string;
+    effort?: ThinkingLevel;
+    error?: string;
+    cachedRecord?: JournalAgentRecord;
+  }) => void;
   onAgentActivity?: (event: AgentActivityEvent) => void;
+  onAgentTelemetry?: (event: AgentEventBase & AgentTelemetryEvent) => void;
 }
 
 export interface WorkflowRunResult<T = unknown> {
@@ -112,6 +140,10 @@ export interface WorkflowRunResult<T = unknown> {
   agentCount: number;
   cachedCount: number;
   spentTokens: number;
+  /** Actual input+output tokens incurred by live child sessions. */
+  newTokens: number;
+  /** Original input+output usage represented by cached replayed tasks. */
+  replayedTokens: number;
   durationMs: number;
 }
 
@@ -121,7 +153,9 @@ interface RuntimeState {
   phases: string[];
   agentCount: number; // number of agent() invocations (for ids / cap)
   cachedCount: number;
-  spent: number; // real output tokens
+  spent: number; // real output tokens (budget compatibility)
+  newTokens: number;
+  replayedTokens: number;
 }
 
 export async function runWorkflow<T = unknown>(
@@ -144,12 +178,22 @@ export async function runWorkflow<T = unknown>(
     agentCount: runtime.state.agentCount,
     cachedCount: runtime.state.cachedCount,
     spentTokens: runtime.state.spent,
+    newTokens: runtime.state.newTokens,
+    replayedTokens: runtime.state.replayedTokens,
     durationMs: Date.now() - started,
   };
 }
 
 class Runtime {
-  readonly state: RuntimeState = { logs: [], phases: [], agentCount: 0, cachedCount: 0, spent: 0 };
+  readonly state: RuntimeState = {
+    logs: [],
+    phases: [],
+    agentCount: 0,
+    cachedCount: 0,
+    spent: 0,
+    newTokens: 0,
+    replayedTokens: 0,
+  };
   private readonly options: WorkflowRunOptions;
   private readonly cwd: string;
   private runnerInstance: { run: WorkflowAgentRunner["run"] } | undefined;
@@ -158,7 +202,7 @@ class Runtime {
   private readonly pending = new Set<Promise<unknown>>();
   private readonly tokenBudget: number | null;
   private readonly applyLock = new Mutex();
-  private depth = 0;
+  private readonly executionContext = new AsyncLocalStorage<{ workflowPath: string[]; depth: number; currentPhase?: string }>();
 
   constructor(options: WorkflowRunOptions) {
     this.options = options;
@@ -201,7 +245,13 @@ class Runtime {
   async runBody(body: string, args: unknown, depth: number, name: string): Promise<unknown> {
     const context = vm.createContext(this.buildSandbox(args));
     const wrapped = `(async () => {\n${body}\n})()`;
-    return new vm.Script(wrapped, { filename: `${name || "workflow"}.js` }).runInContext(context);
+    const parent = this.executionContext.getStore();
+    const parentPath = parent?.workflowPath ?? [];
+    const execution = { workflowPath: [...parentPath, name || `workflow-${depth}`], depth, currentPhase: parent?.currentPhase };
+    return this.executionContext.run(
+      execution,
+      async () => await new vm.Script(wrapped, { filename: `${name || "workflow"}.js` }).runInContext(context),
+    );
   }
 
   private buildSandbox(args: unknown): Record<string, unknown> {
@@ -244,6 +294,8 @@ class Runtime {
   private phase(title: unknown): void {
     const text = requireString(title, "phase title");
     this.state.currentPhase = text;
+    const execution = this.executionContext.getStore();
+    if (execution) execution.currentPhase = text;
     if (!this.state.phases.includes(text)) this.state.phases.push(text);
     this.options.onPhase?.(text);
   }
@@ -255,7 +307,7 @@ class Runtime {
     }
     const prompt = requireString(promptValue, "agent prompt");
     const opts = normalizeAgentOptions(optionsValue);
-    const assignedPhase = opts.phase ?? this.state.currentPhase;
+    const assignedPhase = opts.phase ?? this.executionContext.getStore()?.currentPhase ?? this.state.currentPhase;
 
     const seq = ++this.state.agentCount;
     if (seq > MAX_AGENTS_PER_RUN) {
@@ -263,6 +315,7 @@ class Runtime {
     }
     const id = seq;
     const label = opts.label?.trim() || defaultLabel(assignedPhase, id);
+    const workflowPath = [...(this.executionContext.getStore()?.workflowPath ?? [])];
     const key = agentCallKey(prompt, { ...opts, phase: assignedPhase });
 
     // Resume: cached prefix replay.
@@ -270,13 +323,62 @@ class Runtime {
     if (cached) {
       this.state.cachedCount++;
       this.state.spent += cached.outputTokens ?? 0;
-      this.options.onAgentStart?.({ id, label, phase: assignedPhase, prompt, cached: true });
-      this.options.onAgentEnd?.({ id, label, phase: assignedPhase, result: cached.value, status: "done" });
+      this.state.replayedTokens += cached.totalTokens ?? 0;
+      const cachedUsage: AgentUsage = {
+        inputTokens: cached.inputTokens,
+        outputTokens: cached.outputTokens ?? 0,
+        totalTokens: cached.totalTokens ?? 0,
+        cacheReadTokens: cached.cacheReadTokens,
+        cacheWriteTokens: cached.cacheWriteTokens,
+        cost: cached.cost ?? 0,
+        turns: cached.turns,
+        toolUses: cached.toolUses,
+        retries: cached.retries,
+        compactions: cached.compactions,
+      };
+      this.options.onAgentStart?.({
+        id,
+        label,
+        phase: assignedPhase,
+        workflowPath,
+        prompt,
+        cached: true,
+        modelPattern: opts.model,
+        requestedEffort: this.options.thinkingLevel,
+        agentType: opts.agentType,
+        isolation: opts.isolation,
+        structuredOutput: opts.schema != null,
+        cachedRecord: cached,
+      });
+      this.options.onAgentEnd?.({
+        id,
+        label,
+        phase: assignedPhase,
+        workflowPath,
+        result: cached.value,
+        status: "done",
+        usage: cachedUsage,
+        modelId: cached.modelId,
+        effort: cached.effort,
+        cachedRecord: cached,
+      });
       return cached.value;
     }
 
     const run = this.limiter(async () => {
-      this.options.onAgentStart?.({ id, label, phase: assignedPhase, prompt, cached: false });
+      this.options.onAgentStart?.({
+        id,
+        label,
+        phase: assignedPhase,
+        workflowPath,
+        prompt,
+        cached: false,
+        modelPattern: opts.model,
+        requestedEffort: this.options.thinkingLevel,
+        agentType: opts.agentType,
+        isolation: opts.isolation,
+        structuredOutput: opts.schema != null,
+      });
       let worktree: Worktree | undefined;
       let keepWorktree = false;
       try {
@@ -290,7 +392,11 @@ class Runtime {
         const runner = this.getRunner();
         const onActivity: ((e: AgentActivityInput) => void) | undefined = this.options.onAgentActivity
           ? (e: AgentActivityInput) =>
-              this.options.onAgentActivity!({ id, label, phase: assignedPhase, ...e })
+              this.options.onAgentActivity!({ id, label, phase: assignedPhase, workflowPath, ...e })
+          : undefined;
+        const onTelemetry: ((e: AgentTelemetryEvent) => void) | undefined = this.options.onAgentTelemetry
+          ? (e: AgentTelemetryEvent) =>
+              this.options.onAgentTelemetry!({ id, label, phase: assignedPhase, workflowPath, ...e })
           : undefined;
         const agentStartedAt = Date.now();
         const result: AgentRunResult = await runner.run({
@@ -303,28 +409,71 @@ class Runtime {
           agentTypeDef,
           cwd: worktree?.agentCwd,
           onActivity,
+          onTelemetry,
         });
         this.throwIfAborted();
 
         if (worktree) keepWorktree = await this.integrateWorktree(worktree, id, label);
 
-        this.state.spent += result.usage.outputTokens;
+        const inputTokens = result.usage.inputTokens
+          ?? Math.max(0, result.usage.totalTokens - result.usage.outputTokens);
+        const usage: AgentUsage = {
+          ...result.usage,
+          inputTokens,
+          totalTokens: inputTokens + result.usage.outputTokens,
+        };
+        this.state.spent += usage.outputTokens;
+        this.state.newTokens += usage.totalTokens;
         this.options.journal?.recordAgent({
           seq,
           key,
           label,
           value: result.value,
-          outputTokens: result.usage.outputTokens,
+          inputTokens: usage.inputTokens,
+          outputTokens: usage.outputTokens,
+          totalTokens: usage.totalTokens,
+          cacheReadTokens: usage.cacheReadTokens,
+          cacheWriteTokens: usage.cacheWriteTokens,
+          cost: usage.cost,
+          turns: usage.turns,
+          toolUses: usage.toolUses,
+          retries: usage.retries,
+          compactions: usage.compactions,
+          requestedModelId: opts.model,
+          requestedEffort: this.options.thinkingLevel,
+          modelId: result.modelId,
+          effort: result.effort,
+          agentType: opts.agentType,
+          isolation: opts.isolation,
+          structuredOutput: opts.schema != null,
           startedAt: agentStartedAt,
           durationMs: Date.now() - agentStartedAt,
         });
-        this.options.onAgentEnd?.({ id, label, phase: assignedPhase, result: result.value, status: "done" });
+        this.options.onAgentEnd?.({
+          id,
+          label,
+          phase: assignedPhase,
+          workflowPath,
+          result: result.value,
+          status: "done",
+          usage,
+          modelId: result.modelId,
+          effort: result.effort,
+        });
         return result.value;
       } catch (error) {
         if (this.options.signal?.aborted) throw error;
         const message = error instanceof Error ? error.message : String(error);
         this.logLine(`agent ${label} failed: ${message}`);
-        this.options.onAgentEnd?.({ id, label, phase: assignedPhase, result: null, status: "error" });
+        this.options.onAgentEnd?.({
+          id,
+          label,
+          phase: assignedPhase,
+          workflowPath,
+          result: null,
+          status: "error",
+          error: message,
+        });
         return null;
       } finally {
         if (worktree && !keepWorktree) {
@@ -395,20 +544,15 @@ class Runtime {
 
   private async workflow(nameOrRef: unknown, args: unknown): Promise<unknown> {
     this.throwIfAborted();
-    if (this.depth >= 1) {
+    const depth = this.executionContext.getStore()?.depth ?? 0;
+    if (depth >= 1) {
       throw new Error("workflow() nesting is one level deep only; cannot call workflow() inside a child workflow");
     }
     const ref = normalizeWorkflowRef(nameOrRef);
     const loader = this.options.loadSavedWorkflow ?? ((r) => loadSavedWorkflowFromDisk(r, this.cwd));
     const { meta, body } = loader(ref);
-    this.depth++;
-    try {
-      this.logLine(`▸ nested workflow: ${meta.name}`);
-      const value = await this.runBody(body, args, this.depth, meta.name);
-      return value;
-    } finally {
-      this.depth--;
-    }
+    this.logLine(`▸ nested workflow: ${meta.name}`);
+    return this.runBody(body, args, depth + 1, meta.name);
   }
 
   private tryCreateWorktree(index: number): Worktree | undefined {

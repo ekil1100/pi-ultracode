@@ -6,7 +6,7 @@
 import { safeDisplayText } from "./display-text.ts";
 import type { WorkflowMeta } from "./parser.ts";
 
-export type WorkflowAgentStatus = "running" | "done" | "error" | "skipped" | "cached";
+export type WorkflowAgentStatus = "running" | "done" | "error" | "cancelled" | "skipped" | "cached";
 
 export interface WorkflowActiveToolSnapshot {
   id: string;
@@ -16,13 +16,41 @@ export interface WorkflowActiveToolSnapshot {
   lastUpdateAt: number;
 }
 
+export interface WorkflowAgentUsageSnapshot {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  cost: number;
+  turns: number;
+  toolUses: number;
+  retries: number;
+  compactions: number;
+}
+
 export interface WorkflowAgentSnapshot {
   id: number;
   label: string;
   phase?: string;
+  workflowPath?: string[];
   status: WorkflowAgentStatus;
   resultPreview?: string;
   error?: string;
+  /** Actual model selected by the child session. */
+  modelId?: string;
+  /** Actual effort applied by the child session. */
+  effort?: string;
+  /** Requested values are retained for diagnostics but never rendered as actual. */
+  requestedModelId?: string;
+  requestedEffort?: string;
+  agentType?: string;
+  isolation?: string;
+  structuredOutput?: boolean;
+  usage?: WorkflowAgentUsageSnapshot;
+  currentTurn?: number;
+  legacyCache?: boolean;
+  transcriptPath?: string;
   /** Wall-clock ms when the agent started (host layer; set by the tool). */
   startedAt?: number;
   /** Wall-clock ms when the agent finished. */
@@ -51,8 +79,13 @@ export interface WorkflowSnapshot {
   runningCount: number;
   doneCount: number;
   errorCount: number;
+  cancelledCount: number;
   cachedCount: number;
   spentTokens: number;
+  newTokens: number;
+  replayedTokens: number;
+  /** Sanitized session-scoped workflow detail manifest for headless consumers. */
+  detailsManifestPath?: string;
   budgetTotal: number | null;
   durationMs?: number;
   result?: unknown;
@@ -81,8 +114,11 @@ export function createSnapshot(meta: WorkflowMeta, runId: string, budgetTotal: n
     runningCount: 0,
     doneCount: 0,
     errorCount: 0,
+    cancelledCount: 0,
     cachedCount: 0,
     spentTokens: 0,
+    newTokens: 0,
+    replayedTokens: 0,
     budgetTotal,
     status: "running",
   };
@@ -92,8 +128,9 @@ export function recompute(snapshot: WorkflowSnapshot): WorkflowSnapshot {
   const runningCount = snapshot.agents.filter((a) => a.status === "running").length;
   const doneCount = snapshot.agents.filter((a) => a.status === "done" || a.status === "cached").length;
   const errorCount = snapshot.agents.filter((a) => a.status === "error").length;
+  const cancelledCount = snapshot.agents.filter((a) => a.status === "cancelled" || a.status === "skipped").length;
   const cachedCount = snapshot.agents.filter((a) => a.status === "cached").length;
-  return { ...snapshot, agentCount: snapshot.agents.length, runningCount, doneCount, errorCount, cachedCount };
+  return { ...snapshot, agentCount: snapshot.agents.length, runningCount, doneCount, errorCount, cancelledCount, cachedCount };
 }
 
 export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderOptions = {}): string[] {
@@ -102,17 +139,23 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
   const showResultPreviews = options.showResultPreviews ?? false;
   const now = options.now ?? Date.now();
 
-  const tokens = snapshot.spentTokens
-    ? ` · ${formatTokens(snapshot.spentTokens)}${snapshot.budgetTotal ? `/${formatTokens(snapshot.budgetTotal)}` : ""} tok`
+  const representedTokens = snapshot.newTokens + snapshot.replayedTokens;
+  const tokens = representedTokens
+    ? ` · ${formatTokens(representedTokens)} token${snapshot.replayedTokens ? ` (${formatTokens(snapshot.newTokens)} new, ${formatTokens(snapshot.replayedTokens)} replayed)` : ""}`
+    : snapshot.spentTokens
+      ? ` · ${formatTokens(snapshot.spentTokens)} output token`
+      : "";
+  const budget = snapshot.budgetTotal
+    ? ` · ${formatTokens(snapshot.spentTokens)}/${formatTokens(snapshot.budgetTotal)} out`
     : "";
-  const state =
-    snapshot.errorCount > 0
-      ? `, ${snapshot.errorCount} errors`
-      : snapshot.runningCount > 0
-        ? `, ${snapshot.runningCount} running`
-        : "";
+  const stateParts = [
+    snapshot.runningCount > 0 ? `${snapshot.runningCount} running` : undefined,
+    snapshot.errorCount > 0 ? `${snapshot.errorCount} errors` : undefined,
+    snapshot.cancelledCount > 0 ? `${snapshot.cancelledCount} cancelled` : undefined,
+  ].filter(Boolean);
+  const state = stateParts.length ? `, ${stateParts.join(", ")}` : "";
   const cached = snapshot.cachedCount ? ` · ${snapshot.cachedCount} cached` : "";
-  const header = `◆ ${statusMark(snapshot.status)} ${shorten(snapshot.name, 60)} (${snapshot.doneCount}/${snapshot.agentCount} done${state})${cached}${tokens}`;
+  const header = `◆ ${statusMark(snapshot.status)} ${shorten(snapshot.name, 60)} (${snapshot.doneCount}/${snapshot.agentCount} done${state})${cached}${tokens}${budget}`;
   const lines = [header];
 
   const phaseNames = unique([
@@ -129,13 +172,22 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
     const done = agents.filter((a) => a.status === "done" || a.status === "cached").length;
     const running = agents.filter((a) => a.status === "running").length;
     const errors = agents.filter((a) => a.status === "error").length;
-    const complete = agents.length > 0 && done + errors === agents.length;
-    const marker = running > 0 || (!complete && snapshot.currentPhase === phase) ? "▶" : complete ? "✓" : " ";
+    const cancelled = agents.filter((a) => a.status === "cancelled" || a.status === "skipped").length;
+    const complete = agents.length > 0 && running === 0;
+    const marker = running > 0 || (!complete && snapshot.currentPhase === phase)
+      ? "▶"
+      : errors
+        ? "✗"
+        : cancelled
+          ? "■"
+          : complete
+            ? "✓"
+            : " ";
     lines.push(
-      `  ${marker} ${shorten(phase, 60)} ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}`,
+      `  ${marker} ${shorten(phase, 60)} ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}${cancelled ? ` · ${cancelled} cancelled` : ""}`,
     );
     for (const agent of agents.slice(-maxAgents)) {
-      lines.push(renderAgentLine(agent, { showResultPreviews, now }));
+      lines.push(...renderAgentLines(agent, { showResultPreviews, now }));
     }
     if (agents.length > maxAgents) lines.push(`    … ${agents.length - maxAgents} earlier agents`);
   }
@@ -144,8 +196,9 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
   if (unphased.length) {
     lines.push("  (unphased)");
     for (const agent of unphased.slice(-maxAgents)) {
-      lines.push(renderAgentLine(agent, { showResultPreviews, now }));
+      lines.push(...renderAgentLines(agent, { showResultPreviews, now }));
     }
+    if (unphased.length > maxAgents) lines.push(`    … ${unphased.length - maxAgents} earlier agents`);
   }
 
   for (const log of snapshot.logs.slice(-maxLogs)) lines.push(`  log: ${shorten(log, 100)}`);
@@ -184,6 +237,8 @@ function statusIcon(status: WorkflowAgentStatus): string {
       return "⟲";
     case "error":
       return "✗";
+    case "cancelled":
+      return "■";
     case "skipped":
       return "-";
   }
@@ -199,7 +254,7 @@ function shorten(value: string, max: number): string {
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1)}k`;
   return String(n);
 }
 
@@ -235,18 +290,47 @@ function boundedProjection(value: unknown, _max: number): string {
 /** Seconds without an observable session event before visibility escalates. */
 export const IDLE_THRESHOLD_S = 30;
 
-function renderAgentLine(
+function renderAgentLines(
   agent: WorkflowAgentSnapshot,
   opts: {
     showResultPreviews: boolean;
     now: number;
   },
-): string {
+): string[] {
   const meta = agentMeta(agent, opts.now);
   const result = opts.showResultPreviews && agent.resultPreview
     ? ` — ${safeDisplayText(agent.resultPreview, 80)}`
     : "";
-  return `    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${meta}${result}`;
+  return [
+    `    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${meta}${result}`,
+    `      ${agentStats(agent)}`,
+  ];
+}
+
+function agentStats(agent: WorkflowAgentSnapshot): string {
+  const running = agent.status === "running";
+  const model = agent.modelId
+    ?? (running ? "resolving model…" : agent.legacyCache ? "model unavailable" : "model unresolved");
+  const effort = agent.effort
+    ?? (running ? "resolving effort…" : agent.legacyCache ? "effort unavailable" : "effort unresolved");
+  if (agent.legacyCache) {
+    return `${shorten(model, 48)} • ${shorten(effort, 24)} · metrics unavailable · cached legacy entry`;
+  }
+  const usage = agent.usage ?? {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 0,
+    cost: 0,
+    turns: 0,
+    toolUses: 0,
+    retries: 0,
+    compactions: 0,
+  };
+  const partial = agent.status === "cancelled" || agent.status === "error" || (running && agent.currentTurn != null);
+  const cache = agent.status === "cached" ? " · cached" : "";
+  return `${shorten(model, 48)} • ${shorten(effort, 24)} · ${usage.turns} turn${usage.turns === 1 ? "" : "s"} · ${usage.toolUses} tool use${usage.toolUses === 1 ? "" : "s"} · ${formatTokens(usage.totalTokens)}${partial ? "+" : ""} token${partial ? " · partial" : ""}${cache}`;
 }
 
 /** Compact per-agent timing/activity suffix for the live snapshot. */

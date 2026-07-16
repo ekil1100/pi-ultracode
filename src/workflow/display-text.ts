@@ -54,9 +54,10 @@ const SAFE_EXECUTABLES = new Set([
  * ordinary newlines/tabs. Work is capped before scanning. Unterminated OSC/DCS
  * strings consume the bounded remainder, avoiding injection and backtracking.
  */
-export function stripTerminalControls(value: string): string {
-  const truncated = value.length > DISPLAY_INPUT_LIMIT;
-  const source = truncated ? value.slice(0, DISPLAY_INPUT_LIMIT) : value;
+export function stripTerminalControls(value: string, inputLimit = DISPLAY_INPUT_LIMIT): string {
+  const limit = Math.max(0, Math.floor(inputLimit));
+  const truncated = value.length > limit;
+  const source = truncated ? value.slice(0, limit) : value;
   const output: string[] = [];
   let index = 0;
   while (index < source.length) {
@@ -170,6 +171,16 @@ export function safeDisplayTail(value: string, max: number): string {
 }
 
 /**
+ * Preserve newlines and indentation while applying the same terminal-control
+ * stripping and credential redaction used by compact status text. The caller
+ * owns the explicit input bound; transcript buffers use this only after their
+ * own per-task/run limits have been enforced.
+ */
+export function safeTranscriptText(value: string, maxInput = 1024 * 1024): string {
+  return redactPrepared(stripTerminalControls(value, maxInput));
+}
+
+/**
  * Whether a bounded stream fragment ends inside a credential-shaped construct
  * whose safe rendering depends on a later delimiter.
  */
@@ -191,8 +202,8 @@ function redactPrepared(value: string): string {
       "$1***",
     )
     .replace(/(\s-u)(?:\s+)?(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s]+)/gi, "$1***")
-    .replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@\s]+@/g, "$1***@")
-    .replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@\s]+:[^/@\s]*(?=$|[/?#\s])/g, "$1***")
+    .replace(/(^|[^A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@\s]+@/g, "$1$2***@")
+    .replace(/(^|[^A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@\s]+:[^/@\s]*(?=$|[/?#\s])/g, "$1$2***")
     .replace(/([?&](?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|id[_-]?token|password|secret|client_secret)=)[^&\s'" ]+/gi, "$1***")
     .replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{6,}\b/g, "***");
 }
@@ -233,7 +244,7 @@ const SENSITIVE_HEADER = new RegExp(
   `(^|[^A-Za-z0-9_-]|(?:^|\\s)-H\\s*["']?)((?:["']?${SENSITIVE_HEADER_NAME}["']?)\\s*:\\s*)`,
   "gi",
 );
-const PENDING_URI_USERINFO = /[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]*$/;
+const PENDING_URI_USERINFO = /(?:^|[^A-Za-z0-9+.-])[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/\s@]*$/;
 
 function hasPendingTerminalSequence(value: string): boolean {
   let index = 0;

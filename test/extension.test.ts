@@ -21,6 +21,7 @@ function makeMockPi(flagValues: Record<string, unknown> = {}) {
     tools: [] as any[],
     commands: new Map<string, any>(),
     flags: new Map<string, any>(),
+    shortcuts: new Map<string, any>(),
     events: new Map<string, any[]>(),
     activeTools: [] as string[],
     thinking: "medium",
@@ -31,6 +32,7 @@ function makeMockPi(flagValues: Record<string, unknown> = {}) {
     registerTool: (t: any) => state.tools.push(t),
     registerCommand: (name: string, opts: any) => state.commands.set(name, opts),
     registerFlag: (name: string, opts: any) => state.flags.set(name, opts),
+    registerShortcut: (key: string, opts: any) => state.shortcuts.set(key, opts),
     getFlag: (name: string) => flagValues[name],
     on: (ev: string, h: any) => {
       const list = state.events.get(ev) ?? [];
@@ -55,7 +57,9 @@ function makeMockPi(flagValues: Record<string, unknown> = {}) {
 function makeCtx(state: any) {
   const notifications: Array<{ m: string; l: string }> = [];
   const widgets: Record<string, unknown> = {};
+  const customCalls: unknown[] = [];
   const ctx: any = {
+    mode: "tui",
     ui: {
       notify: (m: string, l: string) => notifications.push({ m, l }),
       setStatus: (k: string, v: unknown) => {
@@ -64,6 +68,10 @@ function makeCtx(state: any) {
       setWidget: (k: string, v: unknown) => {
         widgets[k] = v;
       },
+      custom: async (_factory: unknown, options: unknown) => {
+        customCalls.push(options);
+        return undefined;
+      },
     },
     hasUI: true,
     cwd: process.cwd(),
@@ -71,9 +79,10 @@ function makeCtx(state: any) {
     sessionManager: {
       getEntries: () => state.entries,
       getBranch: () => state.entries,
+      getSessionDir: () => undefined,
     },
   };
-  return { ctx, notifications, widgets };
+  return { ctx, notifications, widgets, customCalls };
 }
 
 test("extension registers the workflow tool, commands, and flag", () => {
@@ -84,6 +93,7 @@ test("extension registers the workflow tool, commands, and flag", () => {
   assert.ok(state.commands.has("ultracode"));
   assert.ok(state.commands.has("workflows"));
   assert.ok(state.flags.has("ultracode"));
+  assert.ok(state.shortcuts.has("f6"));
   assert.ok(state.events.has("session_start"));
   assert.ok(state.events.has("session_tree"));
   assert.ok(state.events.has("model_select"));
@@ -466,28 +476,30 @@ test("model and manual effort changes reassert max and refresh status", async ()
   assert.ok(turn?.systemPrompt.includes("<ultracode>"));
 });
 
-test("/workflows toggles the run panel and /workflows clear hides it", async () => {
+test("/workflows and F6 open the interactive overlay; abort remains available", async () => {
   const { pi, state } = makeMockPi();
   extension(pi);
-  const { ctx, widgets } = makeCtx(state);
+  const { ctx, widgets, customCalls } = makeCtx(state);
 
-  const snap = createSnapshot({ name: "demo", description: "x" }, "wf_paneltest", null);
+  const registry = getRegistry();
+  registry.setScope(path.join(ctx.cwd, ".pi", "ultracode-runs"));
+  const snap = createSnapshot({ name: "demo", description: "x" }, "wf_overlaytest", null);
   snap.status = "completed";
-  getRegistry().register("wf_paneltest", snap, () => {});
+  registry.register("wf_overlaytest", snap, () => {});
 
   const handler = state.commands.get("workflows").handler;
-  const KEY = "ultracode-workflows";
+  await handler("wf_overlaytest", ctx);
+  assert.equal(customCalls.length, 1, "explicit run opens the overlay");
+  assert.deepEqual(widgets, {}, "the legacy static widget is not used");
 
-  await handler("", ctx);
-  assert.ok(Array.isArray(widgets[KEY]), "bare /workflows shows the panel");
+  await state.shortcuts.get("f6").handler(ctx);
+  assert.equal(customCalls.length, 2, "F6 opens the same overlay");
 
-  await handler("", ctx);
-  assert.equal(widgets[KEY], undefined, "bare /workflows again hides the panel");
-
-  await handler("", ctx); // show again
-  assert.ok(Array.isArray(widgets[KEY]));
-  await handler("clear", ctx);
-  assert.equal(widgets[KEY], undefined, "/workflows clear hides the panel");
+  let aborted = false;
+  const active = createSnapshot({ name: "active", description: "x" }, "wf_aborttest", null);
+  registry.register("wf_aborttest", active, () => { aborted = true; });
+  await handler("abort", ctx);
+  assert.equal(aborted, true);
 });
 
 test("workflow tool executes a script end-to-end with an injected runner", async () => {

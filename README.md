@@ -18,7 +18,7 @@ Ultracode 保留 Pi 自身的核心循环、内存模型、工具系统、扩展
 | Agent Type | 通过 `.pi/ultracode/agents/*.md` 定义角色提示词、工具白名单、模型和思考强度。 |
 | 模型覆盖 | 每次 `agent()` 调用都可指定模型模式，例如 `anthropic/claude-sonnet-4`。 |
 | Worktree 隔离 | 让写入型并行代理在临时 git worktree 中运行，并把改动安全合并回共享工作树。 |
-| 进度面板 | 实时状态、活动计数、token 与成本统计、阶段信息，以及可选的 TUI 面板。 |
+| 进度与详情 | 实时状态、实际模型/effort、turn/工具/token 统计，以及可流式展开的 TUI 任务详情浮层。 |
 | Ultracode 模式 | `/ultracode on` 启用主动编排提示词，并请求当前模型支持的最高思考强度。 |
 | 配额执行 | 可选 token 预算、代理数量限制、并发限制、脚本超时与嵌套深度限制。 |
 
@@ -82,17 +82,19 @@ pi --ultracode
 工作流运行时会内联显示实时进度，例如：
 
 ```text
-◆ ▶ audit_repo (4/7 done, 2 running) · 3 cached · 41.2k/500k tok
+◆ ▶ audit_repo (4/7 done, 2 running) · 3 cached · 203k token (141k new, 62k replayed) · 41.2k/500k out
   ✓ Survey 1/1
     #1 ✓ repo inventory
+       gpt-5.6-sol • max · 15 turns · 42 tool uses · 141k token
   ▶ Review 3/4 · 1 running
     #2 ✓ auth module
     #3 ✓ db layer
     #4 ● payments module
+       claude-sonnet-4 • high · 6 turns · 18 tool uses · 52.3k+ token · partial
   ▶ Verify 0/2 · 2 running
 ```
 
-按 `Esc` 可取消；运行中的子代理会被终止并显示为 skipped。
+紧凑 token 数始终是 input + output；cache read/write 与成本只出现在任务详情中。主对话会折叠较早任务并明确显示省略数量，按 `Ctrl+O` 可展开全部，或用 `F6` 打开详情。按 `Esc` 可取消；运行中的子代理会被终止并显示为 cancelled，同时保留已有输出和部分用量。
 
 ## 命令
 
@@ -104,13 +106,21 @@ pi --ultracode
 /ultracode status      # show status and the configured budget
 /ultracode budget 500k # set a token budget
 /ultracode budget off  # remove the budget
-/workflows             # toggle the workflow run panel
-/workflows <runId>     # show one run's detail
-/workflows clear       # hide the panel
-/workflows abort       # abort active runs and hide the panel
+/workflows             # open the interactive workflow detail overlay
+/workflows <runId>     # open one run directly (prefix accepted)
+/workflows abort       # abort active runs
+F6                     # open the workflow detail overlay
 ```
 
-`/workflows` 面板是执行命令时生成的静态快照；再次运行该命令可刷新，`/workflows clear` 只隐藏面板，不删除 registry 记录。工作流执行期间的实时进度显示在工具结果中。为缩小隐私边界，进度只包含结构化生命周期状态和安全摘要，不捕获、持久化或展示子代理的原始流式响应正文。
+`/workflows` 与 `F6` 打开实时浮层。只有一个活动运行时会直接进入；多个活动运行会先显示选择器；没有活动运行时会打开最近完成的运行。宽终端使用任务/详情双栏，窄终端在列表与详情间切换。键盘操作：
+
+- `↑` / `↓` 选择运行或任务；`Enter` 打开；`Tab` 切换双栏焦点；`Esc` 返回或关闭；
+- `PageUp` / `PageDown` 滚动；`End` 恢复尾随；
+- `/` 搜索任务，`r` 只看运行中的任务，`a` 恢复全部，`p` 展开或收起任务 prompt。
+
+每次 `agent()` 调用都是一个可独立展开的任务。详情按时间交错显示 turn、assistant 正文、工具调用、重试、上下文压缩、错误与 thinking 持续时间；thinking 正文不会被捕获。正文 delta 只保存在有界内存中并以不超过每 100ms 一次的频率刷新，消息完成后改用 Markdown 渲染。
+
+所有可视化和落盘内容都会移除终端控制序列并脱敏凭据。内存上限为每任务 1MiB / 5000 行、每工作流 32MiB；最终 transcript 上限为每任务 10MB（约 1MB 头部 + 9MB 尾部）、每工作流 128MB。最终清理后的 timeline 与 manifest 保存在 session 的 `ultracode-runs/` 目录，因而 `/reload` 后仍可浏览；不会复制系统 prompt、注入 skill、AGENTS 内容或父会话上下文。
 
 状态行会显示实际生效的思考强度，例如：
 
@@ -410,7 +420,7 @@ while (budget.total && budget.remaining() > 50_000) {
 
 Ultracode 模式状态通过自定义 session entry 持久化。恢复、reload、fork 和 `/tree` 导航都会按当前 branch 重新读取状态；被丢弃分支中的 entry 不会错误启用模式。旧版 Pi 或旧模型会把 `max` 兼容回退为 `xhigh`，而不会把未知值静默变成 `off`。
 
-扩展清理只管理自己的 widget、status 与运行状态，不会调用 Pi 的全局 `ui.clear()`，因此不会清除其他扩展的 UI。
+扩展清理只管理自己的详情浮层、status 与运行状态，不会调用 Pi 的全局 `ui.clear()`，因此不会清除其他扩展的 UI。
 
 ## 开发
 

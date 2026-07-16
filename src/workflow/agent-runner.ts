@@ -27,6 +27,7 @@ import {
   redactCommand,
   safeCommandPreview,
   safeDisplayText,
+  safeTranscriptText,
   truncateDisplay,
 } from "./display-text.ts";
 import { jsonSchemaToTypeBox } from "./json-schema.ts";
@@ -55,18 +56,67 @@ export interface ModelRegistryLike {
   getAll?(): ModelLike[];
 }
 
-export interface AgentUsage {
+export interface AgentTurnUsage {
+  inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   totalTokens: number;
   cost: number;
+}
+
+export interface AgentUsage {
+  /** Optional on injected legacy runners; production runners always provide it. */
+  inputTokens?: number;
+  outputTokens: number;
+  /** Compact token use: input + output, excluding cache traffic. */
+  totalTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  cost: number;
+  /** Completed assistant messages. */
+  turns?: number;
+  /** Tool executions that reached tool_execution_start. */
+  toolUses?: number;
+  retries?: number;
+  compactions?: number;
 }
 
 export interface AgentRunResult {
   value: unknown;
   usage: AgentUsage;
+  /** Model id and effort actually applied by the child session. */
+  modelId?: string;
+  effort?: ThinkingLevel;
   /** cwd the agent actually ran in (differs from the shared cwd under worktree isolation). */
   cwd: string;
 }
+
+/** Detailed child-session events consumed by the private transcript store. */
+export type AgentTelemetryEvent =
+  | { kind: "model_requested"; modelId?: string; effort?: ThinkingLevel }
+  | { kind: "model_resolved"; modelId?: string; effort: ThinkingLevel }
+  | { kind: "turn_start"; turnIndex?: number }
+  | { kind: "text_delta"; delta: string }
+  | { kind: "message_end"; text: string; usage?: AgentTurnUsage; error?: string }
+  | { kind: "thinking_start" | "thinking_end" }
+  | { kind: "tool_start"; toolCallId: string; toolName: string; toolArgs?: string }
+  | {
+      kind: "tool_end";
+      toolCallId: string;
+      toolName: string;
+      isError: boolean;
+      resultPreview?: string;
+    }
+  | { kind: "retry"; state: "start" | "end"; detail: string }
+  | { kind: "compaction"; state: "start" | "end"; detail: string }
+  | {
+      kind: "run_error";
+      error: string;
+      usage: AgentUsage;
+      modelId?: string;
+      effort?: ThinkingLevel;
+    };
 
 export interface AgentSessionLike {
   thinkingLevel: ThinkingLevel;
@@ -130,8 +180,10 @@ export interface AgentRunCall {
   agentTypeDef?: AgentTypeDef;
   /** Override cwd (worktree). */
   cwd?: string;
-  /** Live activity stream from the subagent (text deltas / tool calls). */
+  /** Safe compact activity stream used by the inline workflow status. */
   onActivity?: (event: AgentActivityInput) => void;
+  /** Private detailed stream used by the task transcript store. */
+  onTelemetry?: (event: AgentTelemetryEvent) => void;
 }
 
 export class WorkflowAgentRunner {
@@ -187,30 +239,54 @@ export class WorkflowAgentRunner {
     });
 
     const sessionThinking = resolveSessionThinkingLevel(thinkingLevel, model);
-    let created = await createSession(sessionThinking);
-    if (call.signal?.aborted) {
-      disposeQuietly(created.session);
-      throw abortedError();
-    }
-    const selectedModel = created.session.model;
-    const selectedModelAdvertisesMax = (model ?? selectedModel)?.thinkingLevelMap?.max != null;
-    if (
-      thinkingLevel === ULTRACODE_THINKING_LEVEL &&
-      sessionThinking === ULTRACODE_THINKING_LEVEL &&
-      created.session.thinkingLevel !== ULTRACODE_THINKING_LEVEL &&
-      created.session.supportsThinking() &&
-      (!this.runtimeSupportsMaxThinking || selectedModelAdvertisesMax)
-    ) {
-      // A legacy runtime may clamp an unknown `max` to medium/high instead of
-      // off. Recreate with xhigh; never mutate the user's global default effort.
-      disposeQuietly(created.session);
-      created = await createSession(LEGACY_ULTRACODE_THINKING_LEVEL);
+    safeEmitTelemetry(call.onTelemetry, {
+      kind: "model_requested",
+      modelId: model?.id,
+      effort: thinkingLevel,
+    });
+
+    let created: { session: AgentSessionLike };
+    try {
+      created = await createSession(sessionThinking);
       if (call.signal?.aborted) {
         disposeQuietly(created.session);
         throw abortedError();
       }
+      const selectedModel = created.session.model;
+      const selectedModelAdvertisesMax = (model ?? selectedModel)?.thinkingLevelMap?.max != null;
+      if (
+        thinkingLevel === ULTRACODE_THINKING_LEVEL &&
+        sessionThinking === ULTRACODE_THINKING_LEVEL &&
+        created.session.thinkingLevel !== ULTRACODE_THINKING_LEVEL &&
+        created.session.supportsThinking() &&
+        (!this.runtimeSupportsMaxThinking || selectedModelAdvertisesMax)
+      ) {
+        // A legacy runtime may clamp an unknown `max` to medium/high instead of
+        // off. Recreate with xhigh; never mutate the user's global default effort.
+        disposeQuietly(created.session);
+        created = await createSession(LEGACY_ULTRACODE_THINKING_LEVEL);
+        if (call.signal?.aborted) {
+          disposeQuietly(created.session);
+          throw abortedError();
+        }
+      }
+    } catch (error) {
+      safeEmitTelemetry(call.onTelemetry, {
+        kind: "run_error",
+        error: safeDisplayText(errorText(error), 512),
+        usage: emptyAgentUsage(),
+      });
+      throw error;
     }
     const { session } = created;
+    const actualModelId = session.model?.id ?? model?.id;
+    const actualEffort = session.thinkingLevel;
+    const telemetryCounters = { retries: 0, compactions: 0, turns: 0, toolUses: 0, observing: false };
+    safeEmitTelemetry(call.onTelemetry, {
+      kind: "model_resolved",
+      modelId: actualModelId,
+      effort: actualEffort,
+    });
 
     let removeAbort: (() => void) | undefined;
     let unsubscribe: (() => void) | undefined;
@@ -234,11 +310,21 @@ export class WorkflowAgentRunner {
         }
       }
 
-      // Forward live activity (text deltas / tool calls) so the workflow
-      // snapshot can show per-agent progress and detect stuck subagents.
-      if (call.onActivity) {
-        const onActivity = call.onActivity;
-        unsubscribe = session.subscribe((event: unknown) => forwardActivity(event, onActivity));
+      // One subscription feeds both compact status and the private transcript
+      // stream. Telemetry callbacks are isolated so observability can never
+      // change the child run's outcome.
+      if (call.onActivity || call.onTelemetry) {
+        telemetryCounters.observing = true;
+        unsubscribe = session.subscribe((event: unknown) => {
+          const sessionEvent = event as { type?: unknown; message?: { role?: unknown } };
+          const eventType = sessionEvent?.type;
+          if (eventType === "message_end" && sessionEvent.message?.role === "assistant") telemetryCounters.turns++;
+          if (eventType === "tool_execution_start") telemetryCounters.toolUses++;
+          if (eventType === "auto_retry_start") telemetryCounters.retries++;
+          if (eventType === "compaction_start") telemetryCounters.compactions++;
+          if (call.onActivity) forwardActivity(event, call.onActivity);
+          if (call.onTelemetry) forwardTelemetry(event, call.onTelemetry);
+        });
       }
 
       await session.prompt(this.buildPrompt(call, Boolean(call.schema)), {
@@ -262,9 +348,22 @@ export class WorkflowAgentRunner {
         value = lastAssistantText(session.messages as unknown[]);
       }
 
-      return { value, usage: readUsage(session), cwd };
+      return {
+        value,
+        usage: readUsage(session, telemetryCounters),
+        modelId: actualModelId,
+        effort: actualEffort,
+        cwd,
+      };
     } catch (error) {
       hasPrimaryError = true;
+      safeEmitTelemetry(call.onTelemetry, {
+        kind: "run_error",
+        error: safeDisplayText(errorText(error), 512),
+        usage: readUsage(session, telemetryCounters),
+        modelId: actualModelId,
+        effort: actualEffort,
+      });
       throw error;
     } finally {
       let hasCleanupError = false;
@@ -429,31 +528,237 @@ function disposeQuietly(session: { dispose(): void }): void {
   }
 }
 
-function readUsage(session: any): AgentUsage {
+function emptyAgentUsage(): AgentUsage {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    totalTokens: 0,
+    cost: 0,
+    turns: 0,
+    toolUses: 0,
+    retries: 0,
+    compactions: 0,
+  };
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function safeEmitTelemetry(
+  listener: ((event: AgentTelemetryEvent) => void) | undefined,
+  event: AgentTelemetryEvent,
+): void {
+  if (!listener) return;
+  try {
+    listener(event);
+  } catch {
+    // Detailed observability is best-effort and must never affect execution.
+  }
+}
+
+function normalizeTurnUsage(value: unknown): AgentTurnUsage | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const usage = value as any;
+  const inputTokens = finiteNumber(usage.input) ?? finiteNumber(usage.inputTokens) ?? 0;
+  const outputTokens = finiteNumber(usage.output) ?? finiteNumber(usage.outputTokens) ?? 0;
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens: finiteNumber(usage.cacheRead) ?? 0,
+    cacheWriteTokens: finiteNumber(usage.cacheWrite) ?? 0,
+    // Compact task stats intentionally exclude cache traffic from token use.
+    totalTokens: inputTokens + outputTokens,
+    cost: finiteNumber(usage.cost?.total) ?? finiteNumber(usage.cost) ?? 0,
+  };
+}
+
+function assistantText(message: any): string {
+  if (!Array.isArray(message?.content)) return "";
+  return message.content
+    .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+    .map((part: any) => part.text)
+    .join("");
+}
+
+function resultText(result: any): string {
+  if (!Array.isArray(result?.content)) return "";
+  return result.content
+    .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+    .map((part: any) => part.text)
+    .join("\n");
+}
+
+function tailByUtf8Bytes(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (Buffer.byteLength(value.slice(mid), "utf8") <= maxBytes) high = mid;
+    else low = mid + 1;
+  }
+  return value.slice(low);
+}
+
+function toolResultPreview(result: unknown): string | undefined {
+  const raw = resultText(result);
+  if (!raw.trim()) return undefined;
+  const safe = safeTranscriptText(raw, 64 * 1024);
+  const lines = safe.split(/\r?\n/).filter((line) => line.trim()).slice(-20).join("\n");
+  const bounded = tailByUtf8Bytes(lines, 8 * 1024);
+  return bounded.trim() || undefined;
+}
+
+/** Convert child session events into the private task-detail stream. */
+export function forwardTelemetry(
+  event: unknown,
+  onTelemetry: (event: AgentTelemetryEvent) => void,
+): void {
+  try {
+    const e = event as any;
+    switch (e?.type) {
+      case "turn_start":
+        safeEmitTelemetry(onTelemetry, {
+          kind: "turn_start",
+          turnIndex: finiteNumber(e.turnIndex),
+        });
+        return;
+      case "message_update": {
+        const update = e.assistantMessageEvent;
+        if (update?.type === "text_delta" && typeof update.delta === "string") {
+          safeEmitTelemetry(onTelemetry, { kind: "text_delta", delta: update.delta });
+        } else if (update?.type === "thinking_start") {
+          safeEmitTelemetry(onTelemetry, { kind: "thinking_start" });
+        } else if (update?.type === "thinking_end") {
+          safeEmitTelemetry(onTelemetry, { kind: "thinking_end" });
+        }
+        return;
+      }
+      case "message_end":
+        if (e.message?.role === "assistant") {
+          safeEmitTelemetry(onTelemetry, {
+            kind: "message_end",
+            text: assistantText(e.message),
+            usage: normalizeTurnUsage(e.message.usage),
+            error: typeof e.message.errorMessage === "string" ? e.message.errorMessage : undefined,
+          });
+        }
+        return;
+      case "tool_execution_start":
+        if (typeof e.toolName === "string") {
+          const args = toolArgsPreview(e.toolName, e.args);
+          safeEmitTelemetry(onTelemetry, {
+            kind: "tool_start",
+            toolCallId: typeof e.toolCallId === "string" ? e.toolCallId : `${e.toolName}:unknown`,
+            toolName: e.toolName,
+            ...(args ? { toolArgs: args } : {}),
+          });
+        }
+        return;
+      case "tool_execution_end":
+        safeEmitTelemetry(onTelemetry, {
+          kind: "tool_end",
+          toolCallId: typeof e.toolCallId === "string" ? e.toolCallId : `${String(e.toolName ?? "tool")}:unknown`,
+          toolName: typeof e.toolName === "string" ? e.toolName : "tool",
+          isError: Boolean(e.isError),
+          resultPreview: toolResultPreview(e.result),
+        });
+        return;
+      case "auto_retry_start": {
+        const attempt = finiteNumber(e.attempt) ?? 0;
+        const maxAttempts = finiteNumber(e.maxAttempts) ?? 0;
+        const reason = typeof e.errorMessage === "string" ? safeDisplayText(e.errorMessage, 160) : "";
+        safeEmitTelemetry(onTelemetry, {
+          kind: "retry",
+          state: "start",
+          detail: `retry ${attempt}/${maxAttempts} in ${formatDelay(finiteNumber(e.delayMs) ?? 0)}${reason ? `: ${reason}` : ""}`,
+        });
+        return;
+      }
+      case "auto_retry_end": {
+        const failure = typeof e.finalError === "string" ? safeDisplayText(e.finalError, 180) : "";
+        safeEmitTelemetry(onTelemetry, {
+          kind: "retry",
+          state: "end",
+          detail: e.success ? "retry succeeded" : failure ? `retry failed: ${failure}` : "retry failed",
+        });
+        return;
+      }
+      case "compaction_start":
+        safeEmitTelemetry(onTelemetry, {
+          kind: "compaction",
+          state: "start",
+          detail: compactionStartDetail(e.reason),
+        });
+        return;
+      case "compaction_end":
+        safeEmitTelemetry(onTelemetry, {
+          kind: "compaction",
+          state: "end",
+          detail: e.aborted ? "compaction aborted" : e.errorMessage ? "compaction failed" : "compaction complete",
+        });
+        return;
+      default:
+        return;
+    }
+  } catch {
+    // best-effort: malformed provider events must not affect the run
+  }
+}
+
+function readUsage(
+  session: any,
+  counters: {
+    retries?: number;
+    compactions?: number;
+    turns?: number;
+    toolUses?: number;
+    observing?: boolean;
+  } = {},
+): AgentUsage {
   try {
     const stats = session.getSessionStats?.();
     if (stats?.tokens) {
       return {
+        inputTokens: stats.tokens.input ?? 0,
         outputTokens: stats.tokens.output ?? 0,
-        totalTokens: stats.tokens.total ?? 0,
+        cacheReadTokens: stats.tokens.cacheRead ?? 0,
+        cacheWriteTokens: stats.tokens.cacheWrite ?? 0,
+        totalTokens: (stats.tokens.input ?? 0) + (stats.tokens.output ?? 0),
         cost: stats.cost ?? 0,
+        turns: counters.observing ? counters.turns ?? 0 : stats.assistantMessages ?? 0,
+        toolUses: counters.observing ? counters.toolUses ?? 0 : stats.toolCalls ?? 0,
+        retries: counters.retries ?? 0,
+        compactions: counters.compactions ?? 0,
       };
     }
   } catch {
     // fall through to message-based estimate
   }
   // Fallback: sum assistant usage from messages.
-  let output = 0;
-  let total = 0;
-  let cost = 0;
-  for (const message of (session.messages ?? []) as Array<Partial<AssistantMessage>>) {
+  const usage = emptyAgentUsage();
+  for (const message of (session.messages ?? []) as Array<any>) {
     if (message?.role === "assistant" && message.usage) {
-      output += message.usage.output ?? 0;
-      total += message.usage.totalTokens ?? 0;
-      cost += message.usage.cost?.total ?? 0;
+      usage.turns = (usage.turns ?? 0) + 1;
+      usage.inputTokens = (usage.inputTokens ?? 0) + (message.usage.input ?? 0);
+      usage.outputTokens += message.usage.output ?? 0;
+      usage.cacheReadTokens = (usage.cacheReadTokens ?? 0) + (message.usage.cacheRead ?? 0);
+      usage.cacheWriteTokens = (usage.cacheWriteTokens ?? 0) + (message.usage.cacheWrite ?? 0);
+      usage.cost += message.usage.cost?.total ?? 0;
     }
+    if (message?.role === "toolResult") usage.toolUses = (usage.toolUses ?? 0) + 1;
   }
-  return { outputTokens: output, totalTokens: total, cost };
+  if (counters.observing) {
+    usage.turns = counters.turns ?? 0;
+    usage.toolUses = counters.toolUses ?? 0;
+  }
+  usage.totalTokens = (usage.inputTokens ?? 0) + usage.outputTokens;
+  usage.retries = counters.retries ?? 0;
+  usage.compactions = counters.compactions ?? 0;
+  return usage;
 }
 
 function lastAssistantText(messages: unknown[]): string {
