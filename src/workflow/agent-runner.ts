@@ -9,6 +9,8 @@
  * allowlist), and an alternate cwd for git-worktree isolation.
  */
 
+import * as path from "node:path";
+import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   createAgentSession,
   createCodingTools,
@@ -16,6 +18,7 @@ import {
   SessionManager,
   SettingsManager,
   VERSION as PI_VERSION,
+  type CreateAgentSessionOptions,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
@@ -53,8 +56,35 @@ export interface ModelLike {
 
 export interface ModelRegistryLike {
   getAvailable(): ModelLike[];
+  /** Legacy public projection retained for consumers of this structural type. */
   getAll?(): ModelLike[];
+  getRegisteredProviderIds?(): readonly string[];
+  getRegisteredProviderConfig?(provider: string): unknown;
+  getProviderAuthStatus?(provider: string): {
+    configured: boolean;
+    source?: string;
+  };
+  getApiKeyForProvider?(provider: string): Promise<string | undefined>;
 }
+
+/** Structural ModelRuntime seam that remains loadable on pre-0.80.8 Pi. */
+export interface ModelRuntimeLike {
+  getModel?(provider: string, modelId: string): ModelLike | undefined;
+  registerProvider?(provider: string, config: any): void;
+  refresh?(options?: { allowNetwork?: boolean }): Promise<unknown>;
+  setRuntimeApiKey?(provider: string, apiKey: string): Promise<void>;
+}
+
+export interface ModelRuntimeCreateOptions {
+  authPath: string;
+  modelsPath: string;
+  /** Child sessions reuse the parent's catalog snapshot and must not refresh remotely. */
+  allowModelNetwork: false;
+}
+
+export type ModelRuntimeFactory = (
+  options: ModelRuntimeCreateOptions,
+) => Promise<ModelRuntimeLike | undefined>;
 
 export interface AgentTurnUsage {
   inputTokens: number;
@@ -133,19 +163,35 @@ export interface AgentSessionLike {
   getSessionStats?(): unknown;
 }
 
+export type AgentSessionCreateOptions = Omit<
+  CreateAgentSessionOptions,
+  "model" | "modelRegistry" | "modelRuntime"
+> & {
+  model?: ModelLike;
+  /** Legacy Pi option, selected only when ModelRuntime is unavailable. */
+  modelRegistry?: ModelRegistryLike;
+  /** Pi 0.80.8+ canonical model/auth runtime. */
+  modelRuntime?: ModelRuntimeLike;
+};
+
 export type AgentSessionFactory = (
-  options: Record<string, unknown>,
+  options: AgentSessionCreateOptions,
 ) => Promise<{ session: AgentSessionLike }>;
 
 export interface WorkflowAgentRunnerOptions {
   cwd: string;
+  /** Synchronous extension facade used only for model selection and state replay. */
   modelRegistry?: ModelRegistryLike;
+  /** Canonical runtime to share across child sessions when supplied by an SDK host. */
+  modelRuntime?: ModelRuntimeLike;
   /** Default model used when an agent() call does not override it. */
   model?: ModelLike;
   /** Default thinking level for subagents. */
   thinkingLevel?: ThinkingLevel;
   /** Test seam for session construction and initialization races. */
   createSession?: AgentSessionFactory;
+  /** Test/compatibility seam for async ModelRuntime initialization. */
+  createModelRuntime?: ModelRuntimeFactory;
   /** Override runtime feature detection for pre-max Pi compatibility tests. */
   supportsMaxThinking?: boolean;
 }
@@ -189,17 +235,24 @@ export interface AgentRunCall {
 export class WorkflowAgentRunner {
   private readonly baseCwd: string;
   private readonly modelRegistry?: ModelRegistryLike;
+  private readonly providedModelRuntime?: ModelRuntimeLike;
   private readonly defaultModel?: ModelLike;
   private readonly defaultThinking?: ThinkingLevel;
   private readonly createSession: AgentSessionFactory;
+  private readonly createModelRuntime?: ModelRuntimeFactory;
+  private modelRuntimePromise?: Promise<ModelRuntimeLike | undefined>;
   private readonly runtimeSupportsMaxThinking: boolean;
 
   constructor(options: WorkflowAgentRunnerOptions) {
     this.baseCwd = options.cwd;
     this.modelRegistry = options.modelRegistry;
+    this.providedModelRuntime = options.modelRuntime;
     this.defaultModel = options.model;
     this.defaultThinking = options.thinkingLevel;
+    const usesPiSessionFactory = options.createSession === undefined;
     this.createSession = options.createSession ?? (createAgentSession as unknown as AgentSessionFactory);
+    this.createModelRuntime = options.createModelRuntime
+      ?? (options.modelRuntime !== undefined || !usesPiSessionFactory ? undefined : createPiModelRuntime);
     this.runtimeSupportsMaxThinking = options.supportsMaxThinking ?? piVersionSupportsMaxThinking(PI_VERSION);
   }
 
@@ -223,9 +276,30 @@ export class WorkflowAgentRunner {
       if (toolAllowlist) toolAllowlist.push("structured_output");
     }
 
-    const { model, thinkingLevel } = this.resolveModel(call.modelPattern, call.agentTypeDef);
-
+    const selection = this.resolveModel(call.modelPattern, call.agentTypeDef);
+    const thinkingLevel = selection.thinkingLevel;
     const agentDir = getAgentDir();
+
+    let modelRuntime: ModelRuntimeLike | undefined;
+    let model: ModelLike | undefined;
+    try {
+      modelRuntime = await waitForSharedInitialization(
+        this.getModelRuntime(agentDir),
+        call.signal,
+      );
+      if (call.signal?.aborted) throw abortedError();
+      model = selection.model && modelRuntime?.getModel
+        ? modelRuntime.getModel(selection.model.provider, selection.model.id) ?? selection.model
+        : selection.model;
+    } catch (error) {
+      safeEmitTelemetry(call.onTelemetry, {
+        kind: "run_error",
+        error: safeDisplayText(errorText(error), 512),
+        usage: emptyAgentUsage(),
+      });
+      throw error;
+    }
+
     const createSession = (level: ThinkingLevel | undefined) => this.createSession({
       cwd,
       agentDir,
@@ -235,7 +309,11 @@ export class WorkflowAgentRunner {
       ...(model ? { model: model as any } : {}),
       ...(level ? { thinkingLevel: level as any } : {}),
       ...(toolAllowlist ? { tools: toolAllowlist } : {}),
-      ...(this.modelRegistry ? { modelRegistry: this.modelRegistry as any } : {}),
+      ...(modelRuntime
+        ? { modelRuntime }
+        : this.modelRegistry
+          ? { modelRegistry: this.modelRegistry as any }
+          : {}),
     });
 
     const sessionThinking = resolveSessionThinkingLevel(thinkingLevel, model);
@@ -414,6 +492,61 @@ export class WorkflowAgentRunner {
     return parts.filter(Boolean).join("\n\n");
   }
 
+  private getModelRuntime(agentDir: string): Promise<ModelRuntimeLike | undefined> {
+    if (this.providedModelRuntime) return Promise.resolve(this.providedModelRuntime);
+    if (!this.createModelRuntime) return Promise.resolve(undefined);
+    if (!this.modelRuntimePromise) {
+      // Cache the in-flight promise so parallel agent() calls never initialize
+      // separate runtimes or race provider/auth replay. Clear only this failed
+      // attempt so a later serial agent can retry transient initialization errors.
+      const pending = this.initializeModelRuntime(agentDir);
+      this.modelRuntimePromise = pending;
+      void pending.catch(() => {
+        if (this.modelRuntimePromise === pending) this.modelRuntimePromise = undefined;
+      });
+    }
+    return this.modelRuntimePromise;
+  }
+
+  private async initializeModelRuntime(agentDir: string): Promise<ModelRuntimeLike | undefined> {
+    const runtime = await this.createModelRuntime?.({
+      authPath: path.join(agentDir, "auth.json"),
+      modelsPath: path.join(agentDir, "models.json"),
+      allowModelNetwork: false,
+    });
+    if (!runtime) return undefined;
+
+    const registeredProviderIds = this.modelRegistry?.getRegisteredProviderIds?.() ?? [];
+    let providersChanged = false;
+    for (const provider of registeredProviderIds) {
+      const config = this.modelRegistry?.getRegisteredProviderConfig?.(provider);
+      if (config === undefined || !runtime.registerProvider) continue;
+      runtime.registerProvider(provider, config);
+      providersChanged = true;
+    }
+    if (providersChanged && runtime.refresh) {
+      await runtime.refresh({ allowNetwork: false });
+    }
+
+    // Only replay CLI/SDK runtime overrides. Stored credentials, OAuth, env,
+    // and models.json auth must stay owned by the new runtime so they can refresh.
+    if (
+      runtime.setRuntimeApiKey
+      && this.modelRegistry?.getProviderAuthStatus
+      && this.modelRegistry.getApiKeyForProvider
+    ) {
+      const providers = new Set(this.modelRegistry.getAvailable().map((model) => model.provider));
+      for (const provider of registeredProviderIds) providers.add(provider);
+      for (const provider of providers) {
+        if (this.modelRegistry.getProviderAuthStatus(provider).source !== "runtime") continue;
+        const apiKey = await this.modelRegistry.getApiKeyForProvider(provider);
+        if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey);
+      }
+    }
+
+    return runtime;
+  }
+
   private resolveModel(
     pattern: string | undefined,
     role: AgentTypeDef | undefined,
@@ -427,6 +560,20 @@ export class WorkflowAgentRunner {
       models: this.modelRegistry?.getAvailable(),
     });
   }
+}
+
+interface ModelRuntimeConstructorLike {
+  create(options: ModelRuntimeCreateOptions): Promise<ModelRuntimeLike>;
+}
+
+/** Capability detection avoids importing a named export that Pi 0.80.7 lacks. */
+async function createPiModelRuntime(
+  options: ModelRuntimeCreateOptions,
+): Promise<ModelRuntimeLike | undefined> {
+  const runtimeClass = (PiCodingAgent as unknown as {
+    ModelRuntime?: ModelRuntimeConstructorLike;
+  }).ModelRuntime;
+  return runtimeClass?.create ? runtimeClass.create(options) : undefined;
 }
 
 export function splitThinkingSuffix(pattern: string): { base: string; thinking?: ThinkingLevel } {
@@ -514,6 +661,30 @@ export function resolveModelSelection(args: {
   const { base, thinking } = splitThinkingSuffix(effectivePattern);
   const model = base ? matchModelIn(models, base) ?? defaultModel : defaultModel;
   return { model, thinkingLevel: thinking ?? roleThinking ?? defaultThinking };
+}
+
+function waitForSharedInitialization<T>(
+  pending: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) return pending;
+  if (signal.aborted) return Promise.reject(abortedError());
+
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => finish(() => reject(abortedError()));
+    signal.addEventListener("abort", onAbort, { once: true });
+    pending.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error)),
+    );
+  });
 }
 
 function abortedError(): Error {

@@ -159,6 +159,203 @@ test("resolveSessionThinkingLevel uses max only when the model advertises it", (
   assert.equal(resolveSessionThinkingLevel("high", DEFAULT), "high");
 });
 
+test("WorkflowAgentRunner shares one modern model runtime and replays public registry state", async () => {
+  const runtimeModel = { ...DEFAULT, name: "Runtime Opus" };
+  const providerConfig = { baseUrl: "https://proxy.example.test" };
+  const registered: Array<[string, unknown]> = [];
+  const refreshed: unknown[] = [];
+  const runtimeKeys: Array<[string, string]> = [];
+  const runtime = {
+    getModel: (provider: string, id: string) =>
+      provider === runtimeModel.provider && id === runtimeModel.id ? runtimeModel : undefined,
+    registerProvider: (provider: string, config: unknown) => registered.push([provider, config]),
+    refresh: async (options?: unknown) => { refreshed.push(options); },
+    setRuntimeApiKey: async (provider: string, apiKey: string) => {
+      runtimeKeys.push([provider, apiKey]);
+    },
+  };
+  const apiKeyReads: string[] = [];
+  const registry = {
+    getAvailable: () => [DEFAULT, { provider: "custom", id: "custom-model" }],
+    getRegisteredProviderIds: () => ["custom"],
+    getRegisteredProviderConfig: (provider: string) => provider === "custom" ? providerConfig : undefined,
+    getProviderAuthStatus: (provider: string) => ({
+      configured: true,
+      source: provider === "anthropic" ? "runtime" : "stored",
+    }),
+    getApiKeyForProvider: async (provider: string) => {
+      apiKeyReads.push(provider);
+      return provider === "anthropic" ? "runtime-secret" : "must-not-copy";
+    },
+  };
+  let runtimeCreations = 0;
+  const sessionOptions: Array<Record<string, unknown>> = [];
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    model: DEFAULT,
+    modelRegistry: registry,
+    createModelRuntime: async (paths) => {
+      runtimeCreations++;
+      assert.match(paths.authPath, /auth\.json$/);
+      assert.match(paths.modelsPath, /models\.json$/);
+      assert.equal(paths.allowModelNetwork, false, "child runtime initialization stays offline");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      return runtime;
+    },
+    createSession: async (options) => {
+      sessionOptions.push(options);
+      const messages: unknown[] = [];
+      return {
+        session: fakeSession({
+          model: runtimeModel,
+          prompt: async () => {
+            messages.push({ role: "assistant", content: [{ type: "text", text: "done" }] });
+          },
+          messages,
+        }),
+      };
+    },
+  });
+
+  await Promise.all([
+    runner.run({ prompt: "one", label: "one" }),
+    runner.run({ prompt: "two", label: "two" }),
+  ]);
+
+  assert.equal(runtimeCreations, 1, "parallel agents share the in-flight runtime initialization");
+  assert.equal(sessionOptions.length, 2);
+  for (const options of sessionOptions) {
+    assert.equal(options.modelRuntime, runtime);
+    assert.equal("modelRegistry" in options, false, "modern sessions never receive the removed option");
+    assert.equal(options.model, runtimeModel, "the selected model is rebound to the target runtime");
+  }
+  assert.deepEqual(registered, [["custom", providerConfig]]);
+  assert.deepEqual(refreshed, [{ allowNetwork: false }]);
+  assert.deepEqual(apiKeyReads, ["anthropic"], "only runtime-sourced auth is copied");
+  assert.deepEqual(runtimeKeys, [["anthropic", "runtime-secret"]]);
+});
+
+test("WorkflowAgentRunner retains the legacy registry option when ModelRuntime is unavailable", async () => {
+  const sessionOptions: Array<Record<string, unknown>> = [];
+  const registry = { getAvailable: () => [DEFAULT] };
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    model: DEFAULT,
+    modelRegistry: registry,
+    createModelRuntime: async () => undefined,
+    createSession: async (options) => {
+      sessionOptions.push(options);
+      const messages: unknown[] = [];
+      return {
+        session: fakeSession({
+          prompt: async () => {
+            messages.push({ role: "assistant", content: [{ type: "text", text: "legacy" }] });
+          },
+          messages,
+        }),
+      };
+    },
+  });
+
+  const result = await runner.run({ prompt: "test", label: "legacy registry" });
+  assert.equal(result.value, "legacy");
+  assert.equal(sessionOptions[0].modelRegistry, registry);
+  assert.equal("modelRuntime" in sessionOptions[0], false);
+});
+
+test("WorkflowAgentRunner shares a concurrent runtime failure but retries later", async () => {
+  let runtimeCreations = 0;
+  let sessionCreations = 0;
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    createModelRuntime: async () => {
+      runtimeCreations++;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (runtimeCreations === 1) throw new Error("runtime init failed");
+      return {};
+    },
+    createSession: async () => {
+      sessionCreations++;
+      const messages: unknown[] = [];
+      return {
+        session: fakeSession({
+          prompt: async () => {
+            messages.push({ role: "assistant", content: [{ type: "text", text: "recovered" }] });
+          },
+          messages,
+        }),
+      };
+    },
+  });
+
+  const settled = await Promise.allSettled([
+    runner.run({ prompt: "one", label: "one" }),
+    runner.run({ prompt: "two", label: "two" }),
+  ]);
+  assert.equal(runtimeCreations, 1);
+  assert.equal(sessionCreations, 0);
+  assert.ok(settled.every((result) => result.status === "rejected" && /runtime init failed/.test(String(result.reason))));
+
+  const recovered = await runner.run({ prompt: "retry", label: "retry" });
+  assert.equal(runtimeCreations, 2, "a transient initialization failure must not poison the runner");
+  assert.equal(sessionCreations, 1);
+  assert.equal(recovered.value, "recovered");
+});
+
+test("WorkflowAgentRunner cancels one runtime waiter without cancelling shared initialization", async () => {
+  let releaseRuntime!: (runtime: object) => void;
+  let markEntered!: () => void;
+  const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+  const runtimePending = new Promise<object>((resolve) => { releaseRuntime = resolve; });
+  let runtimeCreations = 0;
+  let sessionCreations = 0;
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    createModelRuntime: async () => {
+      runtimeCreations++;
+      markEntered();
+      return runtimePending;
+    },
+    createSession: async () => {
+      sessionCreations++;
+      const messages: unknown[] = [];
+      return {
+        session: fakeSession({
+          prompt: async () => {
+            messages.push({ role: "assistant", content: [{ type: "text", text: "shared" }] });
+          },
+          messages,
+        }),
+      };
+    },
+  });
+  const controller = new AbortController();
+  const cancelled = runner.run({ prompt: "cancel", label: "cancel", signal: controller.signal });
+  await entered;
+  controller.abort();
+
+  let cancellationTimeout: ReturnType<typeof setTimeout> | undefined;
+  const cancellationResult = await Promise.race([
+    cancelled.then(
+      () => new Error("cancelled run unexpectedly resolved"),
+      (error) => error,
+    ),
+    new Promise<Error>((resolve) => {
+      cancellationTimeout = setTimeout(() => resolve(new Error("cancellation timed out")), 100);
+    }),
+  ]);
+  if (cancellationTimeout) clearTimeout(cancellationTimeout);
+  releaseRuntime({});
+  await cancelled.catch(() => {});
+
+  assert.match(String(cancellationResult), /Subagent was aborted/);
+  assert.equal(sessionCreations, 0, "the cancelled waiter never creates a session");
+  const result = await runner.run({ prompt: "reuse", label: "reuse" });
+  assert.equal(result.value, "shared", "the completed shared runtime remains reusable");
+  assert.equal(runtimeCreations, 1, "cancelling a waiter does not restart shared initialization");
+  assert.equal(sessionCreations, 1);
+});
+
 test("WorkflowAgentRunner lets a max-capable default model keep max", async () => {
   const createdLevels: unknown[] = [];
   const messages: unknown[] = [];
@@ -264,12 +461,17 @@ test("WorkflowAgentRunner retries xhigh when a legacy runtime clamps max to medi
 test("WorkflowAgentRunner does not prompt when aborted during session creation", async () => {
   const controller = new AbortController();
   let release!: (created: { session: AgentSessionLike }) => void;
+  let markSessionCreationStarted!: () => void;
+  const sessionCreationStarted = new Promise<void>((resolve) => {
+    markSessionCreationStarted = resolve;
+  });
   let promptCalls = 0;
   let disposeCalls = 0;
   const runner = new WorkflowAgentRunner({
     cwd: process.cwd(),
     createSession: () => new Promise((resolve) => {
       release = resolve;
+      markSessionCreationStarted();
     }),
   });
   const session = fakeSession({
@@ -282,7 +484,7 @@ test("WorkflowAgentRunner does not prompt when aborted during session creation",
   });
 
   const pending = runner.run({ prompt: "test", label: "abort", signal: controller.signal });
-  await Promise.resolve();
+  await sessionCreationStarted;
   controller.abort();
   release({ session });
   await assert.rejects(pending, /Subagent was aborted/);

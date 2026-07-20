@@ -26,6 +26,7 @@ import type {
   AgentUsage,
   ModelLike,
   ModelRegistryLike,
+  ModelRuntimeLike,
   ThinkingLevel,
 } from "./agent-runner.ts";
 import { safeDisplayText } from "./display-text.ts";
@@ -99,7 +100,10 @@ export interface WorkflowRunOptions {
   signal?: AbortSignal;
   concurrency?: number;
   tokenBudget?: number | null;
+  /** Synchronous extension facade used for model selection. */
   modelRegistry?: ModelRegistryLike;
+  /** Canonical model/auth runtime shared across child sessions. */
+  modelRuntime?: ModelRuntimeLike;
   model?: ModelLike;
   thinkingLevel?: ThinkingLevel;
   /** Inject a runner (tests). */
@@ -234,6 +238,7 @@ class Runtime {
       this.runnerInstance = new WorkflowAgentRunner({
         cwd: this.cwd,
         modelRegistry: this.options.modelRegistry,
+        modelRuntime: this.options.modelRuntime,
         model: this.options.model,
         thinkingLevel: this.options.thinkingLevel,
       });

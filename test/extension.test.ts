@@ -569,13 +569,15 @@ test("workflow tool resumes a prior run from its journal", async () => {
   fs.rmSync(sessionDir, { recursive: true, force: true });
 });
 
-test("workflow tool forwards the raw ultracode max level to runWorkflow", async () => {
+test("workflow tool forwards the raw ultracode max level and injected model runtime", async () => {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-think-"));
   try {
-    let captured: { thinkingLevel?: string; budget?: number | null } = {};
+    const modelRuntime = { marker: "shared-runtime", getModel: () => undefined };
+    let captured: { thinkingLevel?: string; budget?: number | null; modelRuntime?: unknown } = {};
     const fakeRun = async (_script: string, options: any) => {
       captured.thinkingLevel = options.thinkingLevel;
       captured.budget = options.tokenBudget;
+      captured.modelRuntime = options.modelRuntime;
       return {
         meta: { name: "x", description: "x" },
         result: { ok: true },
@@ -589,12 +591,14 @@ test("workflow tool forwards the raw ultracode max level to runWorkflow", async 
     };
     const tool = createWorkflowTool({
       getThinkingLevel: () => "max",
+      modelRuntime,
       runWorkflowFn: fakeRun as any,
     });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'x', description: 'x' }\nagent('a', { label: 'a' })`;
     await tool.execute("tc1", { script } as any, undefined, undefined, ctx);
     assert.equal(captured.thinkingLevel, "max", "raw max thinking level is forwarded to runWorkflow");
+    assert.equal(captured.modelRuntime, modelRuntime, "SDK hosts can share their canonical runtime");
   } finally {
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }

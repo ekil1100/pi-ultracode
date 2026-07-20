@@ -28,6 +28,9 @@ export {
   type ThinkingLevel,
   type ModelLike,
   type ModelRegistryLike,
+  type ModelRuntimeCreateOptions,
+  type ModelRuntimeFactory,
+  type ModelRuntimeLike,
 } from "./workflow/agent-runner.ts";
 export { createStructuredOutputTool, type StructuredOutputCapture } from "./workflow/structured-output.ts";
 export {

@@ -22,7 +22,7 @@ import {
   WORKFLOW_LOG_OMITTED_TEXT,
   runWorkflow,
 } from "./runtime.ts";
-import type { ThinkingLevel } from "./agent-runner.ts";
+import type { ModelRuntimeLike, ThinkingLevel } from "./agent-runner.ts";
 import { RunJournal, hashString, type JournalAgentRecord } from "./journal.ts";
 import { getRegistry } from "./registry.ts";
 import {
@@ -66,6 +66,8 @@ const workflowToolSchema = Type.Object({
 });
 
 export interface WorkflowToolDeps {
+  /** Canonical runtime supplied by an SDK host; shared by all child sessions. */
+  modelRuntime?: ModelRuntimeLike;
   /** Default token budget from ultracode mode, if any. */
   getDefaultBudget?: () => number | null;
   /** The ultracode effort level to forward to every workflow subagent as its
@@ -203,6 +205,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           tokenBudget: budgetTotal,
           thinkingLevel,
           modelRegistry: ctx.modelRegistry as any,
+          modelRuntime: deps.modelRuntime,
           model: ctx.model as any,
           runner: deps.testRunner,
           journal,
