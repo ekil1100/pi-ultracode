@@ -1,0 +1,127 @@
+name: Publish npm package
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version from package.json to publish
+        required: true
+        type: string
+      npm_tag:
+        description: npm distribution tag
+        required: true
+        default: latest
+        type: choice
+        options:
+          - latest
+          - next
+          - beta
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: publish-npm-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org/
+          cache: npm
+
+      - name: Validate release version
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          GIT_REF_NAME: ${{ github.ref_name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_NPM_TAG: ${{ inputs.npm_tag }}
+        run: |
+          set -euo pipefail
+
+          package_name="$(node --print "require('./package.json').name")"
+          package_version="$(node --print "require('./package.json').version")"
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            expected_tag="v${package_version}"
+            if [[ "$GIT_REF_NAME" != "$expected_tag" ]]; then
+              echo "::error::Version tag must be ${expected_tag}, got ${GIT_REF_NAME}."
+              exit 1
+            fi
+
+            if [[ "$package_version" == *-* ]]; then
+              npm_tag="next"
+            else
+              npm_tag="latest"
+            fi
+          else
+            if [[ "$GIT_REF" != "refs/heads/main" ]]; then
+              echo "::error::Manual publishing is only allowed from main."
+              exit 1
+            fi
+            if [[ "$REQUESTED_VERSION" != "$package_version" ]]; then
+              echo "::error::Requested version ${REQUESTED_VERSION} does not match package.json (${package_version})."
+              exit 1
+            fi
+            npm_tag="$REQUESTED_NPM_TAG"
+          fi
+
+          {
+            echo "name=${package_name}"
+            echo "version=${package_version}"
+            echo "npm_tag=${npm_tag}"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Publishing ${package_name}@${package_version} with npm tag ${npm_tag}."
+
+      - name: Ensure version is unpublished
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ steps.release.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          status=0
+          output="$(npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version --json 2>&1)" || status=$?
+          if (( status == 0 )); then
+            echo "::error::${PACKAGE_NAME}@${PACKAGE_VERSION} is already published."
+            exit 1
+          fi
+          if [[ "$output" != *E404* ]]; then
+            printf '%s\n' "$output" >&2
+            exit "$status"
+          fi
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Run tests
+        run: npm test
+
+      - name: Run type checking
+        run: npm run typecheck
+
+      - name: Publish package
+        env:
+          NPM_TAG: ${{ steps.release.outputs.npm_tag }}
+        run: npm publish --access public --tag "$NPM_TAG"

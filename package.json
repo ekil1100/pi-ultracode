@@ -1,6 +1,6 @@
 {
   "name": "pi-ultracode",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Claude-Code-style \"ultracode\" for Pi: an effort mode that defaults to deterministic multi-agent workflow orchestration, with worktree isolation, per-agent model overrides, custom agent types, nested workflows, token budgets, resumable runs, and a /workflows manager.",
   "type": "module",
   "keywords": [
@@ -16,6 +16,14 @@
   ],
   "author": "pi-ultracode",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ekil1100/pi-ultracode.git"
+  },
+  "homepage": "https://github.com/ekil1100/pi-ultracode#readme",
+  "bugs": {
+    "url": "https://github.com/ekil1100/pi-ultracode/issues"
+  },
   "files": [
     "extensions/",
     "src/",
@@ -23,6 +31,10 @@
     "examples/",
     "README.md"
   ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "pi": {
     "extensions": [
       "./extensions/ultracode.ts"
@@ -39,6 +51,15 @@
   },
   "dependencies": {
     "acorn": "^8.11.0"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.80.10",
+    "@earendil-works/pi-ai": "^0.80.10",
+    "@earendil-works/pi-coding-agent": "^0.80.10",
+    "@earendil-works/pi-tui": "^0.80.10",
+    "@types/node": "^24.12.4",
+    "typebox": "1.1.38",
+    "typescript": "^5.9.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
