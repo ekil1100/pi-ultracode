@@ -235,6 +235,60 @@ test("WorkflowAgentRunner shares one modern model runtime and replays public reg
   assert.deepEqual(runtimeKeys, [["anthropic", "runtime-secret"]]);
 });
 
+test("WorkflowAgentRunner replays native providers into the child model runtime", async () => {
+  const parentModel = { provider: "native-test", id: "native-model", name: "Parent Native" };
+  const runtimeModel = { ...parentModel, name: "Child Native" };
+  const nativeProvider = { id: "native-test", name: "Native Test Provider" };
+  const registeredNativeProviders: unknown[] = [];
+  const refreshed: unknown[] = [];
+  let nativeRegistered = false;
+  const runtime = {
+    getModel: (provider: string, id: string) =>
+      nativeRegistered && provider === runtimeModel.provider && id === runtimeModel.id
+        ? runtimeModel
+        : undefined,
+    registerNativeProvider: (provider: unknown) => {
+      registeredNativeProviders.push(provider);
+      nativeRegistered = true;
+    },
+    refresh: async (options?: unknown) => { refreshed.push(options); },
+  };
+  const registry = {
+    getAvailable: () => [parentModel],
+    getRegisteredProviderIds: () => [nativeProvider.id],
+    getRegisteredNativeProvider: (provider: string) =>
+      provider === nativeProvider.id ? nativeProvider : undefined,
+    getRegisteredProviderConfig: () => undefined,
+  };
+  const sessionOptions: Array<Record<string, unknown>> = [];
+  const runner = new WorkflowAgentRunner({
+    cwd: process.cwd(),
+    model: parentModel,
+    modelRegistry: registry,
+    createModelRuntime: async () => runtime,
+    createSession: async (options) => {
+      sessionOptions.push(options);
+      const messages: unknown[] = [];
+      return {
+        session: fakeSession({
+          model: runtimeModel,
+          prompt: async () => {
+            messages.push({ role: "assistant", content: [{ type: "text", text: "native" }] });
+          },
+          messages,
+        }),
+      };
+    },
+  });
+
+  const result = await runner.run({ prompt: "test", label: "native provider" });
+
+  assert.equal(result.value, "native");
+  assert.deepEqual(registeredNativeProviders, [nativeProvider]);
+  assert.deepEqual(refreshed, [{ allowNetwork: false }]);
+  assert.equal(sessionOptions[0].model, runtimeModel, "the model is rebound after native provider replay");
+});
+
 test("WorkflowAgentRunner retains the legacy registry option when ModelRuntime is unavailable", async () => {
   const sessionOptions: Array<Record<string, unknown>> = [];
   const registry = { getAvailable: () => [DEFAULT] };

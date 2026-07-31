@@ -60,6 +60,8 @@ export interface ModelRegistryLike {
   getAll?(): ModelLike[];
   getRegisteredProviderIds?(): readonly string[];
   getRegisteredProviderConfig?(provider: string): unknown;
+  /** Pi 0.81+ complete provider registration, distinct from legacy config providers. */
+  getRegisteredNativeProvider?(provider: string): any | undefined;
   getProviderAuthStatus?(provider: string): {
     configured: boolean;
     source?: string;
@@ -71,6 +73,8 @@ export interface ModelRegistryLike {
 export interface ModelRuntimeLike {
   getModel?(provider: string, modelId: string): ModelLike | undefined;
   registerProvider?(provider: string, config: any): void;
+  /** Pi 0.81+ complete provider registration. */
+  registerNativeProvider?(provider: any): void;
   refresh?(options?: { allowNetwork?: boolean }): Promise<unknown>;
   setRuntimeApiKey?(provider: string, apiKey: string): Promise<void>;
 }
@@ -519,6 +523,13 @@ export class WorkflowAgentRunner {
     const registeredProviderIds = this.modelRegistry?.getRegisteredProviderIds?.() ?? [];
     let providersChanged = false;
     for (const provider of registeredProviderIds) {
+      const nativeProvider = this.modelRegistry?.getRegisteredNativeProvider?.(provider);
+      if (nativeProvider !== undefined && runtime.registerNativeProvider) {
+        runtime.registerNativeProvider(nativeProvider);
+        providersChanged = true;
+        continue;
+      }
+
       const config = this.modelRegistry?.getRegisteredProviderConfig?.(provider);
       if (config === undefined || !runtime.registerProvider) continue;
       runtime.registerProvider(provider, config);

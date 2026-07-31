@@ -1,6 +1,6 @@
 {
   "name": "pi-ultracode",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Claude-Code-style \"ultracode\" for Pi: an effort mode that defaults to deterministic multi-agent workflow orchestration, with worktree isolation, per-agent model overrides, custom agent types, nested workflows, token budgets, resumable runs, and a /workflows manager.",
   "type": "module",
   "keywords": [
@@ -53,12 +53,12 @@
     "acorn": "^8.11.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "^0.80.10",
-    "@earendil-works/pi-ai": "^0.80.10",
-    "@earendil-works/pi-coding-agent": "^0.80.10",
-    "@earendil-works/pi-tui": "^0.80.10",
+    "@earendil-works/pi-agent-core": "^0.83.0",
+    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@earendil-works/pi-tui": "^0.83.0",
     "@types/node": "^24.12.4",
-    "typebox": "1.1.38",
+    "typebox": "1.3.7",
     "typescript": "^5.9.3"
   },
   "peerDependencies": {
