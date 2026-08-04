@@ -20,7 +20,7 @@ Ultracode 保留 Pi 自身的核心循环、内存模型、工具系统、扩展
 | Worktree 隔离 | 让写入型并行代理在临时 git worktree 中运行，并把改动安全合并回共享工作树。 |
 | 进度与详情 | 实时状态、实际模型/effort、turn/工具/token 统计，以及可流式展开的 TUI 任务详情浮层。 |
 | Ultracode 模式 | `/ultracode on` 启用主动编排提示词，并请求当前模型支持的最高思考强度。 |
-| 配额执行 | 可选 token 预算、代理数量限制、并发限制、脚本超时与嵌套深度限制。 |
+| 执行限制 | 代理数量限制、并发限制与嵌套深度限制。 |
 
 ## 为什么使用工作流
 
@@ -32,7 +32,7 @@ Ultracode 保留 Pi 自身的核心循环、内存模型、工具系统、扩展
 - 哪些阶段依赖前一阶段的结果；
 - 哪些代理应返回结构化数据；
 - 何时需要共享上下文，何时需要隔离；
-- 预算如何限制额外探索；
+- 何时停止额外探索；
 - 失败分支应如何降级。
 
 ## 安装
@@ -82,7 +82,7 @@ pi --ultracode
 工作流运行时会内联显示实时进度，例如：
 
 ```text
-◆ ▶ audit_repo (4/7 done, 2 running) · 3 cached · 203k token (141k new, 62k replayed) · 41.2k/500k out
+◆ ▶ audit_repo (4/7 done, 2 running) · 3 cached · 203k token (141k new, 62k replayed)
   ✓ Survey 1/1
     #1 ✓ repo inventory
        gpt-5.6-sol • max · 15 turns · 42 tool uses · 141k token
@@ -101,11 +101,8 @@ pi --ultracode
 ```text
 /ultracode             # toggle on/off
 /ultracode on          # enable orchestration mode
-/ultracode on 500k     # enable it with an output-token budget
 /ultracode off         # disable the tool and restore the previous thinking level
-/ultracode status      # show status and the configured budget
-/ultracode budget 500k # set a token budget
-/ultracode budget off  # remove the budget
+/ultracode status      # show current status
 /workflows             # open the interactive workflow detail overlay
 /workflows <runId>     # open one run directly (prefix accepted)
 /workflows abort       # abort active runs
@@ -162,7 +159,6 @@ export const meta = {
 - `workflow(nameOrRef, args)`
 - `args`
 - `cwd`
-- `budget`
 
 `agent()` 的主要选项：
 
@@ -339,7 +335,7 @@ await agent("Analyze this failure.", {
 });
 ```
 
-若未指定 model，则子代理继承工作流工具创建时的 Pi 当前模型。Ultracode 启用时，默认子代理强度同样请求 `max`，并按每个代理实际选择的模型独立钳制。Ultracode 不会自动启用 GPT-5.6 的 `pro` 模式，也不会隐式设置 token 预算。
+若未指定 model，则子代理继承工作流工具创建时的 Pi 当前模型。Ultracode 启用时，默认子代理强度同样请求 `max`，并按每个代理实际选择的模型独立钳制。Ultracode 不会自动启用 GPT-5.6 的 `pro` 模式。
 
 ## Worktree 隔离
 
@@ -381,7 +377,7 @@ await agent("Implement the requested change and run focused tests.", {
 await workflow("saved_workflow_name", { target: "src" });
 ```
 
-嵌套限制为一层，且共享父运行的并发上限、代理计数与 token 预算。
+嵌套限制为一层，且共享父运行的并发上限与代理计数。
 
 每次运行都会把脚本和 JSONL journal 保存到：
 
@@ -392,26 +388,12 @@ await workflow("saved_workflow_name", { target: "src" });
 
 暂停、终止或修改脚本后，可再次调用 `workflow` 工具并传入 `resumeFromRunId`。最长的未变 `agent()` 调用前缀会立即返回缓存结果；第一个变化或新增的调用及其后续调用会实时执行。
 
-## 预算与限制
+## 限制
 
-默认 token 预算为无限。只有显式配置后，`budget.total` 才是有限值。
-
-动态探索必须同时检查预算是否存在：
-
-```js
-while (budget.total && budget.remaining() > 50_000) {
-  // additional bounded exploration
-  break;
-}
-```
-
-若不检查 `budget.total`，无限预算下的 `remaining()` 是 `Infinity`，循环可能一直运行到代理数量上限。
-
-其他限制：
+运行时限制：
 
 - 最大代理数；
 - 最大并发数；
-- 工作流脚本超时；
 - 嵌套深度；
 - 结构化输出校验；
 - 静态禁止不确定性与危险全局变量。
@@ -419,6 +401,10 @@ while (budget.total && budget.remaining() > 50_000) {
 ## 会话与兼容性
 
 Ultracode 模式状态通过自定义 session entry 持久化。恢复、reload、fork 和 `/tree` 导航都会按当前 branch 重新读取状态；被丢弃分支中的 entry 不会错误启用模式。旧版 Pi 或旧模型会把 `max` 兼容回退为 `xhigh`，而不会把未知值静默变成 `off`。
+
+### 0.2 迁移说明
+
+0.2 移除了 token budget 功能：`/ultracode budget` 命令、workflow tool 的 `budget` 参数，以及 workflow 脚本中的全局 `budget` 对象都不再存在。旧的 saved workflow 如果引用 `budget.total`、`budget.remaining()` 或 `budget.spent()`，需要删除这些引用，改为显式的 agent 数量、循环条件或输入列表边界。
 
 扩展清理只管理自己的详情浮层、status 与运行状态，不会调用 Pi 的全局 `ui.clear()`，因此不会清除其他扩展的 UI。
 

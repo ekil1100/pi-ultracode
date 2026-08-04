@@ -219,7 +219,7 @@ test("WorkflowRunDetails aggregates, redacts, persists, and restores a task time
   assert.match(liveText, /\*\*\*/);
   assert.ok(live.events.some((event) => event.kind === "thinking" && event.text === undefined));
 
-  const snapshot = createSnapshot({ name: "audit", description: "x" }, "wf_details", null);
+  const snapshot = createSnapshot({ name: "audit", description: "x" }, "wf_details");
   snapshot.status = "completed";
   details.close(snapshot);
   assert.ok(fs.existsSync(details.manifestPath));
@@ -248,6 +248,51 @@ test("WorkflowRunDetails aggregates, redacts, persists, and restores a task time
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("WorkflowRunDetails drops legacy budgetTotal while preserving usage on restore and persist", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-legacy-budget-"));
+  try {
+    const details = new WorkflowRunDetails({ runId: "wf_legacy_budget", name: "legacy", runsDir: root });
+    details.startTask({ id: 1, label: "usage", prompt: "p" });
+    details.finishTask(1, {
+      status: "done",
+      result: "ok",
+      usage: {
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        cost: 0,
+      },
+    });
+    const snapshot = createSnapshot({ name: "legacy", description: "x" }, "wf_legacy_budget");
+    snapshot.status = "completed";
+    snapshot.spentTokens = 5;
+    snapshot.newTokens = 15;
+    snapshot.replayedTokens = 7;
+    details.close(snapshot);
+
+    const legacyManifest = JSON.parse(fs.readFileSync(details.manifestPath, "utf8"));
+    legacyManifest.snapshot.budgetTotal = 123_000;
+    fs.writeFileSync(details.manifestPath, `${JSON.stringify(legacyManifest)}\n`);
+
+    const restored = WorkflowRunDetails.restore(details.manifestPath)!;
+    assert.equal((restored.snapshot as any).budgetTotal, undefined);
+    assert.equal(restored.snapshot.spentTokens, 5);
+    assert.equal(restored.snapshot.newTokens, 15);
+    assert.equal(restored.snapshot.replayedTokens, 7);
+    assert.equal(restored.details.getTask(1)?.usage.totalTokens, 15);
+
+    restored.details.close(restored.snapshot);
+    const rewritten = JSON.parse(fs.readFileSync(restored.details.manifestPath, "utf8"));
+    assert.equal(rewritten.snapshot.budgetTotal, undefined);
+    assert.equal(rewritten.snapshot.spentTokens, 5);
+    assert.equal(rewritten.snapshot.newTokens, 15);
+    assert.equal(rewritten.snapshot.replayedTokens, 7);
+    assert.equal(rewritten.tasks[0].usage.totalTokens, 15);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("WorkflowRunDetails bounds a live streaming task and inserts an omission marker", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-cap-"));
   const details = new WorkflowRunDetails({ runId: "wf_cap", name: "cap", runsDir: root });
@@ -271,7 +316,7 @@ test("final task transcripts preserve valid JSONL within the strict 10MB cap", (
   });
   assert.ok(details.getTask(1)?.events.some((event) => event.kind === "text" && event.text?.endsWith("x")));
   const summary = details.finishTask(1, { status: "done", result: "done" })!;
-  const snapshot = createSnapshot({ name: "cap", description: "x" }, "wf_artifact_cap", null);
+  const snapshot = createSnapshot({ name: "cap", description: "x" }, "wf_artifact_cap");
   details.close(snapshot);
 
   const stat = fs.statSync(summary.transcriptPath!);
@@ -283,7 +328,10 @@ test("final task transcripts preserve valid JSONL within the strict 10MB cap", (
 });
 
 test("workflow rendering shows model, effort, turns, tools, and compact token use", () => {
-  const snapshot = createSnapshot({ name: "stats", description: "x" }, "wf_stats", null);
+  const snapshot = createSnapshot({ name: "stats", description: "x" }, "wf_stats");
+  snapshot.newTokens = 141_000;
+  snapshot.replayedTokens = 62_000;
+  snapshot.spentTokens = 32_000;
   snapshot.agents = [{
     id: 1,
     label: "payments review",
@@ -304,6 +352,8 @@ test("workflow rendering shows model, effort, turns, tools, and compact token us
     },
   }];
   const text = renderWorkflowLines(recompute(snapshot)).join("\n");
+  assert.match(text, /203k token \(141k new, 62k replayed\)/);
+  assert.doesNotMatch(text, /\/500k out|\/\d+k out/);
   assert.match(text, /gpt-5\.6-sol • max · 15 turns · 42 tool uses · 141k token/);
   assert.doesNotMatch(text, /openai-codex/);
 
@@ -439,7 +489,7 @@ test("registry restoration marks interrupted runs and tasks as cancelled", () =>
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-stale-"));
   const details = new WorkflowRunDetails({ runId: "wf_stale", name: "stale", runsDir: root });
   details.startTask({ id: 1, label: "pending", prompt: "p" });
-  let snapshot = createSnapshot({ name: "stale", description: "x" }, "wf_stale", null);
+  let snapshot = createSnapshot({ name: "stale", description: "x" }, "wf_stale");
   snapshot.agents = [{ id: 1, label: "pending", status: "running" }];
   snapshot = recompute(snapshot);
   details.persist(snapshot);
@@ -471,7 +521,7 @@ test("workflow overlay renders responsive task stats and consumes Escape before 
   details.record(1, { kind: "model_resolved", modelId: "gpt-5.6-sol", effort: "max" });
   details.record(1, { kind: "turn_start" });
   details.record(1, { kind: "text_delta", delta: "streaming output" });
-  let snapshot = createSnapshot({ name: "audit", description: "x" }, "wf_overlay", null);
+  let snapshot = createSnapshot({ name: "audit", description: "x" }, "wf_overlay");
   snapshot.agents = [{ id: 1, label: "payments", phase: "Verify", status: "running" }];
   snapshot = recompute(snapshot);
   registry.register("wf_overlay", snapshot, () => {}, details);

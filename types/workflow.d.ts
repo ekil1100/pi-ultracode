@@ -45,23 +45,27 @@ declare global {
     agentType?: string;
   }
 
-  interface WorkflowBudget {
-    total: number | null;
-    spent(): number;
-    remaining(): number;
-  }
+  /** Spawn a subagent. Text is the default; use an explicit T with opts.schema. A started run failure resolves null. */
+  function agent<T = string>(prompt: string, options?: WorkflowAgentOptions): Promise<T | null>;
 
-  /** Spawn a subagent. Returns final text, or a validated object when opts.schema is set. */
-  function agent<T = unknown>(prompt: string, options?: WorkflowAgentOptions): Promise<T>;
+  /**
+   * Run independent tasks concurrently; infer values from thunks and represent a
+   * branch throw as null. Workflow-wide external cancellation propagates and is
+   * not downgraded to null.
+   */
+  function parallel<T = string>(thunks: Array<() => T | Promise<T>>): Promise<Array<Awaited<T> | null>>;
 
-  /** Run independent tasks concurrently (a barrier). Pass functions, not promises. */
-  function parallel<T = unknown>(thunks: Array<() => Promise<T>>): Promise<T[]>;
-
-  /** Run each item through sequential stages while items fan out (no barrier). */
-  function pipeline<TItem = unknown, TResult = unknown>(
+  /**
+   * Fan items through sequential stages. A stage input can be null when a prior
+   * stage (including agent()) returned null; a throwing item branch ends as null.
+   * Workflow-wide external cancellation propagates and is not downgraded to null.
+   */
+  function pipeline<TItem = unknown, TResult = string>(
     items: TItem[],
-    ...stages: Array<(previous: unknown, original: TItem, index: number) => TResult | Promise<TResult>>
-  ): Promise<TResult[]>;
+    ...stages: Array<
+      (previous: unknown | null, original: TItem, index: number) => TResult | Promise<TResult>
+    >
+  ): Promise<Array<Awaited<TResult> | null>>;
 
   /** Run a saved workflow (by name) or { scriptPath } inline; one level of nesting. */
   function workflow<T = unknown>(nameOrRef: string | { scriptPath: string }, args?: unknown): Promise<T>;
@@ -80,7 +84,4 @@ declare global {
 
   /** Deterministic process shim exposing only cwd(). */
   const process: { cwd(): string };
-
-  /** Real output-token budget tracker for the run. */
-  const budget: WorkflowBudget;
 }

@@ -86,7 +86,6 @@ export interface WorkflowSnapshot {
   replayedTokens: number;
   /** Sanitized session-scoped workflow detail manifest for headless consumers. */
   detailsManifestPath?: string;
-  budgetTotal: number | null;
   durationMs?: number;
   result?: unknown;
   status: "running" | "completed" | "aborted" | "failed";
@@ -102,7 +101,7 @@ export interface RenderOptions {
   now?: number;
 }
 
-export function createSnapshot(meta: WorkflowMeta, runId: string, budgetTotal: number | null): WorkflowSnapshot {
+export function createSnapshot(meta: WorkflowMeta, runId: string): WorkflowSnapshot {
   return {
     runId,
     name: safeDisplayText(meta.name, 120) || "workflow",
@@ -119,7 +118,6 @@ export function createSnapshot(meta: WorkflowMeta, runId: string, budgetTotal: n
     spentTokens: 0,
     newTokens: 0,
     replayedTokens: 0,
-    budgetTotal,
     status: "running",
   };
 }
@@ -145,9 +143,6 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
     : snapshot.spentTokens
       ? ` · ${formatTokens(snapshot.spentTokens)} output token`
       : "";
-  const budget = snapshot.budgetTotal
-    ? ` · ${formatTokens(snapshot.spentTokens)}/${formatTokens(snapshot.budgetTotal)} out`
-    : "";
   const stateParts = [
     snapshot.runningCount > 0 ? `${snapshot.runningCount} running` : undefined,
     snapshot.errorCount > 0 ? `${snapshot.errorCount} errors` : undefined,
@@ -155,7 +150,7 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
   ].filter(Boolean);
   const state = stateParts.length ? `, ${stateParts.join(", ")}` : "";
   const cached = snapshot.cachedCount ? ` · ${snapshot.cachedCount} cached` : "";
-  const header = `◆ ${statusMark(snapshot.status)} ${shorten(snapshot.name, 60)} (${snapshot.doneCount}/${snapshot.agentCount} done${state})${cached}${tokens}${budget}`;
+  const header = `◆ ${statusMark(snapshot.status)} ${shorten(snapshot.name, 60)} (${snapshot.doneCount}/${snapshot.agentCount} done${state})${cached}${tokens}`;
   const lines = [header];
 
   const phaseNames = unique([

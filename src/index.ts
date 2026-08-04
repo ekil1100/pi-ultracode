@@ -1,7 +1,7 @@
 /** Public API of pi-ultracode, for reuse and testing. */
 
 export { default } from "../extensions/ultracode.ts";
-export { UltracodeMode, parseBudget, MODE_ENTRY_TYPE } from "./mode.ts";
+export { UltracodeMode, MODE_ENTRY_TYPE } from "./mode.ts";
 export { registerCommands } from "./commands.ts";
 export {
   ULTRACODE_TAGLINE,

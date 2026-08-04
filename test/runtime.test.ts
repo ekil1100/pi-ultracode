@@ -100,30 +100,6 @@ test("phase() and log() are captured", async () => {
   assert.ok(logs.includes("starting"));
 });
 
-test("budget.remaining reflects real tokens and exhaustion throws", async () => {
-  await assert.rejects(
-    runWorkflow(
-      `export const meta = { name: 'bud', description: 'x' }
-       await agent('first', { label: 'first' })
-       await agent('second', { label: 'second' })`,
-      { runner: mockRunner(100), tokenBudget: 100 },
-    ),
-    /token budget exhausted/,
-  );
-});
-
-test("budget loop pattern scales to budget", async () => {
-  const result = await runWorkflow(
-    `export const meta = { name: 'loop', description: 'x' }
-     let n = 0
-     while (budget.total && budget.remaining() > 50) { await agent('x' + n, { label: 'x' + n }); n++ }
-     return n`,
-    { runner: mockRunner(50), tokenBudget: 200 },
-  );
-  // 200/50 = budget allows remaining>50 at 0,50,100 -> 3 iterations (spent 0,50,100 then 150 stops at >50? 200-150=50 not >50)
-  assert.equal(result.result, 3);
-});
-
 test("schema option passes through to the runner", async () => {
   const runner = mockRunner();
   const result = await runWorkflow(
@@ -239,12 +215,20 @@ test("nested workflow() inside a child throws", async () => {
   );
 });
 
-test("rejects a workflow that never calls agent (structured-clone of undefined ok, but no agents)", async () => {
+test("allows a workflow that never calls agent", async () => {
   const result = await runWorkflow(
     `export const meta = { name: 'noop', description: 'x' }\nphase('Plan')\nreturn { planned: true }`,
     { runner: mockRunner() },
   );
-  // The runtime itself allows zero agents; the tool layer enforces "must call agent()".
   assert.equal(result.agentCount, 0);
   assert.deepEqual(result.result, { planned: true });
+});
+
+test("workflow sandbox does not expose the removed budget global", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'no_budget_global', description: 'x' }\nreturn typeof budget`,
+    { runner: mockRunner() },
+  );
+  assert.equal(result.agentCount, 0);
+  assert.equal(result.result, "undefined");
 });

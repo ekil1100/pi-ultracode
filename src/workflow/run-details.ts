@@ -1072,7 +1072,7 @@ function taskForManifest(task: WorkflowTaskSummary): WorkflowTaskSummary {
 }
 
 function snapshotForManifest(snapshot: WorkflowSnapshot): WorkflowSnapshot {
-  return {
+  const projected: WorkflowSnapshot & { budgetTotal?: unknown } = {
     ...snapshot,
     name: safeDisplayText(snapshot.name, 120),
     description: snapshot.description ? safeDisplayText(snapshot.description, 240) : undefined,
@@ -1098,6 +1098,10 @@ function snapshotForManifest(snapshot: WorkflowSnapshot): WorkflowSnapshot {
     // potentially huge or hostile serialization in the UI manifest.
     result: undefined,
   };
+  // Drop the removed run-level token-budget field when restoring or persisting
+  // legacy manifests without broad unknown-field rewriting.
+  delete projected.budgetTotal;
+  return projected;
 }
 
 class RunArtifactBudget {

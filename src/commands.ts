@@ -3,16 +3,16 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { parseBudget, type UltracodeMode } from "./mode.ts";
+import type { UltracodeMode } from "./mode.ts";
 import { getRegistry } from "./workflow/registry.ts";
 import { workflowRunsDir } from "./workflow/tool.ts";
 import { openWorkflowOverlay } from "./workflow/workflow-overlay.ts";
 
 export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
   pi.registerCommand("ultracode", {
-    description: "Toggle ultracode mode (max thinking + default workflow orchestration). Bare /ultracode toggles; subcommands: on|off|status|budget <n>",
+    description: "Toggle ultracode mode (max thinking + default workflow orchestration). Bare /ultracode toggles; subcommands: on|off|status",
     getArgumentCompletions(prefix: string) {
-      return ["on", "off", "status", "budget"]
+      return ["on", "off", "status"]
         .filter((s) => s.startsWith(prefix))
         .map((value) => ({ value, label: value }));
     },
@@ -34,11 +34,19 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
       }
 
       if (sub === "status") {
+        if (parts.length > 1) {
+          ctx.ui.notify(ultracodeUsage(), "error");
+          return;
+        }
         ctx.ui.notify(mode.statusLine(), "info");
         return;
       }
 
       if (sub === "off") {
+        if (parts.length > 1) {
+          ctx.ui.notify(ultracodeUsage(), "error");
+          return;
+        }
         mode.disable(pi);
         await mode.flushThinkingPreference();
         ctx.ui.notify("Ultracode off — thinking restored and workflow tool disabled.", "info");
@@ -46,30 +54,14 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
         return;
       }
 
-      if (sub === "budget") {
-        const budget = parts[1] ? parseBudget(parts[1]) : null;
-        mode.setBudget(pi, budget);
-        ctx.ui.notify(
-          budget ? `Ultracode token budget set to ~${budget} output tokens.` : "Ultracode token budget cleared.",
-          "info",
-        );
-        ctx.ui.setStatus("ultracode", mode.statusLine());
+      if (sub !== "on" || parts.length > 1) {
+        ctx.ui.notify(ultracodeUsage(), "error");
         return;
       }
 
-      // "on", "on 500k", "500k", "+500k"
-      let budget: number | null | undefined;
-      const budgetToken = sub === "on" ? parts[1] : sub;
-      if (budgetToken) {
-        const parsed = parseBudget(budgetToken);
-        if (parsed) budget = parsed;
-      }
-      mode.enable(pi, budget !== undefined ? { budget } : {});
+      mode.enable(pi);
       await mode.flushThinkingPreference();
-      ctx.ui.notify(
-        `Ultracode on — ${mode.statusLine()}${budget ? ` (budget ~${budget} tokens)` : ""}`,
-        "info",
-      );
+      ctx.ui.notify(`Ultracode on — ${mode.statusLine()}`, "info");
       ctx.ui.setStatus("ultracode", mode.statusLine());
     },
   });
@@ -106,4 +98,8 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
     description: "Open workflow task details",
     handler: async (ctx) => openWorkflows(ctx),
   });
+}
+
+function ultracodeUsage(): string {
+  return "Usage: /ultracode [on|off|status]";
 }

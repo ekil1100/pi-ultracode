@@ -64,7 +64,7 @@
 - **主 agent**:请求 `setThinkingLevel("max")`;Pi 按主模型 clamp。若旧版 Pi 将未知 `max` 降错,再请求 `xhigh` 保留旧行为。
 - **模型 / effort / session 生命周期**:Ultracode 开启期间切换模型会重新请求 `max`;手动降低 effort 也会立即重新请求 `max`，每轮 provider 调用前还有最终屏障。模式自身产生的事件与过期事件会被忽略,避免递归。由于 Pi 的 setter 同时写全局默认值，扩展会尽力保存并回写语义等价的全局 preference（原本缺省时会显式写为 `medium`）；旧版 active entry 若只有 `previousThinking` 且全局仍是旧实现写入的 `xhigh`，会用该快照迁移回原 baseline。`session_shutdown` 先进入 quiescing 再恢复开启前的有效 effort，但不改持久化 mode 状态，因此 reload/resume/fork replacement 与 `/tree` 导航都会按当前 branch 的 session 记录重新恢复。若中间模型只能表示 `xhigh`，原始待恢复的 `max` 不会被过早消费。Pi 尚无 session-only setter，hard kill、自定义 SDK agentDir 或另一份 live settings cache 仍属于上游 API 限制。
 - **workflow 子 agent**:模式转发**原始 `"max"`**;runner 根据各子模型是否公开非空 `thinkingLevelMap.max` 选择 `max` 或 `xhigh`,再交给 `createAgentSession` clamp。模型未知时先传 `max`，当前 Pi 的正常模型 clamp 不重建；pre-max Pi 或已宣告支持 `max` 却未接受的 runtime 才会销毁尚未运行的内存 session 并以 `xhigh` 重建,避免修改用户全局默认 effort。初始化、异步 preflight 与流式执行都响应取消；运行器等待 `abort()` 后再释放会话，且 cleanup 错误不覆盖原始失败。
-- **状态**:显示真实 clamp 后的 level（`off|minimal|low|medium|high|xhigh|max`），格式为 `ultracode: on · <level>`，可再追加 budget（不额外写 `thinking`）。
+- **状态**:显示真实 clamp 后的 level（`off|minimal|low|medium|high|xhigh|max`），格式为 `ultracode: on · <level>`（不额外写 `thinking`）。
 - **ultracode 关时**:`workflow` 不在 active tools；`getSubagentThinkingLevel()` = `undefined`，主 agent 恢复开启前的 effort。
 - **显式配置**:`model:"X:max"` 与 agent frontmatter `thinking: max` 均受支持。优先级仍为 per-call `model:"X:level"` > agentType `thinking:` > ultracode 默认。
 

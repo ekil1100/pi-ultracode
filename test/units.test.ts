@@ -6,7 +6,7 @@ import * as path from "node:path";
 import { jsonSchemaToTypeBox } from "../src/workflow/json-schema.ts";
 import { parseFrontmatter, parseAgentTypeFile, discoverAgentTypes, resolveAgentType } from "../src/workflow/agent-types.ts";
 import { agentCallKey, hashString, stableStringify, RunJournal } from "../src/workflow/journal.ts";
-import { parseBudget, UltracodeMode } from "../src/mode.ts";
+import { UltracodeMode } from "../src/mode.ts";
 import { piVersionSupportsMaxThinking } from "../src/thinking.ts";
 
 /** Minimal ExtensionAPI stub with mutable per-request clamp behavior. */
@@ -128,7 +128,7 @@ test("restore migrates an enabled entry that lacks a previous effort", () => {
   m.restore(api, [{
     type: "custom",
     customType: "ultracode-mode",
-    data: { enabled: true, budgetTotal: null },
+    data: { enabled: true },
   }]);
   assert.equal(s.thinking, "max");
   m.disable(api);
@@ -328,7 +328,6 @@ test("an explicit branch off after a disabled mode snapshot clears pending resto
       customType: "ultracode-mode",
       data: {
         enabled: false,
-        budgetTotal: null,
         previousThinking: "high",
         pendingPreviousThinking: "high",
       },
@@ -349,7 +348,6 @@ test("restore consumes a pending level even when the reasoning model currently r
     customType: "ultracode-mode",
     data: {
       enabled: false,
-      budgetTotal: null,
       previousThinking: "high",
       pendingPreviousThinking: "high",
     },
@@ -368,7 +366,6 @@ test("legacy Pi restores a persisted max baseline through xhigh", () => {
     customType: "ultracode-mode",
     data: {
       enabled: true,
-      budgetTotal: null,
       previousThinking: "max",
     },
   }]);
@@ -432,7 +429,6 @@ test("legacy active entries recover the pre-mode default even without an effort 
     customType: "ultracode-mode",
     data: {
       enabled: true,
-      budgetTotal: null,
       previousThinking: "low",
     },
   }]);
@@ -460,7 +456,6 @@ test("restore adopts a newer global preference instead of an old persisted snaps
     customType: "ultracode-mode",
     data: {
       enabled: true,
-      budgetTotal: null,
       previousThinking: "low",
       previousDefaultThinking: "low",
     },
@@ -578,15 +573,6 @@ test("Pi version detection gates max at 0.80.6", () => {
   assert.equal(piVersionSupportsMaxThinking("0.81.0"), true);
   assert.equal(piVersionSupportsMaxThinking("1.0.0"), true);
   assert.equal(piVersionSupportsMaxThinking("custom-build"), true);
-});
-
-test("parseBudget understands k/m/raw and + prefix", () => {
-  assert.equal(parseBudget("500k"), 500_000);
-  assert.equal(parseBudget("+500k"), 500_000);
-  assert.equal(parseBudget("1m"), 1_000_000);
-  assert.equal(parseBudget("250000"), 250_000);
-  assert.equal(parseBudget("1.5m"), 1_500_000);
-  assert.equal(parseBudget("garbage"), null);
 });
 
 test("UltracodeMode.getSubagentThinkingLevel: max when enabled, undefined when off", () => {

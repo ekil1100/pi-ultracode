@@ -145,7 +145,7 @@ test("journal records per-agent startedAt/durationMs in the .jsonl log", async (
 // ---------------------------------------------------------------------------
 
 test("renderWorkflowLines keeps the last known state visible when an agent stops emitting events", () => {
-  const snap = createSnapshot({ name: "obs", description: "x" }, "wf_obs", null);
+  const snap = createSnapshot({ name: "obs", description: "x" }, "wf_obs");
   snap.phases = ["Work"];
   const now = 337_000;
   snap.agents = [
@@ -195,7 +195,7 @@ test("renderWorkflowLines keeps the last known state visible when an agent stops
 
 test("renderWorkflowLines surfaces the stalest concurrent tool", () => {
   const now = 400_000;
-  const snap = createSnapshot({ name: "tool", description: "x" }, "wf_tool", null);
+  const snap = createSnapshot({ name: "tool", description: "x" }, "wf_tool");
   snap.agents = [{
     id: 1,
     label: "tests",
@@ -234,7 +234,7 @@ test("renderWorkflowLines surfaces the stalest concurrent tool", () => {
 
 test("renderWorkflowLines strips terminal controls and ignores deprecated stream tails", () => {
   const now = 40_000;
-  const snap = createSnapshot({ name: "tail\u001b]52;c;name-spoof\u0007", description: "x" }, "wf_tail", null);
+  const snap = createSnapshot({ name: "tail\u001b]52;c;name-spoof\u0007", description: "x" }, "wf_tail");
   snap.agents = [
     {
       id: 1,
@@ -325,7 +325,7 @@ test("display helpers bound hostile input before scanning and omit unsafe tails"
 });
 
 test("public rendering redacts snapshot fields even when callers bypass constructors", () => {
-  const snap = createSnapshot({ name: "safe", description: "x" }, "wf_public", null);
+  const snap = createSnapshot({ name: "safe", description: "x" }, "wf_public");
   snap.name = "visible\u202Espoof";
   snap.logs = ['Authorization: "Bearer logsecret"'];
   snap.agents = [{
@@ -423,7 +423,7 @@ test("result previews never inspect object hooks or expand hostile primitives", 
 });
 
 test("running agent with no activity shows elapsed only (no activity suffix)", () => {
-  const snap = createSnapshot({ name: "na", description: "x" }, "wf_na", null);
+  const snap = createSnapshot({ name: "na", description: "x" }, "wf_na");
   snap.phases = ["Work"];
   const now = 5_000;
   snap.agents = [{ id: 1, label: "fresh", phase: "Work", status: "running", startedAt: 0 }];

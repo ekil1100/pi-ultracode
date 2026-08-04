@@ -3,7 +3,7 @@
  *
  * Parses a workflow script and runs its body inside a Node vm sandbox with the
  * orchestration globals: agent(), parallel(), pipeline(), phase(), log(),
- * workflow(), plus `args`, `cwd`, and `budget`. The sandbox omits Date / require
+ * workflow(), plus `args` and `cwd`. The sandbox omits Date / require
  * / fs / network from the named global surface and neuters Math.random() (it
  * throws) as a guardrail against accidental nondeterminism; this is cooperative
  * enforcement, not a hard isolation boundary (see createDeterministicMath).
@@ -99,7 +99,6 @@ export interface WorkflowRunOptions {
   args?: unknown;
   signal?: AbortSignal;
   concurrency?: number;
-  tokenBudget?: number | null;
   /** Synchronous extension facade used for model selection. */
   modelRegistry?: ModelRegistryLike;
   /** Canonical model/auth runtime shared across child sessions. */
@@ -157,7 +156,7 @@ interface RuntimeState {
   phases: string[];
   agentCount: number; // number of agent() invocations (for ids / cap)
   cachedCount: number;
-  spent: number; // real output tokens (budget compatibility)
+  spent: number; // observed output tokens for usage display
   newTokens: number;
   replayedTokens: number;
 }
@@ -204,7 +203,6 @@ class Runtime {
   private readonly agentTypes: Map<string, AgentTypeDef>;
   private readonly limiter: <R>(fn: () => Promise<R>) => Promise<R>;
   private readonly pending = new Set<Promise<unknown>>();
-  private readonly tokenBudget: number | null;
   private readonly applyLock = new Mutex();
   private readonly executionContext = new AsyncLocalStorage<{ workflowPath: string[]; depth: number; currentPhase?: string }>();
 
@@ -213,20 +211,11 @@ class Runtime {
     this.cwd = options.cwd ?? process.cwd();
     this.runnerInstance = options.runner;
     this.agentTypes = discoverAgentTypes(this.cwd);
-    this.tokenBudget = options.tokenBudget ?? null;
     const cores = (globalThis as any).navigator?.hardwareConcurrency ?? os.cpus().length ?? 8;
     const concurrency = Math.max(1, Math.min(options.concurrency ?? Math.max(1, cores - 2), MAX_CONCURRENCY));
     this.limiter = createLimiter(concurrency);
   }
 
-  get budget() {
-    return Object.freeze({
-      total: this.tokenBudget,
-      spent: () => this.state.spent,
-      remaining: () =>
-        this.tokenBudget == null ? Infinity : Math.max(0, this.tokenBudget - this.state.spent),
-    });
-  }
 
   async drain(): Promise<void> {
     await Promise.allSettled([...this.pending]);
@@ -271,7 +260,6 @@ class Runtime {
       args,
       cwd: this.cwd,
       process: Object.freeze({ cwd: () => this.cwd }),
-      budget: this.budget,
       console: {
         log,
         info: log,
@@ -307,9 +295,6 @@ class Runtime {
 
   private async agent(promptValue: unknown, optionsValue: unknown = {}): Promise<unknown> {
     this.throwIfAborted();
-    if (this.tokenBudget != null && this.budget.remaining() <= 0) {
-      throw new Error("workflow token budget exhausted");
-    }
     const prompt = requireString(promptValue, "agent prompt");
     const opts = normalizeAgentOptions(optionsValue);
     const assignedPhase = opts.phase ?? this.executionContext.getStore()?.currentPhase ?? this.state.currentPhase;

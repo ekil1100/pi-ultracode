@@ -90,6 +90,9 @@ test("extension registers the workflow tool, commands, and flag", () => {
   extension(pi);
   assert.equal(state.tools.length, 1);
   assert.equal(state.tools[0].name, "workflow");
+  const removedParameter = "bud" + "get";
+  assert.equal(state.tools[0].parameters.additionalProperties, false, "workflow tool schema rejects removed and unknown parameters");
+  assert.equal(removedParameter in state.tools[0].parameters.properties, false, "workflow tool schema no longer exposes the removed parameter");
   assert.ok(state.commands.has("ultracode"));
   assert.ok(state.commands.has("workflows"));
   assert.ok(state.flags.has("ultracode"));
@@ -365,33 +368,40 @@ test("production preference adapter treats an absent default as implicit medium"
   }
 });
 
-test("/ultracode budget sets a budget reflected in the injected block", async () => {
+test("/ultracode rejects unknown arguments without enabling the mode", async () => {
   const { pi, state } = makeMockPi();
   extension(pi);
-  const { ctx } = makeCtx(state);
-  await state.commands.get("ultracode").handler("budget 500k", ctx);
-  await state.commands.get("ultracode").handler("on", ctx);
-  const result = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" });
-  assert.ok(/Token budget/.test(result.systemPrompt));
-  assert.ok(/500k/.test(result.systemPrompt));
+  const { ctx, notifications } = makeCtx(state);
+  await state.commands.get("ultracode").handler("nonsense", ctx);
+  assert.equal(state.activeTools.includes("workflow"), false);
+  assert.equal(state.statuses.ultracode, undefined);
+  assert.equal(state.entries.length, 0, "invalid arguments must not persist mode state");
+  assert.equal(notifications.at(-1)?.l, "error");
+  assert.match(notifications.at(-1)?.m ?? "", /Usage: \/ultracode \[on\|off\|status\]/);
 });
 
 test("mode state is restored from persisted entries on a fresh load", async () => {
-  // Simulate a prior session that left ultracode enabled.
+  // Simulate a prior session that left ultracode enabled. Legacy budgetTotal is
+  // ignored and is not re-persisted by new mode entries.
   const { pi, state } = makeMockPi();
   extension(pi);
   state.entries.push({
     type: "custom",
     customType: "ultracode-mode",
-    data: { enabled: true, budgetTotal: 250000, previousThinking: "high" },
+    data: { enabled: true, budgetTotal: 250_000, previousThinking: "high" },
   });
   const { ctx } = makeCtx(state);
   await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
   assert.equal(state.thinking, "max");
   assert.equal(state.activeTools.includes("workflow"), true);
-  // before_agent_start injects (enabled restored).
+  assert.doesNotMatch(String(state.statuses.ultracode), /budget/i);
+  // before_agent_start injects (enabled restored) without legacy budget text.
   const result = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" });
   assert.ok(result?.systemPrompt.includes("<ultracode>"));
+  assert.doesNotMatch(result?.systemPrompt ?? "", /budget/i);
+
+  await state.commands.get("ultracode").handler("off", ctx);
+  assert.equal("budgetTotal" in (state.entries.at(-1)?.data ?? {}), false, "new persisted mode entries omit legacy budgetTotal");
 });
 
 test("session restore ignores mode entries from discarded branches", async () => {
@@ -400,12 +410,12 @@ test("session restore ignores mode entries from discarded branches", async () =>
   const enabled = {
     type: "custom",
     customType: "ultracode-mode",
-    data: { enabled: true, budgetTotal: null, previousThinking: "low" },
+    data: { enabled: true, previousThinking: "low" },
   };
   state.entries.push(enabled, {
     type: "custom",
     customType: "ultracode-mode",
-    data: { enabled: false, budgetTotal: null, previousThinking: "low" },
+    data: { enabled: false, previousThinking: "low" },
   });
   const { ctx } = makeCtx(state);
   ctx.sessionManager.getBranch = () => [enabled];
@@ -483,7 +493,7 @@ test("/workflows and F6 open the interactive overlay; abort remains available", 
 
   const registry = getRegistry();
   registry.setScope(path.join(ctx.cwd, ".pi", "ultracode-runs"));
-  const snap = createSnapshot({ name: "demo", description: "x" }, "wf_overlaytest", null);
+  const snap = createSnapshot({ name: "demo", description: "x" }, "wf_overlaytest");
   snap.status = "completed";
   registry.register("wf_overlaytest", snap, () => {});
 
@@ -496,7 +506,7 @@ test("/workflows and F6 open the interactive overlay; abort remains available", 
   assert.equal(customCalls.length, 2, "F6 opens the same overlay");
 
   let aborted = false;
-  const active = createSnapshot({ name: "active", description: "x" }, "wf_aborttest", null);
+  const active = createSnapshot({ name: "active", description: "x" }, "wf_aborttest");
   registry.register("wf_aborttest", active, () => { aborted = true; });
   await handler("abort", ctx);
   assert.equal(aborted, true);
@@ -541,6 +551,26 @@ test("workflow tool executes a script end-to-end with an injected runner", async
   fs.rmSync(sessionDir, { recursive: true, force: true });
 });
 
+test("workflow tool treats ordinary aborted-looking errors as failures", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-aborted-word-"));
+  try {
+    const tool = createWorkflowTool({
+      runWorkflowFn: (async () => {
+        throw new Error("ordinary aborted-looking failure");
+      }) as any,
+    });
+    const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+    const script = `export const meta = { name: 'aborted_word', description: 'x' }
+agent('one', { label: 'one' })`;
+    await assert.rejects(
+      tool.execute("aborted-word", { script } as any, undefined, undefined, ctx),
+      /Workflow aborted_word failed: ordinary aborted-looking failure/,
+    );
+  } finally {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
 test("workflow tool resumes a prior run from its journal", async () => {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-sess2-"));
   let calls = 0;
@@ -573,10 +603,9 @@ test("workflow tool forwards the raw ultracode max level and injected model runt
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-think-"));
   try {
     const modelRuntime = { marker: "shared-runtime", getModel: () => undefined };
-    let captured: { thinkingLevel?: string; budget?: number | null; modelRuntime?: unknown } = {};
+    let captured: { thinkingLevel?: string; modelRuntime?: unknown } = {};
     const fakeRun = async (_script: string, options: any) => {
       captured.thinkingLevel = options.thinkingLevel;
-      captured.budget = options.tokenBudget;
       captured.modelRuntime = options.modelRuntime;
       return {
         meta: { name: "x", description: "x" },

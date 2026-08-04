@@ -39,7 +39,6 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   } = extraDeps;
 
   const workflowTool = createWorkflowTool({
-    getDefaultBudget: () => mode.getBudget(),
     getThinkingLevel: () => mode.getSubagentThinkingLevel(),
     ...workflowDeps,
     isExecutionAllowed: () => mode.isEnforcing(),

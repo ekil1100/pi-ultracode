@@ -5,8 +5,8 @@
  *   - raises the thinking level to the model's maximum (remembering the previous level),
  *   - keeps the `workflow` tool active,
  *   - injects a standing "author and run a workflow by default" system block on
- *     every turn, plus an optional token budget,
- *   - persists its on/off + budget state in session custom entries so it survives
+ *     every turn,
+ *   - persists its on/off state in session custom entries so it survives
  *     reload, resume, fork, and compaction.
  */
 
@@ -25,7 +25,6 @@ export const MODE_ENTRY_TYPE = "ultracode-mode";
 
 interface PersistedModeState {
   enabled: boolean;
-  budgetTotal: number | null;
   previousThinking?: ThinkingLevel;
   /** `null` records that the setting was originally absent (Pi defaults to medium). */
   previousDefaultThinking?: ThinkingLevel | null;
@@ -50,7 +49,6 @@ export interface ThinkingPreferenceStore {
 export class UltracodeMode {
   private enabled = false;
   private suspended = false;
-  private budgetTotal: number | null = null;
   private previousThinking: ThinkingLevel | undefined;
   private previousDefaultThinking: ThinkingLevel | null | undefined;
   /** Restore a level later if the current non-reasoning model clamps it to off. */
@@ -98,12 +96,12 @@ export class UltracodeMode {
   }
 
   /** Enable if off, disable if on. Returns the new enabled state. */
-  toggle(pi: ExtensionAPI, opts: { budget?: number | null } = {}): boolean {
+  toggle(pi: ExtensionAPI): boolean {
     if (this.enabled) {
       this.disable(pi);
       return false;
     }
-    this.enable(pi, opts);
+    this.enable(pi);
     return true;
   }
 
@@ -191,9 +189,6 @@ export class UltracodeMode {
     return this.suspended;
   }
 
-  getBudget(): number | null {
-    return this.budgetTotal;
-  }
 
   /** Keep tool availability aligned with the current mode state. */
   syncWorkflowTool(pi: ExtensionAPI): void {
@@ -206,8 +201,7 @@ export class UltracodeMode {
   }
 
   /** Turn ultracode on. Idempotent. */
-  enable(pi: ExtensionAPI, opts: { budget?: number | null } = {}): void {
-    if (opts.budget !== undefined) this.budgetTotal = opts.budget;
+  enable(pi: ExtensionAPI): void {
     this.suspended = false;
     this.pendingPreviousThinking = undefined;
     this.pendingClearGeneration++;
@@ -253,10 +247,6 @@ export class UltracodeMode {
     this.persist(pi);
   }
 
-  setBudget(pi: ExtensionAPI, budget: number | null): void {
-    this.budgetTotal = budget;
-    this.persist(pi);
-  }
 
   /** Restore mode state from the active session branch. */
   restore(
@@ -298,7 +288,6 @@ export class UltracodeMode {
       ) as ThinkingLevel | undefined;
       this.enabled = false;
       this.suspended = false;
-      this.budgetTotal = null;
       this.pendingPreviousThinking = undefined;
       this.previousThinking = target;
       this.previousDefaultThinking = globalPreference;
@@ -318,7 +307,6 @@ export class UltracodeMode {
 
     this.suspended = false;
     this.enabled = latest.enabled;
-    this.budgetTotal = latest.budgetTotal;
     this.syncWorkflowTool(pi);
     const maxIsUnknownToRuntime = !this.runtimeSupportsMaxThinking
       && preference.effective === ULTRACODE_THINKING_LEVEL;
@@ -392,7 +380,7 @@ export class UltracodeMode {
    */
   beforeAgentStart(event: { systemPrompt: string }): { systemPrompt: string } | undefined {
     if (!this.isEnforcing()) return undefined;
-    const block = ultracodeSystemBlock({ budgetTotal: this.budgetTotal });
+    const block = ultracodeSystemBlock();
     return { systemPrompt: `${event.systemPrompt}\n\n${block}\n\n${ULTRACODE_ACTIVE_REMINDER}` };
   }
 
@@ -401,7 +389,6 @@ export class UltracodeMode {
     const parts = ["ultracode: on"];
     // Show the level that actually applied, including compatibility/model fallback.
     if (this.appliedThinking) parts.push(this.appliedThinking);
-    if (this.budgetTotal) parts.push(`budget ~${formatTokens(this.budgetTotal)}`);
     return parts.join(" · ");
   }
 
@@ -542,7 +529,6 @@ export class UltracodeMode {
   private persist(pi: ExtensionAPI): void {
     const state: PersistedModeState = {
       enabled: this.enabled,
-      budgetTotal: this.budgetTotal,
       previousThinking: this.previousThinking,
       previousDefaultThinking: this.legacyDefaultMigrationPending
         ? undefined
@@ -560,11 +546,9 @@ export class UltracodeMode {
 function parsePersistedModeState(data: unknown): PersistedModeState | undefined {
   if (!data || typeof data !== "object") return undefined;
   const value = data as Record<string, unknown>;
-  const budget = value.budgetTotal;
   const previousDefault = value.previousDefaultThinking;
   return {
     enabled: value.enabled === true,
-    budgetTotal: typeof budget === "number" && Number.isFinite(budget) && budget > 0 ? budget : null,
     previousThinking: isThinkingLevel(value.previousThinking) ? value.previousThinking : undefined,
     previousDefaultThinking: previousDefault === null || isThinkingLevel(previousDefault)
       ? previousDefault
@@ -586,22 +570,4 @@ function safeGetThinking(pi: ExtensionAPI): ThinkingLevel | undefined {
   } catch {
     return undefined;
   }
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
-  return String(n);
-}
-
-/** Parse a budget token like "500k", "1m", "250000", "+500k". */
-export function parseBudget(input: string): number | null {
-  const match = input.trim().match(/^\+?\s*([0-9][0-9_.]*)\s*([kmKM])?$/);
-  if (!match) return null;
-  const value = Number(match[1].replace(/_/g, ""));
-  if (!Number.isFinite(value)) return null;
-  const unit = match[2]?.toLowerCase();
-  if (unit === "k") return Math.round(value * 1_000);
-  if (unit === "m") return Math.round(value * 1_000_000);
-  return Math.round(value);
 }

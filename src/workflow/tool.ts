@@ -42,7 +42,7 @@ const workflowToolSchema = Type.Object({
   script: Type.Optional(
     Type.String({
       description:
-        "Raw JavaScript workflow script (no Markdown fences). First statement: export const meta = { name: 'snake_case', description: '...' }. Must call agent() at least once. Required unless `name` or `scriptPath` is given.",
+        "Inline raw JavaScript workflow script (no Markdown fences). The source must begin with export const meta = { name: 'snake_case', description: '...' }. Should call agent() at least once for useful orchestration. Required unless `name` or `scriptPath` is given.",
     }),
   ),
   scriptPath: Type.Optional(
@@ -54,22 +54,17 @@ const workflowToolSchema = Type.Object({
   args: Type.Optional(
     Type.Any({ description: "Optional JSON value exposed to the workflow script as the global `args`." }),
   ),
-  budget: Type.Optional(
-    Type.Number({ description: "Optional output-token ceiling for this run; agent() calls throw once exhausted." }),
-  ),
   resumeFromRunId: Type.Optional(
     Type.String({
       description:
         "Resume a prior run: agent() calls with unchanged (prompt, opts) return cached results; the first changed/new call and everything after run live.",
     }),
   ),
-});
+}, { additionalProperties: false });
 
 export interface WorkflowToolDeps {
   /** Canonical runtime supplied by an SDK host; shared by all child sessions. */
   modelRuntime?: ModelRuntimeLike;
-  /** Default token budget from ultracode mode, if any. */
-  getDefaultBudget?: () => number | null;
   /** The ultracode effort level to forward to every workflow subagent as its
    *  default thinking level (`max` when ultracode is on, so each subagent's own
    *  session clamps it independently; undefined when off). A per-call
@@ -116,7 +111,6 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       const runsDir = workflowRunsDir(ctx);
       const requestedRunId = params.resumeFromRunId?.trim();
       const runId = requestedRunId ? requireSafeRunId(requestedRunId) : nextRunId();
-      const budgetTotal = params.budget ?? deps.getDefaultBudget?.() ?? null;
       // Forward the raw `max` request so each subagent session clamps it against
       // that subagent's model. Undefined when ultracode is off.
       const thinkingLevel = deps.getThinkingLevel?.();
@@ -152,7 +146,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       }
 
       // Snapshot + registry + abort plumbing.
-      let snapshot = createSnapshot(parsed.meta, runId, budgetTotal);
+      let snapshot = createSnapshot(parsed.meta, runId);
       const restoredDetails = resuming
         ? WorkflowRunDetails.restore(path.join(runsDir, `${runId}.details.json`))?.details
         : undefined;
@@ -202,7 +196,6 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           cwd,
           args: params.args,
           signal: controller.signal,
-          tokenBudget: budgetTotal,
           thinkingLevel,
           modelRegistry: ctx.modelRegistry as any,
           modelRuntime: deps.modelRuntime,
@@ -378,7 +371,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           details: { ...snapshot, runId, scriptPath, source: sourceLabel },
         };
       } catch (error) {
-        const aborted = controller.signal.aborted || isAbortError(error);
+        const aborted = controller.signal.aborted;
         acceptingEvents = false;
         if (!controller.signal.aborted) controller.abort();
         for (const agent of snapshot.agents) {
@@ -490,9 +483,6 @@ function safeJson(value: unknown): string {
   }
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && /\babort(?:ed)?\b/i.test(error.message);
-}
 
 function requireSafeRunId(value: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
