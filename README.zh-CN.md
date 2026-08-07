@@ -127,6 +127,8 @@ Worktree 隔离只能在至少有一个 commit 的 Git 仓库中使用。如果�
 
 工作流默认使用 `maxAgents: 128`，最多并发运行 16 个代理，并只允许一层嵌套工作流。累计代理上限会跨 resume 保留，缓存回放不会再次占用额度。
 
+Workflow 子代理会保留项目上下文和普通 skills，但不会初始化环境中的 Pi 扩展，也不会暴露父级编排工具与 skill（`workflow`、`subagent`、`subagent_wait` 或 `pi-subagents`）。这样可把编排限制在父会话边界，同时允许 `pi-ultracode` 与 `pi-subagents` 在主会话中共存。
+
 Resume 刻意保持不可变：脚本、参数、代理定义、实际模型和调用结构都必须匹配。工作内容发生变化时，应启动新的 run。
 
 Token 和成本只用于可观测性，不作为执行预算。Worker 与 VM 限制用于确定性和存活性保护，不是安全沙箱。

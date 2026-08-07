@@ -127,6 +127,8 @@ Worktree isolation requires a git repository with at least one commit. If setup 
 
 A workflow defaults to `maxAgents: 128`, supports at most 16 concurrent agent calls, and allows one level of nested workflows. The lifetime agent limit is preserved across resumes; cached replay does not consume it again.
 
+Workflow agent sessions retain project context and ordinary skills, but do not initialize ambient Pi extensions or expose parent orchestration tools and skills (`workflow`, `subagent`, `subagent_wait`, or `pi-subagents`). This keeps orchestration at the parent boundary and allows `pi-ultracode` and `pi-subagents` to coexist in the main session.
+
 Resume is intentionally immutable: the script, arguments, agent definitions, effective models, and call structure must still match. Changed work starts a new run.
 
 Token and cost data are reported for observability, not enforced as a budget. Worker and VM restrictions are determinism and liveness guards, not a security sandbox.

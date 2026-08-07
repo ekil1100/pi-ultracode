@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import {
   WorkflowAgentRunner,
+  createWorkflowChildResourceLoader,
   resolveModelSelection,
   matchModelIn,
   splitThinkingSuffix,
@@ -179,6 +181,127 @@ test("resolveSessionThinkingLevel uses max only when the model advertises it", (
   assert.equal(resolveSessionThinkingLevel("high", DEFAULT), "high");
 });
 
+test("workflow child resources exclude ambient orchestrators without dropping ordinary context", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-child-resources-"));
+  const cwd = path.join(root, "project");
+  const agentDir = path.join(root, "agent");
+  const extensionDir = path.join(agentDir, "extensions");
+  const orchestratorSkillDir = path.join(agentDir, "skills", "pi-subagents");
+  const ordinarySkillDir = path.join(agentDir, "skills", "ordinary");
+  const marker = "__ultracodeAmbientExtensionProbe";
+
+  try {
+    fs.mkdirSync(extensionDir, { recursive: true });
+    fs.mkdirSync(orchestratorSkillDir, { recursive: true });
+    fs.mkdirSync(ordinarySkillDir, { recursive: true });
+    fs.mkdirSync(cwd, { recursive: true });
+    fs.writeFileSync(
+      path.join(extensionDir, "ambient.ts"),
+      `export default function () { globalThis.${marker} = true; }\n`,
+    );
+    fs.writeFileSync(
+      path.join(orchestratorSkillDir, "SKILL.md"),
+      "---\nname: pi-subagents\ndescription: Parent-only orchestration.\n---\nDo not load.\n",
+    );
+    fs.writeFileSync(
+      path.join(ordinarySkillDir, "SKILL.md"),
+      "---\nname: ordinary\ndescription: Ordinary child guidance.\n---\nKeep this skill.\n",
+    );
+    const contextPath = path.join(cwd, "AGENTS.md");
+    fs.writeFileSync(contextPath, "Project child context.\n");
+    delete (globalThis as Record<string, unknown>)[marker];
+
+    const loader = await createWorkflowChildResourceLoader({ cwd, agentDir });
+
+    assert.equal(
+      (globalThis as Record<string, unknown>)[marker],
+      undefined,
+      "ambient extension factories must never run in workflow children",
+    );
+    assert.deepEqual(loader.getExtensions().extensions, []);
+    const skillNames = loader.getSkills().skills.map((skill) => skill.name);
+    assert.ok(skillNames.includes("ordinary"), "ordinary skills remain available");
+    assert.equal(skillNames.includes("pi-subagents"), false, "parent-only orchestration skill is hidden");
+    assert.ok(
+      loader.getAgentsFiles().agentsFiles.some((file) => file.path === contextPath),
+      "project context remains available",
+    );
+  } finally {
+    delete (globalThis as Record<string, unknown>)[marker];
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("production WorkflowAgentRunner wires sealed resources into the real Pi session", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-production-child-resources-"));
+  const cwd = path.join(root, "project");
+  const agentDir = path.join(root, "agent");
+  const extensionDir = path.join(agentDir, "extensions");
+
+  try {
+    fs.mkdirSync(extensionDir, { recursive: true });
+    fs.mkdirSync(cwd, { recursive: true });
+    fs.writeFileSync(
+      path.join(extensionDir, "ambient.ts"),
+      "export default function () { globalThis.__ultracodeProductionWireProbe = true; }\n",
+    );
+
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const runnerModuleUrl = new URL("../src/workflow/agent-runner.ts", import.meta.url).href;
+    const script = `
+      import { WorkflowAgentRunner } from ${JSON.stringify(runnerModuleUrl)};
+      const controller = new AbortController();
+      let sessionCreated = false;
+      let error = '';
+      try {
+        await new WorkflowAgentRunner({ cwd: process.env.PROBE_CWD }).run({
+          prompt: 'probe',
+          label: 'production wire',
+          signal: controller.signal,
+          onTelemetry(event) {
+            if (event.kind === 'model_resolved') {
+              sessionCreated = true;
+              controller.abort();
+            }
+          },
+        });
+      } catch (caught) {
+        error = caught instanceof Error ? caught.message : String(caught);
+      }
+      console.log(JSON.stringify({
+        extensionLoaded: globalThis.__ultracodeProductionWireProbe === true,
+        sessionCreated,
+        error,
+      }));
+    `;
+    const output = execFileSync(
+      process.execPath,
+      ["--experimental-strip-types", "--input-type=module", "--eval", script],
+      {
+        cwd: repoRoot,
+        encoding: "utf8",
+        timeout: 30_000,
+        env: {
+          ...process.env,
+          PI_CODING_AGENT_DIR: agentDir,
+          PROBE_CWD: cwd,
+        },
+      },
+    );
+    const result = JSON.parse(output.trim().split(/\r?\n/).at(-1)!) as {
+      extensionLoaded: boolean;
+      sessionCreated: boolean;
+      error: string;
+    };
+
+    assert.equal(result.sessionCreated, true, "the real Pi session must be created before the probe aborts");
+    assert.equal(result.extensionLoaded, false, "production wiring must not initialize ambient extensions");
+    assert.match(result.error, /Subagent was aborted/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("WorkflowAgentRunner shares one modern model runtime and replays public registry state", async () => {
   const runtimeModel = { ...DEFAULT, name: "Runtime Opus" };
   const providerConfig = { baseUrl: "https://proxy.example.test" };
@@ -248,7 +371,11 @@ test("WorkflowAgentRunner shares one modern model runtime and replays public reg
     assert.equal(options.modelRuntime, runtime);
     assert.equal("modelRegistry" in options, false, "modern sessions never receive the removed option");
     assert.equal(options.model, runtimeModel, "the selected model is rebound to the target runtime");
-    assert.deepEqual(options.excludeTools, ["workflow"], "workflow children cannot recursively launch workflows");
+    assert.deepEqual(
+      options.excludeTools,
+      ["workflow", "subagent", "subagent_wait"],
+      "workflow children cannot launch any orchestration tool",
+    );
   }
   assert.deepEqual(registered, [["custom", providerConfig]]);
   assert.deepEqual(refreshed, [{ allowNetwork: false }]);

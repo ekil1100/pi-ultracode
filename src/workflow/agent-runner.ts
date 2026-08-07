@@ -14,6 +14,7 @@ import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   createAgentSession,
   createCodingTools,
+  DefaultResourceLoader,
   getAgentDir,
   SessionManager,
   SettingsManager,
@@ -44,6 +45,42 @@ import {
 import type { AgentTypeDef } from "./agent-types.ts";
 
 export type { ThinkingLevel } from "../thinking.ts";
+
+const CHILD_ORCHESTRATION_TOOLS = ["workflow", "subagent", "subagent_wait"];
+const PARENT_ONLY_CHILD_SKILLS = new Set(["pi-subagents"]);
+
+export interface WorkflowChildResourceLoaderOptions {
+  cwd: string;
+  agentDir: string;
+  settingsManager?: SettingsManager;
+}
+
+/**
+ * Build the sealed resource view used by workflow agent sessions.
+ *
+ * Ambient extension factories execute during discovery, so filtering an already
+ * loaded extension result is too late: another in-process orchestrator may have
+ * already replaced process-global lifecycle state. Disable ambient extensions at
+ * the loader boundary while retaining project context and ordinary skills.
+ */
+export async function createWorkflowChildResourceLoader(
+  options: WorkflowChildResourceLoaderOptions,
+): Promise<DefaultResourceLoader> {
+  const settingsManager = options.settingsManager
+    ?? SettingsManager.create(options.cwd, options.agentDir);
+  const loader = new DefaultResourceLoader({
+    cwd: options.cwd,
+    agentDir: options.agentDir,
+    settingsManager,
+    noExtensions: true,
+    skillsOverride: ({ skills, diagnostics }) => ({
+      skills: skills.filter((skill) => !PARENT_ONLY_CHILD_SKILLS.has(skill.name)),
+      diagnostics,
+    }),
+  });
+  await loader.reload();
+  return loader;
+}
 
 /** A minimal structural view of a Pi model (avoids importing the heavy generic type). */
 export interface ModelLike {
@@ -192,7 +229,10 @@ export interface WorkflowAgentRunnerOptions {
   model?: ModelLike;
   /** Default thinking level for subagents. */
   thinkingLevel?: ThinkingLevel;
-  /** Test seam for session construction and initialization races. */
+  /**
+   * Test seam for session construction and initialization races. Custom
+   * factories own resource isolation; production uses the sealed Pi loader.
+   */
   createSession?: AgentSessionFactory;
   /** Test/compatibility seam for async ModelRuntime initialization. */
   createModelRuntime?: ModelRuntimeFactory;
@@ -243,6 +283,7 @@ export class WorkflowAgentRunner {
   private readonly defaultModel?: ModelLike;
   private readonly defaultThinking?: ThinkingLevel;
   private readonly createSession: AgentSessionFactory;
+  private readonly usesPiSessionFactory: boolean;
   private readonly createModelRuntime?: ModelRuntimeFactory;
   private modelRuntimePromise?: Promise<ModelRuntimeLike | undefined>;
   private readonly runtimeSupportsMaxThinking: boolean;
@@ -253,10 +294,10 @@ export class WorkflowAgentRunner {
     this.providedModelRuntime = options.modelRuntime;
     this.defaultModel = options.model;
     this.defaultThinking = options.thinkingLevel;
-    const usesPiSessionFactory = options.createSession === undefined;
+    this.usesPiSessionFactory = options.createSession === undefined;
     this.createSession = options.createSession ?? (createAgentSession as unknown as AgentSessionFactory);
     this.createModelRuntime = options.createModelRuntime
-      ?? (options.modelRuntime !== undefined || !usesPiSessionFactory ? undefined : createPiModelRuntime);
+      ?? (options.modelRuntime !== undefined || !this.usesPiSessionFactory ? undefined : createPiModelRuntime);
     this.runtimeSupportsMaxThinking = options.supportsMaxThinking ?? piVersionSupportsMaxThinking(PI_VERSION);
   }
 
@@ -304,22 +345,29 @@ export class WorkflowAgentRunner {
       throw error;
     }
 
-    const createSession = (level: ThinkingLevel | undefined) => this.createSession({
-      cwd,
-      agentDir,
-      sessionManager: SessionManager.inMemory(cwd),
-      settingsManager: SettingsManager.create(cwd, agentDir),
-      customTools,
-      excludeTools: ["workflow"],
-      ...(model ? { model: model as any } : {}),
-      ...(level ? { thinkingLevel: level as any } : {}),
-      ...(toolAllowlist ? { tools: toolAllowlist } : {}),
-      ...(modelRuntime
-        ? { modelRuntime }
-        : this.modelRegistry
-          ? { modelRegistry: this.modelRegistry as any }
-          : {}),
-    });
+    const createSession = async (level: ThinkingLevel | undefined) => {
+      const settingsManager = SettingsManager.create(cwd, agentDir);
+      const resourceLoader = this.usesPiSessionFactory
+        ? await createWorkflowChildResourceLoader({ cwd, agentDir, settingsManager })
+        : undefined;
+      return this.createSession({
+        cwd,
+        agentDir,
+        sessionManager: SessionManager.inMemory(cwd),
+        settingsManager,
+        ...(resourceLoader ? { resourceLoader } : {}),
+        customTools,
+        excludeTools: [...CHILD_ORCHESTRATION_TOOLS],
+        ...(model ? { model: model as any } : {}),
+        ...(level ? { thinkingLevel: level as any } : {}),
+        ...(toolAllowlist ? { tools: toolAllowlist } : {}),
+        ...(modelRuntime
+          ? { modelRuntime }
+          : this.modelRegistry
+            ? { modelRegistry: this.modelRegistry as any }
+            : {}),
+      });
+    };
 
     const sessionThinking = resolveSessionThinkingLevel(thinkingLevel, model);
     safeEmitTelemetry(call.onTelemetry, {
