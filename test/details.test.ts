@@ -724,7 +724,7 @@ test("registry preserves active handles when switching session scopes", () => {
   }
 });
 
-test("workflow overlay renders responsive task stats and consumes Escape before closing", () => {
+test("workflow overlay renders responsive task stats and routes navigation in regular and fullscreen TUI", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-overlay-"));
   const registry = new WorkflowRegistry();
   registry.setScope(root);
@@ -749,7 +749,7 @@ test("workflow overlay renders responsive task stats and consumes Escape before 
 
   let renders = 0;
   let closed = 0;
-  const tui: any = { terminal: { columns: 120, rows: 40 }, requestRender: () => { renders++; } };
+  const tui: any = { mode: "regular", terminal: { columns: 120, rows: 40 }, requestRender: () => { renders++; } };
   const component = new WorkflowOverlayComponent({ tui, theme: plainTheme, registry, preferredRunId: "wf_overlay", onClose: () => { closed++; } });
   const text = component.render(120).join("\n");
   assert.match(text, /gpt-5\.6-sol • max/);
@@ -765,7 +765,7 @@ test("workflow overlay renders responsive task stats and consumes Escape before 
   assert.equal(closed, 1, "a second Escape closes the overlay");
   component.dispose();
 
-  const narrowTui: any = { terminal: { columns: 70, rows: 30 }, requestRender: () => {} };
+  const narrowTui: any = { mode: "regular", terminal: { columns: 70, rows: 30 }, requestRender: () => {} };
   const narrow = new WorkflowOverlayComponent({ tui: narrowTui, theme: plainTheme, registry, preferredRunId: "wf_overlay", onClose: () => {} });
   assert.doesNotMatch(narrow.render(70).join("\n"), /streaming output/);
   narrow.handleInput("\r");
@@ -773,5 +773,38 @@ test("workflow overlay renders responsive task stats and consumes Escape before 
   narrow.handleInput("\u001b");
   assert.doesNotMatch(narrow.render(70).join("\n"), /streaming output/, "Escape returns to the narrow task list");
   narrow.dispose();
+
+  for (let id = 2; id <= 12; id++) {
+    details.startTask({ id, callPath: `$/task-${id}`, label: `task-${id}`, phase: "Verify", prompt: "p" });
+    details.finishTask(id, { status: "done", result: `result-${id}` });
+  }
+  const fullscreenTui: any = {
+    mode: "fullscreen",
+    terminal: { columns: 120, rows: 40 },
+    requestRender: () => {},
+  };
+  const fullscreen = new WorkflowOverlayComponent({
+    tui: fullscreenTui,
+    theme: plainTheme,
+    registry,
+    preferredRunId: "wf_overlay",
+    onClose: () => {},
+  });
+  let fullscreenText = fullscreen.render(120).join("\n");
+  assert.match(fullscreenText, /Ctrl\+PgUp\/Dn scroll.*Ctrl\+End follow/);
+  assert.match(fullscreenText, /#1 payments/);
+  fullscreen.handleInput("\u001b[6^");
+  fullscreenText = fullscreen.render(120).join("\n");
+  assert.match(fullscreenText, /#11 task-11/, "Ctrl+PageDown pages the fullscreen task list");
+
+  fullscreen.handleInput("\t");
+  fullscreen.handleInput("\u001b[5^");
+  assert.match(fullscreen.render(120).join("\n"), /Ctrl\+End to follow/, "Ctrl+PageUp leaves follow mode");
+  fullscreen.handleInput("\u001b[6^");
+  assert.match(fullscreen.render(120).join("\n"), /Ctrl\+End to follow/, "Ctrl+PageDown keeps manual scrolling active");
+  fullscreen.handleInput("\u001b[8^");
+  assert.match(fullscreen.render(120).join("\n"), /Ctrl\+End follow/, "Ctrl+End restores fullscreen follow mode");
+  fullscreen.dispose();
+
   fs.rmSync(root, { recursive: true, force: true });
 });

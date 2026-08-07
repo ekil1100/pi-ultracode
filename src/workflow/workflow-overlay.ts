@@ -24,6 +24,12 @@ const MIN_SPLIT_WIDTH = 100;
 const MAX_RENDER_FPS_INTERVAL_MS = 100;
 let overlayOpen = false;
 
+type OverlayNavigationKey = "pageUp" | "pageDown" | "end";
+
+function matchesOverlayNavigationKey(data: string, key: OverlayNavigationKey): boolean {
+  return matchesKey(data, key) || matchesKey(data, `ctrl+${key}`);
+}
+
 interface TaskViewport {
   offset: number;
   follow: boolean;
@@ -318,8 +324,8 @@ export class WorkflowOverlayComponent implements Component {
     if (currentIndex >= 0) this.selectedTaskIndex = currentIndex;
     if (matchesKey(data, "up")) this.selectedTaskIndex = Math.max(0, this.selectedTaskIndex - 1);
     else if (matchesKey(data, "down")) this.selectedTaskIndex = Math.min(tasks.length - 1, this.selectedTaskIndex + 1);
-    else if (matchesKey(data, "pageUp")) this.selectedTaskIndex = Math.max(0, this.selectedTaskIndex - 10);
-    else if (matchesKey(data, "pageDown")) this.selectedTaskIndex = Math.min(tasks.length - 1, this.selectedTaskIndex + 10);
+    else if (matchesOverlayNavigationKey(data, "pageUp")) this.selectedTaskIndex = Math.max(0, this.selectedTaskIndex - 10);
+    else if (matchesOverlayNavigationKey(data, "pageDown")) this.selectedTaskIndex = Math.min(tasks.length - 1, this.selectedTaskIndex + 10);
     else if (matchesKey(data, "enter") || matchesKey(data, "return")) {
       if (split) this.focus = "detail";
       else {
@@ -341,13 +347,13 @@ export class WorkflowOverlayComponent implements Component {
     } else if (matchesKey(data, "down")) {
       viewport.offset++;
       viewport.follow = false;
-    } else if (matchesKey(data, "pageUp")) {
+    } else if (matchesOverlayNavigationKey(data, "pageUp")) {
       viewport.offset = Math.max(0, viewport.offset - page);
       viewport.follow = false;
-    } else if (matchesKey(data, "pageDown")) {
+    } else if (matchesOverlayNavigationKey(data, "pageDown")) {
       viewport.offset += page;
       viewport.follow = false;
-    } else if (matchesKey(data, "end")) {
+    } else if (matchesOverlayNavigationKey(data, "end")) {
       viewport.follow = true;
       viewport.newLines = 0;
     }
@@ -456,9 +462,13 @@ export class WorkflowOverlayComponent implements Component {
       viewport.offset = Math.max(0, Math.min(viewport.offset, maxOffset));
     }
     const visible = body.slice(viewport.offset, viewport.offset + bodyHeight);
+    // Fullscreen owns unmodified paging keys before focused overlays receive input.
+    // Ctrl variants remain routed to the overlay under Pi 0.84's default bindings.
+    const pageKeys = this.tui.mode === "fullscreen" ? "Ctrl+PgUp/Dn" : "PgUp/Dn";
+    const endKey = this.tui.mode === "fullscreen" ? "Ctrl+End" : "End";
     const footer = viewport.follow
-      ? "↑↓/PgUp scroll · End follow · p prompt · Tab tasks · Esc back"
-      : `↓ ${viewport.newLines} new lines · End to follow`;
+      ? `↑↓/${pageKeys} scroll · ${endKey} follow · p prompt · Tab tasks · Esc back`
+      : `↓ ${viewport.newLines} new lines · ${endKey} to follow`;
     return fitHeight([...fixed, "", ...visible, this.theme.fg("dim", footer)], height);
   }
 

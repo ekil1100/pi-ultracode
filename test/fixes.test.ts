@@ -146,6 +146,27 @@ test("matchModelIn: empty/whitespace pattern does not match (returns undefined, 
   assert.equal(matchModelIn(MODELS, "anthropic/claude-opus")?.id, "claude-opus");
 });
 
+test("bare exact model ids reject ambiguity across available providers", () => {
+  const duplicated = [
+    { provider: "alpha", id: "shared-model", name: "Alpha Shared" },
+    { provider: "beta", id: "shared-model", name: "Beta Shared" },
+  ];
+  assert.throws(
+    () => matchModelIn(duplicated, "shared-model"),
+    /ambiguous.*alpha\/shared-model.*beta\/shared-model.*provider\/model/i,
+  );
+  assert.equal(matchModelIn(duplicated, "beta/shared-model"), duplicated[1]);
+  assert.throws(
+    () => resolveModelSelection({
+      pattern: "shared-model:high",
+      defaultModel: DEFAULT,
+      models: duplicated,
+    }),
+    /ambiguous.*provider\/model/i,
+    "a thinking suffix must not turn an ambiguous exact id into a catalog-order choice",
+  );
+});
+
 test("resolveSessionThinkingLevel uses max only when the model advertises it", () => {
   const maxModel = {
     ...DEFAULT,

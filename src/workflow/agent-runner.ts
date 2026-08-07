@@ -619,9 +619,27 @@ export function resolveSessionThinkingLevel(
 
 function matchExactModelIn(models: ModelLike[] | undefined, pattern: string): ModelLike | undefined {
   if (!models || !pattern.trim()) return undefined;
-  const lower = pattern.trim().toLowerCase();
-  return models.find((m) => `${m.provider}/${m.id}`.toLowerCase() === lower)
-    ?? models.find((m) => m.id.toLowerCase() === lower);
+  const trimmed = pattern.trim();
+  const lower = trimmed.toLowerCase();
+  const canonicalMatches = models.filter((model) =>
+    `${model.provider}/${model.id}`.toLowerCase() === lower
+  );
+  if (canonicalMatches.length === 1) return canonicalMatches[0];
+  if (canonicalMatches.length > 1) throw ambiguousModelReferenceError(trimmed, canonicalMatches);
+
+  const idMatches = models.filter((model) => model.id.toLowerCase() === lower);
+  if (idMatches.length === 1) return idMatches[0];
+  if (idMatches.length > 1) throw ambiguousModelReferenceError(trimmed, idMatches);
+  return undefined;
+}
+
+function ambiguousModelReferenceError(pattern: string, matches: ModelLike[]): Error {
+  const references = [...new Set(matches.map((model) => `${model.provider}/${model.id}`))]
+    .sort((left, right) => left.localeCompare(right))
+    .join(", ");
+  return new Error(
+    `Model "${safeDisplayText(pattern, 80)}" is ambiguous across providers: ${safeDisplayText(references, 400)}. Use provider/model.`,
+  );
 }
 
 /** Match a model pattern against a registry list: exact provider/id, then exact id, then substring. */
