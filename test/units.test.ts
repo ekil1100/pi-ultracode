@@ -2,12 +2,32 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as os from "node:os";
 import * as fs from "node:fs";
+import fsDefault from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import * as path from "node:path";
 import { jsonSchemaToTypeBox } from "../src/workflow/json-schema.ts";
+import { Check } from "typebox/value";
+import { createStructuredOutputTool } from "../src/workflow/structured-output.ts";
 import { parseFrontmatter, parseAgentTypeFile, discoverAgentTypes, resolveAgentType } from "../src/workflow/agent-types.ts";
-import { agentCallKey, hashString, stableStringify, RunJournal } from "../src/workflow/journal.ts";
+import {
+  agentCallKey,
+  hashString,
+  MAX_JOURNAL_BYTES,
+  stableStringify,
+  RunJournal,
+} from "../src/workflow/journal.ts";
 import { UltracodeMode } from "../src/mode.ts";
 import { piVersionSupportsMaxThinking } from "../src/thinking.ts";
+import { acquireWorkflowLease, activeWorkflowCount, clearWorkflowLeasesForTests } from "../src/workflow/leases.ts";
+import { writeArtifactFile } from "../src/workflow/run-artifacts.ts";
+import {
+  assertStructuredOutputLimit,
+  assertWorkflowArgsLimit,
+  assertWorkflowSchemaLimit,
+  MAX_STRUCTURED_OUTPUT_BYTES,
+  MAX_WORKFLOW_ARGS_BYTES,
+  MAX_WORKFLOW_SCHEMA_BYTES,
+} from "../src/workflow/value-limits.ts";
 
 /** Minimal ExtensionAPI stub with mutable per-request clamp behavior. */
 function miniPi(clamps: Record<string, string> = {}) {
@@ -25,6 +45,100 @@ function miniPi(clamps: Record<string, string> = {}) {
   };
   return { api, s, clamps };
 }
+
+test("workflow value limits bound args, schemas, patterns, and structured output", () => {
+  assert.doesNotThrow(() => assertWorkflowArgsLimit({ value: "ok" }));
+  assert.throws(
+    () => assertWorkflowArgsLimit("x".repeat(MAX_WORKFLOW_ARGS_BYTES)),
+    /args.*1048576 bytes/i,
+  );
+  assert.throws(
+    () => assertWorkflowSchemaLimit({ description: "x".repeat(MAX_WORKFLOW_SCHEMA_BYTES) }),
+    /schema.*262144 bytes/i,
+  );
+  assert.throws(
+    () => assertWorkflowArgsLimit(new Map([["large", "x".repeat(MAX_WORKFLOW_ARGS_BYTES)]])),
+    /workflow args.*plain JSON/i,
+  );
+  assert.throws(
+    () => assertWorkflowArgsLimit(new ArrayBuffer(MAX_WORKFLOW_ARGS_BYTES + 1)),
+    /workflow args.*plain JSON/i,
+  );
+  assert.throws(
+    () => assertWorkflowArgsLimit({ value: -0 }),
+    /negative zero is unsupported/i,
+  );
+  assert.throws(
+    () => assertWorkflowArgsLimit(new Array(1_000_000)),
+    /arrays must not be sparse/,
+  );
+  assert.throws(
+    () => assertWorkflowArgsLimit(new Array(65_537).fill(null)),
+    /exceeds 65536 JSON nodes/,
+  );
+  let sharedDag: unknown = "x";
+  for (let depth = 0; depth < 30; depth++) sharedDag = [sharedDag, sharedDag];
+  assert.throws(
+    () => assertWorkflowArgsLimit(sharedDag),
+    /JSON tree.*repeated object references/,
+  );
+  assert.throws(
+    () => assertWorkflowSchemaLimit({ type: "string", pattern: "^(a+){20}$" }),
+    /schema pattern is not supported/i,
+  );
+  assert.throws(
+    () => assertWorkflowSchemaLimit({ $ref: "https://example.com/schema.json" }),
+    /\$ref.*not supported/i,
+  );
+  assert.throws(
+    () => assertWorkflowSchemaLimit({ patternProperties: { "^(a+)+$": { type: "string" } } }),
+    /patternProperties.*not supported/i,
+  );
+  assert.throws(
+    () => assertWorkflowSchemaLimit({ $dynamicRef: "#node" }),
+    /\$dynamicRef.*not supported/i,
+  );
+  assert.throws(
+    () => assertWorkflowSchemaLimit({ type: "string", unknownConstraint: true }),
+    /unsupported keyword unknownConstraint/i,
+  );
+  assert.doesNotThrow(() => assertWorkflowSchemaLimit({
+    type: "object",
+    properties: {
+      pattern: { type: "string" },
+      $ref: { type: "number" },
+    },
+  }));
+  let deepSchema: unknown = { type: "string" };
+  for (let depth = 0; depth < 70; depth++) deepSchema = { items: deepSchema };
+  assert.throws(
+    () => assertWorkflowSchemaLimit(deepSchema),
+    /schema exceeds the 64-level nesting limit/i,
+  );
+  assert.throws(
+    () => assertStructuredOutputLimit({ value: "x".repeat(MAX_STRUCTURED_OUTPUT_BYTES) }),
+    /structured output.*2097152 bytes/i,
+  );
+});
+
+test("structured output rejects oversized values before capture", async () => {
+  const capture: any = { called: false, value: undefined };
+  const tool = createStructuredOutputTool({
+    schema: jsonSchemaToTypeBox({ type: "object" }),
+    capture,
+  });
+  await assert.rejects(
+    (tool.execute as any)(
+      "structured-limit",
+      { value: "x".repeat(MAX_STRUCTURED_OUTPUT_BYTES) },
+      undefined,
+      undefined,
+      {},
+    ),
+    /workflow structured output exceeds 2097152 bytes/,
+  );
+  assert.equal(capture.called, false);
+});
 
 test("jsonSchemaToTypeBox builds an object schema with required/optional", () => {
   const schema = jsonSchemaToTypeBox({
@@ -48,6 +162,72 @@ test("jsonSchemaToTypeBox handles arrays", () => {
   const schema = jsonSchemaToTypeBox({ type: "array", items: { type: "string" } }) as any;
   assert.equal(schema.type, "array");
   assert.equal(schema.items.type, "string");
+});
+
+test("jsonSchemaToTypeBox preserves object and array enum/const values", () => {
+  const objectConst = jsonSchemaToTypeBox({ const: { a: 1 } }) as any;
+  assert.equal(Check(objectConst, { a: 1 }), true);
+  assert.equal(Check(objectConst, { a: 2 }), false);
+
+  const arrayEnum = jsonSchemaToTypeBox({ enum: [[1, 2], { kind: "ok" }] }) as any;
+  assert.equal(Check(arrayEnum, [1, 2]), true);
+  assert.equal(Check(arrayEnum, [1, 3]), false);
+  assert.equal(Check(arrayEnum, { kind: "ok" }), true);
+});
+
+test("tuple-form items retain JSON Schema's default extra-item semantics", () => {
+  const schema = jsonSchemaToTypeBox({
+    type: "array",
+    items: [{ type: "string" }],
+  }) as any;
+  assert.equal(schema.additionalItems, true);
+  assert.equal(Check(schema, []), true);
+  assert.equal(Check(schema, ["ok", 42]), true);
+  assert.equal(Check(schema, [1]), false);
+});
+
+test("jsonSchemaToTypeBox preserves every supported numeric constraint", () => {
+  const schema = jsonSchemaToTypeBox({
+    type: "number",
+    minimum: 1,
+    maximum: 9,
+    exclusiveMinimum: 0,
+    exclusiveMaximum: 10,
+    multipleOf: 0.5,
+  }) as any;
+  assert.equal(schema.minimum, 1);
+  assert.equal(schema.maximum, 9);
+  assert.equal(schema.exclusiveMinimum, 0);
+  assert.equal(schema.exclusiveMaximum, 10);
+  assert.equal(schema.multipleOf, 0.5);
+});
+
+test("jsonSchemaToTypeBox preserves the __proto__ property as an own constraint", () => {
+  const properties = JSON.parse('{"__proto__":{"type":"string"}}');
+  const schema = jsonSchemaToTypeBox({
+    type: "object",
+    properties,
+    required: ["__proto__"],
+    additionalProperties: false,
+  }) as any;
+  assert.equal(Object.hasOwn(schema.properties, "__proto__"), true);
+  assert.equal(Check(schema, JSON.parse('{"__proto__":"ok"}')), true);
+  assert.equal(Check(schema, {}), false);
+  assert.equal(Check(schema, JSON.parse('{"__proto__":42}')), false);
+});
+
+test("jsonSchemaToTypeBox permits data fields named like forbidden schema keywords", () => {
+  const schema = jsonSchemaToTypeBox({
+    type: "object",
+    properties: {
+      pattern: { type: "string" },
+      $ref: { type: "number" },
+    },
+    required: ["pattern", "$ref"],
+  }) as any;
+  assert.ok(schema.properties.pattern);
+  assert.ok(schema.properties.$ref);
+  assert.deepEqual(schema.required.sort(), ["$ref", "pattern"]);
 });
 
 test("parseFrontmatter parses key/values and block scalars", () => {
@@ -88,21 +268,390 @@ test("hash + stableStringify are stable and key-order independent", () => {
   assert.equal(typeof hashString("abc"), "string");
 });
 
+test("artifact writes reject symlinked parent directories below their trusted root", {
+  skip: process.platform === "win32",
+}, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-artifact-root-"));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "uc-artifact-outside-"));
+  try {
+    fs.symlinkSync(outside, path.join(root, "bridge"), "dir");
+    assert.throws(
+      () => writeArtifactFile(
+        path.join(root, "bridge", "nested", "value.json"),
+        "value",
+        { trustedRoot: root },
+      ),
+      /real directory|symlink/i,
+    );
+    assert.equal(fs.existsSync(path.join(outside, "nested")), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
 test("RunJournal records and looks up cached agents on resume", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-"));
   const runId = "wf_x";
   const j = RunJournal.create(dir, { type: "run", runId, name: "n", scriptHash: "1", startedAt: 0 });
-  j.recordAgent({ seq: 1, key: "k1", label: "a", value: "v1", outputTokens: 5 });
-  j.recordAgent({ seq: 2, key: "k2", label: "b", value: { x: 1 }, outputTokens: 6 });
+  j.recordAdmission("$/a:0", "k1", 1);
+  j.recordAgent({ callPath: "$/a:0", seq: 1, key: "k1", label: "a", value: "v1", outputTokens: 5 });
+  j.recordAdmission("$/a:1", "k2", 2);
+  j.recordAgent({ callPath: "$/a:1", seq: 2, key: "k2", label: "b", value: { x: 1 }, outputTokens: 6 });
   j.close();
 
   const r = RunJournal.resume(dir, runId, { type: "run", runId, name: "n", scriptHash: "1", startedAt: 1 });
-  assert.equal(r.lookup(1, "k1")?.value, "v1");
-  assert.deepEqual(r.lookup(2, "k2")?.value, { x: 1 });
-  assert.equal(r.lookup(1, "different-key"), undefined, "key mismatch is a cache miss");
-  assert.equal(r.lookup(3, "k3"), undefined);
+  assert.equal(r.lookup("$/a:0", "k1")?.value, "v1");
+  assert.deepEqual(r.lookup("$/a:1", "k2")?.value, { x: 1 });
+  assert.throws(() => r.lookup("$/a:0", "different-key"), /diverged/);
+  assert.equal(r.lookup("$/a:2", "k3"), undefined);
   r.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("RunJournal treats JSON object key order as part of immutable args", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-args-order-"));
+  const runId = "wf_args_order";
+  try {
+    const journal = RunJournal.create(dir, {
+      type: "run",
+      runId,
+      name: "args_order",
+      scriptHash: "1",
+      args: { a: 1, b: 2 },
+      startedAt: 0,
+    });
+    journal.close();
+    assert.throws(
+      () => RunJournal.resume(dir, runId, {
+        type: "run",
+        runId,
+        name: "args_order",
+        scriptHash: "1",
+        args: { b: 2, a: 1 },
+        startedAt: 1,
+      }),
+      /immutable args/i,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal rejects a conflicting panel definition before append", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-panel-definition-"));
+  const runId = "wf_panel_definition";
+  try {
+    const journal = RunJournal.create(dir, {
+      type: "run", runId, name: "panel_definition", scriptHash: "1", startedAt: 0,
+    });
+    journal.recordPanelOpen("$/p:0", 1, 1);
+    const before = fs.readFileSync(journal.filePath, "utf8");
+    assert.throws(
+      () => journal.recordPanelOpen("$/p:0", 2, 2),
+      /immutable panel definition changed/i,
+    );
+    assert.equal(fs.readFileSync(journal.filePath, "utf8"), before);
+    journal.close();
+    const resumed = RunJournal.resume(dir, runId, {
+      type: "run", runId, name: "panel_definition", scriptHash: "1", startedAt: 1,
+    });
+    resumed.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal rechecks final panel admissions before completion", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-panel-final-admission-"));
+  try {
+    const journal = RunJournal.create(dir, {
+      type: "run", runId: "wf_panel_final_admission", name: "panel_final_admission", scriptHash: "1", startedAt: 0,
+    });
+    journal.recordPanelOpen("$/p:0", 2, 2);
+    journal.recordPanelBranch("$/p:0", 0, "success", []);
+    journal.recordPanelBranch("$/p:0", 1, "success", []);
+    journal.recordAdmission("$/p:0/b:1/a:0", "k", 1);
+    const before = fs.readFileSync(journal.filePath, "utf8");
+    assert.throws(
+      () => journal.recordPanelComplete("$/p:0", 2, ["success", "success"], []),
+      /invalid panel-branch record/i,
+    );
+    assert.equal(fs.readFileSync(journal.filePath, "utf8"), before);
+    journal.close();
+    assert.throws(
+      () => RunJournal.resume(dir, "wf_panel_final_admission", {
+        type: "run",
+        runId: "wf_panel_final_admission",
+        name: "panel_final_admission",
+        scriptHash: "1",
+        startedAt: 1,
+      }),
+      /invalid panel-branch record/i,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal poisons the descriptor after a partial append failure", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-poison-"));
+  const runId = "wf_poison";
+  const journal = RunJournal.create(dir, {
+    type: "run", runId, name: "poison", scriptHash: "1", startedAt: 0,
+  });
+  const originalWrite = fsDefault.writeFileSync;
+  let injected = false;
+  try {
+    (fsDefault as any).writeFileSync = (target: any, data: any, ...rest: any[]) => {
+      if (!injected && target === (journal as any).fd) {
+        injected = true;
+        const text = String(data);
+        (originalWrite as any)(target, text.slice(0, Math.max(1, Math.floor(text.length / 2))), ...rest);
+        throw new Error("synthetic partial write");
+      }
+      return (originalWrite as any).call(fsDefault, target, data, ...rest);
+    };
+    syncBuiltinESMExports();
+    assert.throws(
+      () => journal.recordAdmission("$/a:0", "k", 1),
+      /journal write failed.*synthetic partial write/i,
+    );
+  } finally {
+    (fsDefault as any).writeFileSync = originalWrite;
+    syncBuiltinESMExports();
+  }
+  try {
+    const poisonedSize = fs.statSync(journal.filePath).size;
+    assert.throws(
+      () => journal.recordResult({ ok: false, error: "must not append", agentCount: 0, durationMs: 0 }),
+      /synthetic partial write/i,
+    );
+    assert.equal(fs.statSync(journal.filePath).size, poisonedSize);
+    assert.throws(() => journal.close(), /synthetic partial write/i);
+
+    const resumed = RunJournal.resume(dir, runId, {
+      type: "run", runId, name: "poison", scriptHash: "1", startedAt: 1,
+    });
+    assert.equal(resumed.agentsUsed, 0);
+    resumed.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal preserves a close fsync failure across retries", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-close-fsync-"));
+  const journal = RunJournal.create(dir, {
+    type: "run", runId: "wf_close_fsync", name: "close_fsync", scriptHash: "1", startedAt: 0,
+  });
+  const originalFsync = fsDefault.fsyncSync;
+  let injected = false;
+  try {
+    (fsDefault as any).fsyncSync = (fd: number) => {
+      if (!injected && fd === (journal as any).fd) {
+        injected = true;
+        throw new Error("synthetic close fsync failure");
+      }
+      return originalFsync.call(fsDefault, fd);
+    };
+    syncBuiltinESMExports();
+    assert.throws(() => journal.close(), /synthetic close fsync failure/);
+  } finally {
+    (fsDefault as any).fsyncSync = originalFsync;
+    syncBuiltinESMExports();
+  }
+  try {
+    assert.throws(() => journal.close(), /synthetic close fsync failure/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal rejects invalid metadata before writing a self-corrupting record", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-invalid-write-"));
+  try {
+    assert.throws(
+      () => RunJournal.create(dir, {
+        type: "run",
+        runId: "wf_invalid_create",
+        name: "invalid_create",
+        scriptHash: "1",
+        startedAt: Number.NaN,
+      }),
+      /invalid run header/i,
+    );
+    assert.equal(fs.existsSync(path.join(dir, "wf_invalid_create.jsonl")), false);
+
+    const runId = "wf_invalid_resume";
+    const journal = RunJournal.create(dir, {
+      type: "run", runId, name: "valid", scriptHash: "1", startedAt: 0,
+    });
+    journal.close();
+    const before = fs.readFileSync(journal.filePath, "utf8");
+    assert.throws(
+      () => RunJournal.resume(dir, runId, {
+        type: "run", runId, name: "valid", scriptHash: "1", startedAt: Number.NaN,
+      }),
+      /invalid run header|invalid resume/i,
+    );
+    assert.equal(fs.readFileSync(journal.filePath, "utf8"), before);
+    const resumed = RunJournal.resume(dir, runId, {
+      type: "run", runId, name: "valid", scriptHash: "1", startedAt: 1,
+    });
+    resumed.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal rejects semantically corrupt cached agent records", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-corrupt-agent-"));
+  const runId = "wf_corrupt_agent";
+  try {
+    const journal = RunJournal.create(dir, {
+      type: "run", runId, name: "corrupt", scriptHash: "1", startedAt: 0,
+    });
+    journal.recordAdmission("$/a:0", "k", 1);
+    journal.close();
+    fs.appendFileSync(journal.filePath, `${JSON.stringify({
+      type: "agent",
+      callPath: "$/a:0",
+      seq: 1,
+      key: "k",
+      label: "bad",
+      value: "value",
+      outputTokens: "not-a-number",
+    })}\n`);
+    assert.throws(
+      () => RunJournal.resume(dir, runId, {
+        type: "run", runId, name: "corrupt", scriptHash: "1", startedAt: 1,
+      }),
+      /invalid agent record/i,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal rejects an append before it would exceed the restore cap", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-cap-"));
+  const runId = "wf_cap";
+  try {
+    const journal = RunJournal.create(dir, {
+      type: "run", runId, name: "cap", scriptHash: "1", startedAt: 0,
+    });
+    const sizeBefore = fs.statSync(journal.filePath).size;
+    assert.throws(
+      () => journal.recordResult({
+        ok: false,
+        error: "x".repeat(MAX_JOURNAL_BYTES),
+        agentCount: 0,
+        durationMs: 0,
+      }),
+      /journal full|exceed.*byte cap/i,
+    );
+    assert.equal(fs.statSync(journal.filePath).size, sizeBefore);
+    journal.close();
+    const resumed = RunJournal.resume(dir, runId, {
+      type: "run", runId, name: "cap", scriptHash: "1", startedAt: 1,
+    });
+    resumed.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal resume discards only a torn final JSONL record", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-torn-"));
+  const runId = "wf_torn";
+  try {
+    const journal = RunJournal.create(dir, {
+      type: "run", runId, name: "torn", scriptHash: "1", startedAt: 0,
+    });
+    journal.close();
+    fs.appendFileSync(journal.filePath, '{"type":"result","ok":');
+
+    const resumed = RunJournal.resume(dir, runId, {
+      type: "run", runId, name: "torn", scriptHash: "1", startedAt: 1,
+    });
+    resumed.close();
+    const lines = fs.readFileSync(journal.filePath, "utf8").trim().split("\n");
+    assert.doesNotThrow(() => lines.map((line) => JSON.parse(line)));
+    assert.equal(lines.some((line) => line.includes('"type":"resume"')), true);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal terminates a valid final record but rejects corruption before EOF", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-tail-rules-"));
+  try {
+    const validRunId = "wf_valid_tail";
+    const valid = RunJournal.create(dir, {
+      type: "run", runId: validRunId, name: "valid", scriptHash: "1", startedAt: 0,
+    });
+    valid.close();
+    fs.appendFileSync(valid.filePath, JSON.stringify({
+      type: "result", ok: true, result: 1, agentCount: 0, durationMs: 0,
+    }));
+    const resumed = RunJournal.resume(dir, validRunId, {
+      type: "run", runId: validRunId, name: "valid", scriptHash: "1", startedAt: 1,
+    });
+    resumed.close();
+    assert.doesNotThrow(() => fs.readFileSync(valid.filePath, "utf8").trim().split("\n").map((line) => JSON.parse(line)));
+
+    const invalidRunId = "wf_invalid_middle";
+    const invalid = RunJournal.create(dir, {
+      type: "run", runId: invalidRunId, name: "invalid", scriptHash: "1", startedAt: 0,
+    });
+    invalid.close();
+    fs.appendFileSync(invalid.filePath, "not-json\n");
+    assert.throws(
+      () => RunJournal.resume(dir, invalidRunId, {
+        type: "run", runId: invalidRunId, name: "invalid", scriptHash: "1", startedAt: 1,
+      }),
+      /invalid JSON on line 2/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal follows the single-owner session model without lock artifacts", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-single-owner-"));
+  const runId = "wf_single_owner";
+  try {
+    const journal = RunJournal.create(dir, {
+      type: "run", runId, name: "single-owner", scriptHash: "1", startedAt: 0,
+    });
+    assert.equal(fs.existsSync(`${journal.filePath}.lock`), false);
+    journal.close();
+
+    const resumed = RunJournal.resume(dir, runId, {
+      type: "run", runId, name: "single-owner", scriptHash: "1", startedAt: 1,
+    });
+    assert.equal(fs.existsSync(`${resumed.filePath}.lock`), false);
+    resumed.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal fails closed on unsupported journal versions", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-old-"));
+  try {
+    const runId = "wf_old";
+    fs.writeFileSync(path.join(dir, `${runId}.jsonl`), `${JSON.stringify({
+      type: "run", journalVersion: 2, runId, name: "old", scriptHash: "1", startedAt: 0, maxAgents: 128,
+    })}\n`);
+    assert.throws(
+      () => RunJournal.resume(dir, runId, { type: "run", runId, name: "old", scriptHash: "1", startedAt: 1 }),
+      /unsupported workflow journal version/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("mode.toggle requests max and restores the prior thinking level", () => {
@@ -602,4 +1151,37 @@ test("suspend quiesces all effort, tool, and prompt enforcement", () => {
   assert.equal(m.handleModelSelect(api), false);
   assert.equal(s.thinking, "high");
   assert.equal(m.beforeAgentStart({ systemPrompt: "BASE" }), undefined);
+});
+
+test("workflow leases cap top-level active runs per runsDir, isolate directories, and release idempotently", () => {
+  clearWorkflowLeasesForTests();
+  const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "uc-lease-a-"));
+  const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "uc-lease-b-"));
+  try {
+    const leases = [1, 2, 3, 4].map((n) => acquireWorkflowLease(dirA, `wf_${n}`));
+    assert.equal(activeWorkflowCount(dirA), 4);
+    assert.throws(() => acquireWorkflowLease(dirA, "wf_5"), /too many active workflows/);
+    assert.throws(() => acquireWorkflowLease(dirA, "wf_1"), /already active/);
+
+    const other = acquireWorkflowLease(dirB, "wf_5");
+    assert.equal(activeWorkflowCount(dirB), 1, "different runsDir scopes are independent");
+    other.release();
+    other.release();
+
+    leases[0].release();
+    assert.equal(activeWorkflowCount(dirA), 3);
+    const replacement = acquireWorkflowLease(dirA, "wf_5");
+    assert.equal(activeWorkflowCount(dirA), 4);
+    replacement.release();
+    leases.slice(1).forEach((lease) => lease.release());
+    assert.equal(activeWorkflowCount(dirA), 0);
+  } finally {
+    clearWorkflowLeasesForTests();
+    fs.rmSync(dirA, { recursive: true, force: true });
+    fs.rmSync(dirB, { recursive: true, force: true });
+  }
+});
+
+test("workflow worker source file is present", () => {
+  assert.equal(fs.existsSync(path.join(process.cwd(), "src", "workflow", "script-worker.mjs")), true);
 });

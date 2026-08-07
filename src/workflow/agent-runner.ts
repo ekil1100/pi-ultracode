@@ -310,6 +310,7 @@ export class WorkflowAgentRunner {
       sessionManager: SessionManager.inMemory(cwd),
       settingsManager: SettingsManager.create(cwd, agentDir),
       customTools,
+      excludeTools: ["workflow"],
       ...(model ? { model: model as any } : {}),
       ...(level ? { thinkingLevel: level as any } : {}),
       ...(toolAllowlist ? { tools: toolAllowlist } : {}),

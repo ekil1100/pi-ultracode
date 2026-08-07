@@ -44,8 +44,11 @@ const VERDICT = {
 const seen = new Set()
 const confirmed = []
 let dry = 0
+let roundsRun = 0
+const MAX_ROUNDS = 2
 
-while (dry < 2) {
+while (dry < 2 && roundsRun < MAX_ROUNDS) {
+  roundsRun++
   const rounds = await parallel(
     FINDERS.map((prompt, i) => () => agent(prompt, { label: 'find ' + i, phase: 'Find', schema: BUGS })),
   )
@@ -59,16 +62,23 @@ while (dry < 2) {
   for (const b of fresh) seen.add(b.file + ':' + b.desc)
 
   const judged = await parallel(
-    fresh.map((b) => () =>
-      parallel(
+    fresh.map((b) => async () => {
+      const votes = await parallel(
         ['correctness', 'security', 'does-it-reproduce'].map((lens) => () =>
           agent('Judge via the ' + lens + ' lens — is this real? "' + b.desc + '" (' + b.file + '). Default to real:false if unsure.',
             { label: 'verify ' + lens, phase: 'Verify', agentType: 'code-reviewer', schema: VERDICT }),
         ),
-      ).then((votes) => ({ bug: b, real: votes.filter(Boolean).filter((v) => v.real).length >= 2 })),
-    ),
+      )
+      return { bug: b, real: votes.filter(Boolean).filter((v) => v.real).length >= 2 }
+    }),
   )
   confirmed.push(...judged.filter((j) => j.real).map((j) => j.bug))
 }
 
-return { confirmed, totalSeen: seen.size }
+const complete = dry >= 2
+const truncated = !complete
+if (truncated) {
+  log('Stopped after MAX_ROUNDS=' + MAX_ROUNDS + ' before reaching two consecutive dry rounds; returning truncated results.')
+}
+
+return { confirmed, totalSeen: seen.size, roundsRun, complete, truncated }

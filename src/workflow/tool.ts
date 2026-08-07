@@ -4,7 +4,7 @@
  * structured result to the parent assistant.
  */
 
-import * as fs from "node:fs";
+import * as crypto from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -18,6 +18,8 @@ import {
 import { redactCommand, safeDisplayText } from "./display-text.ts";
 import { parseWorkflowScript, normalizeScript } from "./parser.ts";
 import {
+  ABSOLUTE_MAX_AGENTS,
+  DEFAULT_MAX_AGENTS,
   MAX_WORKFLOW_LOGS,
   WORKFLOW_LOG_OMITTED_TEXT,
   runWorkflow,
@@ -25,6 +27,18 @@ import {
 import type { ModelRuntimeLike, ThinkingLevel } from "./agent-runner.ts";
 import { RunJournal, hashString, type JournalAgentRecord } from "./journal.ts";
 import { getRegistry } from "./registry.ts";
+import { normalizeMaxAgents } from "./admission.ts";
+import { acquireWorkflowLease, type WorkflowLease } from "./leases.ts";
+import {
+  artifactPathExists,
+  assertRegularArtifactFile,
+  ensurePrivateArtifactDirectory,
+  readArtifactFile,
+  readContainedArtifactFile,
+  standaloneWorkflowRunsDir,
+  writeArtifactFile,
+} from "./run-artifacts.ts";
+import { assertWorkflowArgsLimit } from "./value-limits.ts";
 import {
   WorkflowRunDetails,
   normalizeTaskUsage,
@@ -57,7 +71,15 @@ const workflowToolSchema = Type.Object({
   resumeFromRunId: Type.Optional(
     Type.String({
       description:
-        "Resume a prior run: agent() calls with unchanged (prompt, opts) return cached results; the first changed/new call and everything after run live.",
+        "Resume an immutable prior run. Script and args must match exactly; successful agent calls replay by stable call path. maxAgents may only stay the same or increase.",
+    }),
+  ),
+  maxAgents: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: ABSOLUTE_MAX_AGENTS,
+      description:
+        `Lifetime live-agent admission cap for this run across resumes. Defaults to ${DEFAULT_MAX_AGENTS}; absolute range is 1..${ABSOLUTE_MAX_AGENTS}. Cache replay is free. This is not a token budget.`,
     }),
   ),
 }, { additionalProperties: false });
@@ -77,6 +99,8 @@ export interface WorkflowToolDeps {
   /** Test seam: override the workflow runtime (lets tests capture the options,
    *  including the forwarded thinkingLevel, without spinning up real subagents). */
   runWorkflowFn?: typeof runWorkflow;
+  /** Internal test seam for bounded cancellation cleanup. */
+  cleanupTimeoutMs?: number;
 }
 
 let runCounter = 0;
@@ -87,7 +111,8 @@ const ACTIVITY_RENDER_INTERVAL_MS = 100;
 
 function nextRunId(): string {
   runCounter += 1;
-  return `wf_${Date.now().toString(36)}-${runCounter.toString(36)}`;
+  const nonce = crypto.randomBytes(6).toString("hex");
+  return `wf_${Date.now().toString(36)}-${runCounter.toString(36)}-${nonce}`;
 }
 
 export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<typeof workflowToolSchema, any> {
@@ -102,28 +127,57 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       if (deps.isExecutionAllowed?.() === false) {
         throw new Error("The workflow tool is disabled. Run /ultracode on before using it.");
       }
+      const controller = new AbortController();
+      let abortRequested = false;
+      const requestAbort = () => {
+        abortRequested = true;
+        controller.abort();
+      };
+      const onOuterAbort = () => requestAbort();
+      signal?.addEventListener("abort", onOuterAbort, { once: true });
+      try {
+        if (signal?.aborted || controller.signal.aborted) throw new Error("Workflow was aborted before it started");
 
       const cwd = ctx.cwd;
-      const { script, sourceLabel } = resolveScript(params, cwd);
+      assertWorkflowArgsLimit(params.args);
+      const requestedMaxAgents = params.maxAgents === undefined ? undefined : normalizeMaxAgents(params.maxAgents);
+      const resolvedScript = resolveScript(params, cwd);
+      const script = normalizeScript(resolvedScript.script);
+      const sourceLabel = resolvedScript.sourceLabel;
       const parsed = parseWorkflowScript(script);
       const displayName = safeDisplayText(parsed.meta.name, 60) || "workflow";
 
       const runsDir = workflowRunsDir(ctx);
       const requestedRunId = params.resumeFromRunId?.trim();
       const runId = requestedRunId ? requireSafeRunId(requestedRunId) : nextRunId();
+      const resuming = Boolean(requestedRunId);
+      if (resuming && !RunJournal.exists(runsDir, runId)) {
+        throw new Error(`workflow: resumeFromRunId ${runId} was not found in this session`);
+      }
       // Forward the raw `max` request so each subagent session clamps it against
       // that subagent's model. Undefined when ultracode is off.
       const thinkingLevel = deps.getThinkingLevel?.();
+      if (controller.signal.aborted) throw new Error("Workflow was aborted before it started");
       const run = deps.runWorkflowFn ?? runWorkflow;
       const workflowStartedAt = Date.now();
-
-      // Persist the script next to the session for resume / inspection.
-      const scriptPath = path.join(runsDir, `${runId}.workflow.js`);
+      let lease: WorkflowLease | undefined;
+      let journal: RunJournal | undefined;
+      let toolSucceeded = false;
+      lease = acquireWorkflowLease(runsDir, runId);
       try {
-        fs.mkdirSync(runsDir, { recursive: true });
-        fs.writeFileSync(scriptPath, script);
-      } catch {
-        // non-fatal
+
+      // Persist new scripts next to the session. Resume artifacts are immutable:
+      // validate the existing file now and compare its content below.
+      const scriptPath = path.join(runsDir, `${runId}.workflow.js`);
+      ensurePrivateArtifactDirectory(runsDir);
+      if (resuming) {
+        assertRegularArtifactFile(scriptPath, "workflow resume script");
+        const persistedScript = readArtifactFile(scriptPath, "workflow resume script");
+        if (persistedScript !== script) {
+          throw new Error(`workflow ${runId} has an immutable script; start a new run for changed source`);
+        }
+      } else {
+        writeArtifactFile(scriptPath, script, { trustedRoot: runsDir });
       }
 
       // Journal (create new, or resume an existing run id).
@@ -134,34 +188,46 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         scriptHash: hashString(script),
         args: params.args,
         startedAt: Date.now(),
+        maxAgents: requestedMaxAgents,
       };
-      const resuming = Boolean(requestedRunId) && RunJournal.exists(runsDir, runId);
-      let journal: RunJournal | undefined;
-      try {
-        journal = resuming
-          ? RunJournal.resume(runsDir, runId, journalMeta)
-          : RunJournal.create(runsDir, journalMeta);
-      } catch {
-        journal = undefined;
-      }
+      journal = resuming
+        ? RunJournal.resume(runsDir, runId, journalMeta)
+        : RunJournal.create(runsDir, journalMeta);
+      const activeJournal = journal;
+      const effectiveMaxAgents = activeJournal.effectiveMaxAgents;
 
       // Snapshot + registry + abort plumbing.
       let snapshot = createSnapshot(parsed.meta, runId);
+      snapshot.maxAgents = effectiveMaxAgents;
+      snapshot.agentsUsed = activeJournal.agentsUsed;
+      const detailsPath = path.join(runsDir, `${runId}.details.json`);
+      if (resuming && artifactPathExists(detailsPath)) {
+        assertRegularArtifactFile(detailsPath, "workflow details manifest");
+      }
       const restoredDetails = resuming
-        ? WorkflowRunDetails.restore(path.join(runsDir, `${runId}.details.json`))?.details
+        ? WorkflowRunDetails.restore(detailsPath)?.details
         : undefined;
       const runDetails = restoredDetails ?? new WorkflowRunDetails({
         runId,
         name: parsed.meta.name,
         runsDir,
       });
+      if (resuming) runDetails.beginGeneration();
       snapshot.detailsManifestPath = runDetails.manifestPath;
-      const controller = new AbortController();
-      const onOuterAbort = () => controller.abort();
-      signal?.addEventListener("abort", onOuterAbort, { once: true });
+      if (controller.signal.aborted) throw new Error("Workflow was aborted before it started");
       const registry = getRegistry();
       registry.setScope(runsDir);
-      const handle = registry.register(runId, snapshot, () => controller.abort(), runDetails);
+      const handle = registry.register(runId, snapshot, requestAbort, runDetails);
+      let updateObserverEnabled = true;
+      const emitUpdate = () => {
+        if (!onUpdate || !updateObserverEnabled) return;
+        try {
+          onUpdate({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
+        } catch (error) {
+          updateObserverEnabled = false;
+          throw error;
+        }
+      };
 
       const update = () => {
         const totals = representedUsage(snapshot);
@@ -171,7 +237,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         snapshot = recompute(snapshot);
         handle.snapshot = snapshot;
         registry.notify();
-        onUpdate?.({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
+        emitUpdate();
       };
 
       // Throttle state for activity-driven re-renders. Agent fields below are
@@ -188,8 +254,23 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       };
 
       // Heartbeat: keep elapsed/no-event markers live in the compact panel even
-      // when a subagent emits no events.
-      const heartbeat = setInterval(() => update(), 1000);
+      // when a subagent emits no events. Detached timer callbacks must never throw
+      // past the tool lifecycle; convert observer failures into a controlled run
+      // failure and let the runtime finish abort/drain cleanup before releasing the lease.
+      let heartbeatFailed = false;
+      let heartbeatError: unknown;
+      const heartbeat = setInterval(() => {
+        try {
+          update();
+        } catch (error) {
+          if (!heartbeatFailed) {
+            heartbeatFailed = true;
+            heartbeatError = error;
+          }
+          clearInterval(heartbeat);
+          controller.abort();
+        }
+      }, 1000);
 
       try {
         const result = await run(script, {
@@ -201,7 +282,9 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           modelRuntime: deps.modelRuntime,
           model: ctx.model as any,
           runner: deps.testRunner,
-          journal,
+          journal: activeJournal,
+          maxAgents: effectiveMaxAgents,
+          cleanupTimeoutMs: deps.cleanupTimeoutMs,
           onLog(message) {
             if (!acceptingEvents || snapshot.logs.length > MAX_WORKFLOW_LOGS) return;
             const safe = safeDisplayText(message, 512);
@@ -220,10 +303,12 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           },
           onAgentStart(event) {
             if (!acceptingEvents) return;
+            snapshot.agentsUsed = activeJournal.agentsUsed;
             const phase = recordPhase(event.phase);
             const startedAt = Date.now();
             const summary = runDetails.startTask({
               id: event.id,
+              callPath: event.callPath,
               label: event.label,
               phase,
               workflowPath: event.workflowPath,
@@ -238,6 +323,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
             });
             const agent: WorkflowSnapshot["agents"][number] = {
               id: event.id,
+              callPath: event.callPath,
               label: safeDisplayText(event.label, 120) || `agent ${event.id}`,
               phase,
               workflowPath: event.workflowPath,
@@ -283,9 +369,6 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
             if (summary) applyTaskSummary(agent, summary);
             const now = Date.now();
             agent.lastActivityAt = now;
-            if (event.kind !== "text_delta" && event.kind !== "thinking_start") {
-              runDetails.persist(snapshot);
-            }
             if (now - lastActivityRenderMs >= ACTIVITY_RENDER_INTERVAL_MS) {
               lastActivityRenderMs = now;
               update();
@@ -331,17 +414,28 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           },
         });
 
+        // The runtime normally rejects after cancellation, but success must not
+        // win a race with a detached heartbeat failure or a user/registry abort.
+        if (heartbeatFailed) throw heartbeatError;
+        if (abortRequested || controller.signal.aborted) throw new Error("Workflow execution ended after cancellation");
+
         acceptingEvents = false;
         for (const agent of snapshot.agents) clearAgentTransient(agent);
         snapshot.result = result.result;
         snapshot.spentTokens = result.spentTokens;
-        snapshot.newTokens = result.newTokens;
-        snapshot.replayedTokens = result.replayedTokens;
+        snapshot.newTokens = result.newTokens ?? 0;
+        snapshot.replayedTokens = result.replayedTokens ?? 0;
+        snapshot.maxAgents = result.maxAgents ?? effectiveMaxAgents;
+        snapshot.agentsUsed = result.agentsUsed ?? activeJournal.agentsUsed;
         snapshot.durationMs = result.durationMs;
         snapshot.status = "completed";
         snapshot = recompute(snapshot);
         handle.snapshot = snapshot;
-        runDetails.close(snapshot);
+        try {
+          runDetails.close(snapshot);
+        } catch {
+          // best-effort manifest close
+        }
         registry.notify();
         journal?.recordResult({
           ok: true,
@@ -349,29 +443,32 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           agentCount: result.agentCount,
           durationMs: result.durationMs,
         });
-        onUpdate?.({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
+        emitUpdate();
 
+        const agentsUsed = result.agentsUsed ?? activeJournal.agentsUsed;
         ctx.ui?.notify(
-          `Workflow ${displayName} completed: ${result.agentCount} agent(s), ~${result.spentTokens} output tokens.`,
+          `Workflow ${displayName} completed: ${agentsUsed}/${result.maxAgents ?? effectiveMaxAgents} lifetime agent slot(s), ~${result.spentTokens} output tokens.`,
           "info",
         );
 
         const cachedNote = result.cachedCount ? ` (${result.cachedCount} cached from resume)` : "";
+        toolSucceeded = true;
         return {
           content: [
             {
               type: "text",
               text:
-                `Workflow ${displayName} completed: ${result.agentCount} agent(s)${cachedNote}, ` +
+                `Workflow ${displayName} completed: ${result.agentCount} agent call(s), lifetime slots ${agentsUsed}/${result.maxAgents ?? effectiveMaxAgents}${cachedNote}, ` +
                 `~${result.spentTokens} output tokens, ${Math.round(result.durationMs)}ms.\n` +
                 `runId: ${runId}  (script: ${scriptPath})\n\n` +
                 `Result:\n${safeJson(result.result)}`,
             },
           ],
-          details: { ...snapshot, runId, scriptPath, source: sourceLabel },
+          details: { ...snapshot, runId, scriptPath, source: sourceLabel, maxAgents: result.maxAgents ?? effectiveMaxAgents },
         };
       } catch (error) {
-        const aborted = controller.signal.aborted;
+        const failure = heartbeatFailed ? heartbeatError : error;
+        const aborted = abortRequested;
         acceptingEvents = false;
         if (!controller.signal.aborted) controller.abort();
         for (const agent of snapshot.agents) {
@@ -394,30 +491,64 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         snapshot.spentTokens = totals.outputTokens;
         snapshot = recompute(snapshot);
         handle.snapshot = snapshot;
-        runDetails.close(snapshot);
+        try {
+          runDetails.close(snapshot);
+        } catch {
+          // best-effort manifest close
+        }
         registry.notify();
-        const errorText = statusText(error);
-        journal?.recordResult({
-          ok: false,
-          error: errorText,
-          agentCount: snapshot.agentCount,
-          durationMs: snapshot.durationMs ?? 0,
-        });
-        onUpdate?.({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
+        const errorText = statusText(failure);
+        try {
+          journal?.recordResult({
+            ok: false,
+            error: errorText,
+            agentCount: snapshot.agentCount,
+            durationMs: snapshot.durationMs ?? 0,
+          });
+        } catch {
+          // A poisoned journal must not append after a partial write; preserve
+          // the execution failure that brought us into this path.
+        }
+        emitUpdate();
         ctx.ui?.notify(
           `Workflow ${displayName} ${aborted ? "was aborted" : "failed"}${aborted ? "" : `: ${errorText}`}`,
           aborted ? "warning" : "error",
         );
         if (aborted) {
-          throw new Error(`Workflow ${displayName} was aborted (runId: ${runId})`, { cause: error });
+          throw new Error(`Workflow ${displayName} was aborted (runId: ${runId})`, { cause: failure });
         }
-        throw new Error(`Workflow ${displayName} failed: ${errorText}`, { cause: error });
+        throw new Error(`Workflow ${displayName} failed: ${errorText}`, { cause: failure });
       } finally {
         acceptingEvents = false;
-        clearInterval(heartbeat);
+        try {
+          clearInterval(heartbeat);
+        } catch {
+          // best-effort cleanup
+        }
+        try {
+          runDetails.close(snapshot);
+        } catch {
+          // best-effort cleanup
+        }
+      }
+      } finally {
+        let journalCloseError: unknown;
+        try {
+          journal?.close();
+        } catch (error) {
+          journalCloseError = error;
+        }
+        try {
+          lease?.release();
+        } catch {
+          // best-effort cleanup; active-run leases must never mask the original error
+        }
+        if (toolSucceeded && journalCloseError) {
+          throw new Error(`workflow journal close failed: ${statusText(journalCloseError)}`, { cause: journalCloseError });
+        }
+      }
+      } finally {
         signal?.removeEventListener("abort", onOuterAbort);
-        runDetails.close(snapshot);
-        journal?.close();
       }
     },
     renderCall(_args, theme) {
@@ -427,7 +558,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       const snapshot = result.details as WorkflowSnapshot | undefined;
       if (snapshot?.name) {
         return new Text(renderWorkflowText(snapshot, {
-          maxAgents: expanded ? Number.MAX_SAFE_INTEGER : undefined,
+          maxAgentRows: expanded ? Number.MAX_SAFE_INTEGER : undefined,
           maxLogs: expanded ? 12 : undefined,
           showResultPreviews: expanded && !isPartial,
         }), 0, 0);
@@ -447,17 +578,21 @@ function resolveScript(
   }
   if (params.scriptPath) {
     const full = path.isAbsolute(params.scriptPath) ? params.scriptPath : path.join(cwd, params.scriptPath);
-    return { script: fs.readFileSync(full, "utf8"), sourceLabel: `scriptPath:${params.scriptPath}` };
+    return { script: readArtifactFile(full, "workflow script", 16 * 1024 * 1024), sourceLabel: `scriptPath:${params.scriptPath}` };
   }
   if (params.name) {
-    const dirs = [
-      path.join(cwd, ".pi", "ultracode", "workflows"),
-      path.join(os.homedir(), ".pi", "ultracode", "workflows"),
-    ];
-    for (const dir of dirs) {
+    requireSafeWorkflowName(params.name);
+    const roots = [cwd, os.homedir()];
+    for (const root of roots) {
+      const dir = path.join(root, ".pi", "ultracode", "workflows");
       for (const candidate of [`${params.name}.workflow.js`, `${params.name}.js`]) {
         const full = path.join(dir, candidate);
-        if (fs.existsSync(full)) return { script: fs.readFileSync(full, "utf8"), sourceLabel: `name:${params.name}` };
+        if (artifactPathExists(full)) {
+          return {
+            script: readContainedArtifactFile(root, full, "saved workflow", 16 * 1024 * 1024),
+            sourceLabel: `name:${params.name}`,
+          };
+        }
       }
     }
     throw new Error(`workflow: no saved workflow named "${params.name}" found under .pi/ultracode/workflows/`);
@@ -472,7 +607,7 @@ export function workflowRunsDir(ctx: { sessionManager?: { getSessionDir?: () => 
   } catch {
     // fall through
   }
-  return path.join(ctx.cwd, ".pi", "ultracode-runs");
+  return standaloneWorkflowRunsDir(ctx.cwd);
 }
 
 function safeJson(value: unknown): string {
@@ -483,6 +618,13 @@ function safeJson(value: unknown): string {
   }
 }
 
+
+function requireSafeWorkflowName(value: string): string {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) {
+    throw new Error("workflow name must contain only letters, numbers, underscore, or hyphen");
+  }
+  return value;
+}
 
 function requireSafeRunId(value: string): string {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value)) {
@@ -512,6 +654,7 @@ function representedUsage(snapshot: WorkflowSnapshot): { newTokens: number; repl
 function cachedRecordSummary(record: JournalAgentRecord): Partial<WorkflowTaskSummary> {
   return {
     id: record.seq,
+    callPath: record.callPath,
     label: record.label,
     status: "cached",
     promptPreview: "",

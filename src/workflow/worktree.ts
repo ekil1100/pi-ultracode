@@ -12,6 +12,7 @@ import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ensurePrivateArtifactDirectory, writeArtifactFile } from "./run-artifacts.ts";
 
 export interface Worktree {
   path: string;
@@ -247,11 +248,12 @@ export function writeRescuePatch(
   label: string,
   patch: string,
 ): string {
-  fs.mkdirSync(dir, { recursive: true });
+  ensurePrivateArtifactDirectory(dir);
   const safeRun = runId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 24) || "run";
   const safeLabel = label.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 40) || "agent";
-  const file = path.join(dir, `${safeRun}-${id}-${safeLabel}.patch`);
-  fs.writeFileSync(file, patch.endsWith("\n") ? patch : `${patch}\n`);
+  const nonce = randomBytes(6).toString("hex");
+  const file = path.join(dir, `${safeRun}-${id}-${safeLabel}-${nonce}.patch`);
+  writeArtifactFile(file, patch.endsWith("\n") ? patch : `${patch}\n`, { trustedRoot: dir });
   return file;
 }
 

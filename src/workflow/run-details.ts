@@ -1,8 +1,15 @@
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentTelemetryEvent, AgentUsage, ThinkingLevel } from "./agent-runner.ts";
 import { safeDisplayText, safeTranscriptText } from "./display-text.ts";
 import { preview, recompute, type WorkflowAgentStatus, type WorkflowSnapshot } from "./display.ts";
+import {
+  appendArtifactFile,
+  ensurePrivateArtifactDirectory,
+  readArtifactFile,
+  writeArtifactFile,
+} from "./run-artifacts.ts";
 
 export const RUN_DETAILS_VERSION = 1;
 export const MAX_LIVE_TASK_BYTES = 1024 * 1024;
@@ -66,6 +73,7 @@ export interface WorkflowTimelineEvent {
 
 export interface WorkflowTaskSummary {
   id: number;
+  callPath?: string;
   label: string;
   phase?: string;
   workflowPath: string[];
@@ -98,6 +106,7 @@ export interface WorkflowTaskDetail extends WorkflowTaskSummary {
 
 export interface StartWorkflowTaskInput {
   id: number;
+  callPath?: string;
   label: string;
   phase?: string;
   workflowPath?: string[];
@@ -261,6 +270,7 @@ function cloneEvent(event: WorkflowTimelineEvent): WorkflowTimelineEvent {
 function cloneSummary(task: InternalTask): WorkflowTaskSummary {
   return {
     id: task.id,
+    callPath: task.callPath,
     label: task.label,
     phase: task.phase,
     workflowPath: [...task.workflowPath],
@@ -299,6 +309,7 @@ export class WorkflowRunDetails {
   readonly manifestPath: string;
 
   private readonly tasks = new Map<number, InternalTask>();
+  private readonly previousGenerationTasks = new Map<string, InternalTask>();
   private readonly listeners = new Set<() => void>();
   private readonly streamingLineColumns = new Map<string, number>();
   private readonly artifactBudget: RunArtifactBudget;
@@ -311,24 +322,23 @@ export class WorkflowRunDetails {
     this.runsDir = input.runsDir;
     this.manifestPath = path.join(input.runsDir, `${input.runId}.details.json`);
     const taskDir = this.taskDir();
-    try {
-      fs.mkdirSync(taskDir, { recursive: true });
-    } catch {
-      // Artifact persistence is best-effort; live details remain available.
-    }
+    ensurePrivateArtifactDirectory(this.runsDir);
+    ensurePrivateArtifactDirectory(taskDir);
     this.artifactBudget = new RunArtifactBudget(taskDir, MAX_RUN_TRANSCRIPT_PAYLOAD_BYTES);
   }
 
   static restore(manifestPath: string): { details: WorkflowRunDetails; snapshot: WorkflowSnapshot } | undefined {
     let manifest: WorkflowRunDetailsManifest;
     try {
-      manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8")) as WorkflowRunDetailsManifest;
+      manifest = JSON.parse(readArtifactFile(manifestPath, "workflow details manifest", MAX_DETAILS_MANIFEST_BYTES)) as WorkflowRunDetailsManifest;
     } catch {
       return undefined;
     }
+    const expectedFileName = `${manifest.runId}.details.json`;
     if (
       manifest.version !== RUN_DETAILS_VERSION
       || !/^wf_[a-z0-9_-]{1,120}$/i.test(manifest.runId ?? "")
+      || path.basename(manifestPath) !== expectedFileName
       || typeof manifest.name !== "string"
       || !manifest.snapshot
     ) return undefined;
@@ -381,20 +391,46 @@ export class WorkflowRunDetails {
     this.viewedTaskId = id;
   }
 
+  /** Start a resume generation while retaining prior transcripts only for cache hits. */
+  beginGeneration(): void {
+    this.previousGenerationTasks.clear();
+    for (const task of this.tasks.values()) {
+      this.previousGenerationTasks.set(task.callPath ?? `id:${task.id}`, task);
+    }
+    this.tasks.clear();
+    this.streamingLineColumns.clear();
+    this.sequence = 0;
+    this.viewedTaskId = undefined;
+    this.notify();
+  }
+
   startTask(input: StartWorkflowTaskInput): WorkflowTaskSummary {
-    const restored = this.tasks.get(input.id);
+    const callPath = input.callPath ?? input.cachedRecord?.callPath ?? `id:${input.id}`;
+    const restored = this.tasks.get(input.id) ?? this.previousGenerationTasks.get(callPath);
     if (input.cached && restored) {
+      restored.id = input.id;
+      restored.callPath = callPath;
+      restored.label = safeDisplayText(input.label, 120) || `agent ${input.id}`;
+      restored.phase = input.phase ? safeDisplayText(input.phase, 120) : undefined;
+      restored.workflowPath = (input.workflowPath?.length ? input.workflowPath : [this.name])
+        .map((part) => safeDisplayText(part, 120))
+        .filter(Boolean);
       restored.status = "cached";
       restored.cached = true;
       restored.currentTurn = undefined;
+      this.previousGenerationTasks.delete(callPath);
+      this.tasks.set(input.id, restored);
+      this.sequence = Math.max(this.sequence, input.id);
       this.notify();
       return cloneSummary(restored);
     }
+    this.previousGenerationTasks.delete(callPath);
 
     const prompt = safeTranscriptText(input.prompt, MAX_TASK_TRANSCRIPT_BYTES);
     const cached = input.cachedRecord;
     const task: InternalTask = {
       id: input.id,
+      callPath,
       label: safeDisplayText(input.label, 120) || `agent ${input.id}`,
       phase: input.phase ? safeDisplayText(input.phase, 120) : undefined,
       workflowPath: (input.workflowPath?.length ? input.workflowPath : [this.name])
@@ -433,11 +469,14 @@ export class WorkflowRunDetails {
     if (!input.cached) {
       const writer = new BoundedTaskTranscriptWriter({
         dir: this.taskDir(),
+        artifactKey: transcriptArtifactKey(callPath),
+        runId: this.runId,
+        callPath,
         taskId: input.id,
         budget: this.artifactBudget,
       });
       writer.reset();
-      this.persistPrompt(writer, input.id, prompt);
+      this.persistPrompt(writer, input.id, callPath, prompt);
       task.writer = writer;
       task.transcriptPath = writer.finalPath;
     }
@@ -709,17 +748,21 @@ export class WorkflowRunDetails {
   }
 
   persist(snapshot: WorkflowSnapshot): void {
+    const persistedTasks = this.tasks.size === 0 && this.previousGenerationTasks.size > 0
+      ? [...this.previousGenerationTasks.values()]
+      : [...this.tasks.values()];
+    persistedTasks.sort((a, b) => a.id - b.id);
     const manifest: WorkflowRunDetailsManifest = {
       version: RUN_DETAILS_VERSION,
       runId: this.runId,
       name: this.name,
       updatedAt: Date.now(),
       snapshot: snapshotForManifest(snapshot),
-      tasks: this.listTasks().map(taskForManifest),
+      tasks: persistedTasks.map(taskForManifest),
       transcriptBytes: this.artifactBudget.usedBytes,
     };
     try {
-      fs.mkdirSync(this.runsDir, { recursive: true });
+      ensurePrivateArtifactDirectory(this.runsDir);
       let serialized = JSON.stringify(manifest, null, 2);
       if (Buffer.byteLength(serialized, "utf8") > MAX_DETAILS_MANIFEST_BYTES) {
         manifest.snapshot.logs = [];
@@ -738,9 +781,7 @@ export class WorkflowRunDetails {
         serialized = JSON.stringify(manifest);
       }
       if (Buffer.byteLength(serialized, "utf8") > MAX_DETAILS_MANIFEST_BYTES) return;
-      const temp = `${this.manifestPath}.tmp-${process.pid}`;
-      fs.writeFileSync(temp, serialized, "utf8");
-      fs.renameSync(temp, this.manifestPath);
+      writeArtifactFile(this.manifestPath, serialized, { trustedRoot: this.runsDir, overwrite: true });
     } catch {
       // Persistence failure does not affect the workflow result.
     }
@@ -782,7 +823,7 @@ export class WorkflowRunDetails {
     if (persist) this.persistTimelineEvent(task, event);
   }
 
-  private persistPrompt(writer: BoundedTaskTranscriptWriter, taskId: number, prompt: string): void {
+  private persistPrompt(writer: BoundedTaskTranscriptWriter, taskId: number, callPath: string, prompt: string): void {
     const chunks = chunkText(safeMultiline(prompt), TRANSCRIPT_TEXT_CHUNK_CHARS);
     for (const [chunkIndex, text] of chunks.entries()) {
       writer.append({
@@ -790,6 +831,7 @@ export class WorkflowRunDetails {
         recordType: "prompt",
         runId: this.runId,
         taskId,
+        callPath,
         ts: Date.now(),
         chunkIndex,
         chunkCount: chunks.length,
@@ -814,6 +856,7 @@ export class WorkflowRunDetails {
         recordType: "event",
         runId: this.runId,
         taskId: task.id,
+        callPath: task.callPath,
         ts: Date.now(),
         baseSeq: safeEvent.seq,
         chunkIndex,
@@ -944,7 +987,7 @@ export class WorkflowRunDetails {
       const resolved = path.resolve(task.transcriptPath);
       const root = path.resolve(this.taskDir()) + path.sep;
       if (!resolved.startsWith(root)) return;
-      content = fs.readFileSync(resolved, "utf8");
+      content = readArtifactFile(resolved, "workflow transcript", MAX_TASK_TRANSCRIPT_BYTES);
     } catch {
       return;
     }
@@ -957,6 +1000,11 @@ export class WorkflowRunDetails {
       if (!line.trim()) continue;
       try {
         const record = JSON.parse(line) as any;
+        if (
+          record.version !== RUN_DETAILS_VERSION
+          || record.runId !== this.runId
+          || record.callPath !== task.callPath
+        ) continue;
         if (record.recordType === "prompt" && typeof record.text === "string") {
           const index = Number.isFinite(record.chunkIndex) ? record.chunkIndex : 0;
           promptChunks.set(index, record.text);
@@ -1013,7 +1061,7 @@ function restoreTaskSummary(value: unknown, fallbackName: string): WorkflowTaskS
   if (!value || typeof value !== "object") return undefined;
   const raw = value as Record<string, unknown>;
   const id = Number.isInteger(raw.id) ? Number(raw.id) : 0;
-  if (id < 1 || id > 1000) return undefined;
+  if (id < 1 || id > 1024) return undefined;
   const statuses: WorkflowAgentStatus[] = ["running", "done", "error", "cancelled", "skipped", "cached"];
   const status = statuses.includes(raw.status as WorkflowAgentStatus) ? raw.status as WorkflowAgentStatus : "cancelled";
   const requestedEffort = normalizeThinkingLevel(raw.requestedEffort);
@@ -1023,6 +1071,7 @@ function restoreTaskSummary(value: unknown, fallbackName: string): WorkflowTaskS
     : [fallbackName];
   return taskForManifest({
     id,
+    callPath: typeof raw.callPath === "string" ? raw.callPath : undefined,
     label: typeof raw.label === "string" ? raw.label : `agent ${id}`,
     phase: typeof raw.phase === "string" ? raw.phase : undefined,
     workflowPath,
@@ -1132,6 +1181,10 @@ class RunArtifactBudget {
   }
 }
 
+function transcriptArtifactKey(callPath: string): string {
+  return crypto.createHash("sha256").update(callPath).digest("hex").slice(0, 32);
+}
+
 class BoundedTaskTranscriptWriter {
   readonly finalPath: string;
   readonly headPath: string;
@@ -1140,14 +1193,27 @@ class BoundedTaskTranscriptWriter {
   private headBytes = 0;
   private tailBytes = 0;
 
-  constructor(input: { dir: string; taskId: number; budget: RunArtifactBudget }) {
+  constructor(input: {
+    dir: string;
+    artifactKey: string;
+    runId: string;
+    callPath: string;
+    taskId: number;
+    budget: RunArtifactBudget;
+  }) {
     this.budget = input.budget;
-    this.finalPath = path.join(input.dir, `${input.taskId}.transcript.jsonl`);
+    this.runId = input.runId;
+    this.callPath = input.callPath;
+    this.taskId = input.taskId;
+    this.finalPath = path.join(input.dir, `${input.artifactKey}.transcript.jsonl`);
     this.headPath = `${this.finalPath}.head`;
     this.tailPath = `${this.finalPath}.tail`;
   }
 
   private readonly budget: RunArtifactBudget;
+  private readonly runId: string;
+  private readonly callPath: string;
+  private readonly taskId: number;
 
   reset(): void {
     for (const target of [this.finalPath, this.headPath, this.tailPath]) {
@@ -1173,10 +1239,10 @@ class BoundedTaskTranscriptWriter {
     }
     try {
       if (this.headBytes + bytes <= TRANSCRIPT_HEAD_BYTES) {
-        fs.appendFileSync(this.headPath, line, "utf8");
+        appendArtifactFile(this.headPath, line, { trustedRoot: path.dirname(this.finalPath) });
         this.headBytes += bytes;
       } else {
-        fs.appendFileSync(this.tailPath, line, "utf8");
+        appendArtifactFile(this.tailPath, line, { trustedRoot: path.dirname(this.finalPath) });
         this.tailBytes += bytes;
         if (this.tailBytes > TRANSCRIPT_TAIL_BYTES) this.compactTail();
       }
@@ -1194,6 +1260,9 @@ class BoundedTaskTranscriptWriter {
       ? `${JSON.stringify({
           version: RUN_DETAILS_VERSION,
           recordType: "omitted",
+          runId: this.runId,
+          taskId: this.taskId,
+          callPath: this.callPath,
           ts: Date.now(),
           omittedBytes: this.omittedBytes,
           message: `… ${formatBytes(this.omittedBytes)} of middle transcript omitted …`,
@@ -1205,10 +1274,11 @@ class BoundedTaskTranscriptWriter {
       : "";
     const combined = `${head}${marker}${tail}`;
     try {
-      fs.mkdirSync(path.dirname(this.finalPath), { recursive: true });
-      const temp = `${this.finalPath}.tmp-${process.pid}`;
-      fs.writeFileSync(temp, combined, "utf8");
-      fs.renameSync(temp, this.finalPath);
+      ensurePrivateArtifactDirectory(path.dirname(this.finalPath));
+      writeArtifactFile(this.finalPath, combined, {
+        trustedRoot: path.dirname(this.finalPath),
+        overwrite: true,
+      });
       fs.rmSync(this.headPath, { force: true });
       fs.rmSync(this.tailPath, { force: true });
       this.headBytes = 0;
@@ -1236,7 +1306,10 @@ class BoundedTaskTranscriptWriter {
     }
     const removed = Math.max(0, this.tailBytes - keptBytes);
     try {
-      fs.writeFileSync(this.tailPath, kept.join(""), "utf8");
+      writeArtifactFile(this.tailPath, kept.join(""), {
+        trustedRoot: path.dirname(this.finalPath),
+        overwrite: true,
+      });
       this.tailBytes = keptBytes;
       this.omittedBytes += removed;
       this.budget.release(removed);
@@ -1259,7 +1332,7 @@ function isPathInside(candidate: string | undefined, rootDir: string): boolean {
 
 function readText(filePath: string): string {
   try {
-    return fs.readFileSync(filePath, "utf8");
+    return readArtifactFile(filePath, "workflow transcript", MAX_TASK_TRANSCRIPT_BYTES);
   } catch {
     return "";
   }
@@ -1267,7 +1340,8 @@ function readText(filePath: string): string {
 
 function fileSize(filePath: string): number {
   try {
-    return fs.statSync(filePath).size;
+    const stat = fs.lstatSync(filePath);
+    return stat.isFile() && !stat.isSymbolicLink() ? stat.size : 0;
   } catch {
     return 0;
   }

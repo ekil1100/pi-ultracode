@@ -12,7 +12,7 @@ Ultracode 保留 Pi 自身的核心循环、内存模型、工具系统、扩展
 | --- | --- |
 | `workflow` 工具 | 模型请求前按 Ultracode 状态校准；运行确定性的 JavaScript 编排脚本，并调用 `agent()`、`parallel()`、`pipeline()` 和 `workflow()`。 |
 | 独立子代理 | 每次 `agent()` 调用都会创建一条带标准编码工具的新 Pi 会话。 |
-| 并行执行 | `parallel()` 并发运行任务，且保留输入顺序。 |
+| 并行执行 | `parallel()` 并发运行任务、保留输入顺序，并在启动前整批预留 agent slots。 |
 | 流水线 | `pipeline()` 让任务独立流经多个阶段，无需全局屏障。 |
 | 结构化输出 | 传入 JSON Schema，即可通过终止型 `structured_output` 工具获得经校验的对象。 |
 | Agent Type | 通过 `.pi/ultracode/agents/*.md` 定义角色提示词、工具白名单、模型和思考强度。 |
@@ -20,7 +20,7 @@ Ultracode 保留 Pi 自身的核心循环、内存模型、工具系统、扩展
 | Worktree 隔离 | 让写入型并行代理在临时 git worktree 中运行，并把改动安全合并回共享工作树。 |
 | 进度与详情 | 实时状态、实际模型/effort、turn/工具/token 统计，以及可流式展开的 TUI 任务详情浮层。 |
 | Ultracode 模式 | `/ultracode on` 启用主动编排提示词，并请求当前模型支持的最高思考强度。 |
-| 执行限制 | 代理数量限制、并发限制与嵌套深度限制。 |
+| 执行限制 | `maxAgents`（默认 128/上限 1024）、每进程且每 session/runsDir 最多 4 个活动 workflow、并发限制与嵌套深度限制。 |
 
 ## 为什么使用工作流
 
@@ -152,7 +152,7 @@ export const meta = {
 脚本可使用下列全局变量：
 
 - `agent(prompt, options)`
-- `parallel(thunks)`
+- `parallel(thunks, options?)`
 - `pipeline(items, ...stages)`
 - `phase(title)`
 - `log(message)`
@@ -160,22 +160,28 @@ export const meta = {
 - `args`
 - `cwd`
 
+workflow 工具本身支持 `maxAgents?: integer`：默认 128，范围 1–1024。它限制同一 run 在首次执行及所有 resume 中累计获准启动的 live agent；cache replay 不重复占用额度。它不是 token budget，token/cost 仍只用于观测展示。
+
 `agent()` 的主要选项：
 
 | 选项 | 作用 |
 | --- | --- |
 | `label` | 进度中显示的 2–5 个词短名称。 |
 | `phase` | 显式指定进度阶段。 |
-| `schema` | 普通 JSON Schema；成功时返回经 `structured_output` 校验的对象。 |
+| `schema` | 内联的有界 JSON Schema 子集（≤256 KiB、深度≤64）；成功时返回经 `structured_output` 校验且≤2 MiB 的对象。 |
 | `model` | 按模式覆盖模型，也可带 `:off`、`:high`、`:xhigh` 或 `:max`。 |
 | `agentType` | 使用内置或自定义角色。 |
 | `isolation: "worktree"` | 在临时 git worktree 中运行写入型代理。 |
 
-为保证可恢复和确定性，脚本不提供 Node.js 模块加载能力，也不允许直接使用 `fs`、网络、`Date.now()`、`new Date()` 或 `Math.random()`。
+为保证可恢复和确定性，脚本不提供 Node.js 模块加载能力，也不允许直接使用 `fs`、网络、`Date.now()`、`new Date()` 或 `Math.random()`。Worker 使用 context-realm bridge，禁用字符串/Wasm code generation，并设置 128 MiB V8 old-generation heap 上限；Intl/Temporal、ArrayBuffer、SharedArrayBuffer、typed arrays 与 WebAssembly 不向脚本开放。控制流另受循环/函数 checkpoint、host-call fuel、AST 结构限制、同步 stall watchdog 和无 host RPC 时的 idle-progress watchdog 约束。这些是确定性与 liveness guard，不是安全沙箱，也不宣称与 Grok Build 的 Rhai operation fuel 完全等价。所有 `agent()`、`parallel()`、`pipeline()` 和 `workflow()` 返回值都必须直接被 await 或 return；原生 `.then/.catch/.finally` 链、动态 method call（`value[key](...)`）和 `Promise.all/allSettled/race/any` 会在执行前被拒绝（本地异步仅保留 `new Promise(...)` 与 `Promise.resolve(...)`）。并发编排必须使用 `parallel()`/`pipeline()`，以保持 call path 可恢复且不受完成顺序影响；同 scope 的 sibling async orchestration 及未观察或仍 pending 的编排 promise 也会使 workflow 失败。
+
+含编排调用的 helper 也属于可恢复身份的一部分，因此只支持直接声明的函数/函数变量，或声明对象/已赋给标识符的 class instance 上的静态 method call。helper alias、事后赋值 method、`this.otherMethod()` 转发、临时/awaited factory receiver 与高阶 callable 会在执行前 fail closed；请先改写为一个直接声明的 helper，再从明确的源码调用点调用它。编译器会把源码调用点、词法 loop iteration、helper caller scope、请求指纹和同请求 occurrence 组合成 durable identity，避免条件分支、循环、并行完成顺序或 resume 重试改变 cache 对应关系。
+
+资源输入输出同样有硬上限：`args` 1 MiB、schema 256 KiB/64 层、每个 agent/workflow output 2 MiB、journal 64 MiB。args/schema/output 必须是严格 JSON tree（只允许可持久化的有限 number〔不含 `-0`〕、string、boolean、null、array 与 plain object；拒绝 binary objects、accessor、稀疏数组以及循环/重复对象引用）。schema 只接受明确支持的子集：类型、object/array 结构、`enum`/`const`、`anyOf`/`allOf`、长度和数值约束及注解；未知关键字会直接拒绝。`$ref` 家族、`oneOf`、`format` 与所有 regex 关键字（包括 `pattern`/`patternProperties`）均不支持；JavaScript regex validation 无可靠执行上限。journal 在每次 append 前检查上限并校验记录语义；单进程恢复时只会修复 EOF 处的 torn JSONL 尾记录，文件中部损坏仍 fail closed。
 
 ### 取消与清理
 
-按 `Esc` 取消工作流时，取消信号会覆盖子代理初始化、异步 preflight 和流式执行窗口。运行器会等待进行中的 `abort()` 完成后再释放会话；清理失败不会覆盖原始 prompt 或取消错误。兼容旧版 Pi 时创建的临时 fallback 会话也遵循同一清理规则。
+按 `Esc` 取消工作流时，取消信号会覆盖子代理初始化、异步 preflight 和流式执行窗口。运行器会等待进行中的 `abort()`，但 cleanup 最多等待 25 秒；即使 provider 忽略取消，workflow lease 也会在有界清理后释放。兼容旧版 Pi 时创建的临时 fallback 会话同样遵循该规则。
 
 ### 直接调用
 
@@ -190,12 +196,12 @@ const result = await agent(
   { label: "mode review" },
 );
 
-export default result;
+return result;
 ```
 
 ### 并行检视
 
-`parallel()` 接收 thunk，而不是已经启动的 Promise：
+`parallel()` 接收 thunk，而不是已经启动的 Promise。每个 panel 在任意 thunk 启动前原子预留 `options.reserveAgents ?? thunks.length` 个 agent slot；`reserveAgents` 不能小于 thunk 数。每个 thunk 保有一个独立基础 slot，其余显式预留量由 panel 共享；调用超过预留量会使整个 workflow 失败，不会临时挪用未预留的 `maxAgents` 容量。
 
 ```js
 export const meta = {
@@ -211,9 +217,10 @@ const tasks = [
 
 const results = await parallel(
   tasks.map(([label, prompt]) => () => agent(prompt, { label })),
+  { reserveAgents: tasks.length },
 );
 
-export default results.filter(Boolean);
+return results.filter(Boolean);
 ```
 
 ### 流水线
@@ -240,12 +247,12 @@ const results = await pipeline(
   ),
 );
 
-export default results.filter(Boolean);
+return results.filter(Boolean);
 ```
 
 ### 结构化输出
 
-不传 `schema` 时，`agent()` 返回子代理最后一段非空 assistant 文本；传入普通 JSON Schema 时，则返回经校验的对象：
+不传 `schema` 时，`agent()` 返回子代理最后一段非空 assistant 文本；传入支持的 JSON Schema 子集时，则返回经校验的对象。两种返回值都必须是≤2 MiB 的严格 JSON value：
 
 ```js
 export const meta = {
@@ -269,7 +276,7 @@ const finding = await agent(
   },
 );
 
-export default finding;
+return finding;
 ```
 
 使用 schema 的代理必须调用 `structured_output`。否则该 `agent()` 分支会失败并返回 `null`；工作流本身仍可继续，因此脚本应过滤或显式处理失败分支，而不会把自由文本伪装成结构化结果。
@@ -377,7 +384,7 @@ await agent("Implement the requested change and run focused tests.", {
 await workflow("saved_workflow_name", { target: "src" });
 ```
 
-嵌套限制为一层，且共享父运行的并发上限与代理计数。
+嵌套限制为一层，且共享父运行的并发上限、`maxAgents`、当前 parallel reservations 与代理计数。由 workflow 启动的 child Pi session 会显式排除 `workflow` 工具，不能再创建一条拥有独立额度的新 workflow 链。
 
 每次运行都会把脚本和 JSONL journal 保存到：
 
@@ -386,21 +393,33 @@ await workflow("saved_workflow_name", { target: "src" });
 <sessionDir>/ultracode-runs/<runId>.jsonl
 ```
 
-暂停、终止或修改脚本后，可再次调用 `workflow` 工具并传入 `resumeFromRunId`。最长的未变 `agent()` 调用前缀会立即返回缓存结果；第一个变化或新增的调用及其后续调用会实时执行。
+没有 sessionDir 的独立调用使用用户目录下按 cwd 哈希隔离的 `~/.pi/ultracode-runs/<cwd-hash>/`，不会写入仓库可控制的 `.pi` symlink。run script、journal、details 和 transcript 会拒绝 symlink/non-regular artifacts，并使用 no-follow/独占或原子写入。与 Pi 和 Grok Build 一样，session 采用单进程 owner 模型；同一 Pi 进程内由 process-local lease 阻止重复运行同一 runId，但不支持两个 Pi 进程并发写同一个 session。
+
+已有 run 可再次调用 `workflow` 并传入 `resumeFromRunId`。resume 是 immutable：顶层 script/args、实际解析到的 Agent Type 定义、effective model/thinking，以及每个 nested workflow call path 的源码/args 都必须和原 run 完全一致；args 的可观察对象键序也属于 identity。需要修改工作时必须启动新 run。成功的 agent 结果按 Worker 生成的稳定结构 call path replay，因此不受 parallel/pipeline 完成顺序影响。live admission 会在 runner side effect 前持久化，并在整个 run 生命周期累计；恢复时省略 `maxAgents` 会继承当前上限，显式值只能提高、不能降低。不存在或格式不受支持的 runId 会明确失败。
 
 ## 限制
 
 运行时限制：
 
-- 最大代理数；
-- 最大并发数；
-- 嵌套深度；
+- run-lifetime `maxAgents` live admission（默认 128，绝对上限 1024；cache replay 免费）；
+- 同一进程、同一 session/runsDir 最多 4 个活动顶层 workflow；
+- 每个 run 最大并发 16；
+- 最多一层嵌套 workflow；
+- 10,000 次 host-call fuel、AST/checkpoint、stall 与 idle-progress 限制；
+- Worker V8 old-generation heap 128 MiB，并禁用 string/Wasm code generation 与二进制内存构造器；
+- args/schema/structured output/journal 字节与结构上限；
+- 取消后的 25 秒 cleanup deadline；
+- child session 显式排除 `workflow` 工具；
 - 结构化输出校验；
-- 静态禁止不确定性与危险全局变量。
+- 静态及 context-realm 运行期确定性 guard。
 
 ## 会话与兼容性
 
 Ultracode 模式状态通过自定义 session entry 持久化。恢复、reload、fork 和 `/tree` 导航都会按当前 branch 重新读取状态；被丢弃分支中的 entry 不会错误启用模式。旧版 Pi 或旧模型会把 `max` 兼容回退为 `xhigh`，而不会把未知值静默变成 `off`。
+
+### 0.3 迁移说明
+
+0.3 引入 Grok Build 式结构控制：`maxAgents` 默认为 128（范围 1–1024），并在同一 run 的所有 resume 中累计 live admissions；cache replay 不重复占用。`parallel()` 会在启动前按 panel 原子预留 slots，`reserveAgents < thunks.length`、调用超过预留量或超过 `maxAgents` 都是 fatal policy failure。一个 thunk 会调用多个 agent 时，必须用 `reserveAgents` 显式覆盖全部潜在调用。resume 改为 immutable script/args，并按稳定结构 call path replay；旧的“修改脚本后最长前缀恢复”不再支持。同一进程、同一 session/runsDir 同时最多 4 个顶层 workflow，取消清理有 25 秒上限，run artifacts 拒绝 symlink。
 
 ### 0.2 迁移说明
 
@@ -443,7 +462,7 @@ npm 发布由 [`.github/workflows/publish-npm.yml`](.github/workflows/publish-np
 同时在 GitHub 仓库中创建名为 `npm` 的 Environment；可以按需增加审批人。正常发布无需打开 Actions 页面：
 
 ```bash
-npm version patch # or: minor / major / 0.2.0-beta.1
+npm version patch # or: minor / major / x.y.z-beta.1
 git push origin main --follow-tags
 ```
 

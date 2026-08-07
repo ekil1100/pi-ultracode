@@ -3,15 +3,21 @@
  * `agent(prompt, { schema })`) into a TypeBox `TSchema` so Pi can both validate
  * the subagent's structured output and serialize a faithful tool schema to the model.
  *
- * Covers the common JSON Schema subset; anything unrecognized falls back to
- * `Type.Unsafe`, which preserves the raw schema for the model without crashing.
+ * Covers the explicitly validated workflow JSON Schema subset. Unsupported
+ * keywords are rejected before conversion rather than silently weakened.
  */
 
 import { Type, type TSchema } from "typebox";
+import { assertWorkflowSchemaLimit } from "./value-limits.ts";
 
 type Json = Record<string, any>;
 
 export function jsonSchemaToTypeBox(schema: unknown): TSchema {
+  assertWorkflowSchemaLimit(schema);
+  return convertJsonSchema(schema);
+}
+
+function convertJsonSchema(schema: unknown): TSchema {
   if (!schema || typeof schema !== "object") {
     // No constraints -> accept anything.
     return Type.Unsafe<unknown>({});
@@ -21,27 +27,29 @@ export function jsonSchemaToTypeBox(schema: unknown): TSchema {
 
   // Composite keywords first.
   if (Array.isArray(node.enum)) {
-    const literals = node.enum.map((value: unknown) => Type.Literal(value as any));
-    return withAnnotations(literals.length === 1 ? literals[0] : Type.Union(literals), annotations);
+    return withAnnotations(Type.Unsafe<unknown>({
+      ...(node.type !== undefined ? { type: node.type } : {}),
+      enum: node.enum,
+    }), annotations);
   }
   if ("const" in node) {
-    return withAnnotations(Type.Literal(node.const), annotations);
+    return withAnnotations(Type.Unsafe<unknown>({
+      ...(node.type !== undefined ? { type: node.type } : {}),
+      const: node.const,
+    }), annotations);
   }
   if (Array.isArray(node.anyOf)) {
-    return withAnnotations(Type.Union(node.anyOf.map(jsonSchemaToTypeBox)), annotations);
-  }
-  if (Array.isArray(node.oneOf)) {
-    return withAnnotations(Type.Union(node.oneOf.map(jsonSchemaToTypeBox)), annotations);
+    return withAnnotations(Type.Union(node.anyOf.map(convertJsonSchema)), annotations);
   }
   if (Array.isArray(node.allOf)) {
-    return withAnnotations(Type.Intersect(node.allOf.map(jsonSchemaToTypeBox)), annotations);
+    return withAnnotations(Type.Intersect(node.allOf.map(convertJsonSchema)), annotations);
   }
 
   const type = node.type;
   if (Array.isArray(type)) {
     // e.g. ["string", "null"]
     return withAnnotations(
-      Type.Union(type.map((t: string) => jsonSchemaToTypeBox({ ...node, type: t, enum: undefined }))),
+      Type.Union(type.map((t: string) => convertJsonSchema({ ...node, type: t, enum: undefined }))),
       annotations,
     );
   }
@@ -70,33 +78,47 @@ export function jsonSchemaToTypeBox(schema: unknown): TSchema {
 }
 
 function objectSchema(node: Json): TSchema {
-  const properties: Record<string, TSchema> = {};
+  const properties: Record<string, TSchema> = Object.create(null);
   const required: string[] = Array.isArray(node.required) ? node.required : [];
   const props = (node.properties ?? {}) as Json;
   for (const [key, value] of Object.entries(props)) {
-    const child = jsonSchemaToTypeBox(value);
+    const child = convertJsonSchema(value);
     properties[key] = required.includes(key) ? child : Type.Optional(child);
   }
   const options: Json = {};
   if (node.additionalProperties === false) options.additionalProperties = false;
   else if (node.additionalProperties && typeof node.additionalProperties === "object") {
-    options.additionalProperties = jsonSchemaToTypeBox(node.additionalProperties);
+    options.additionalProperties = convertJsonSchema(node.additionalProperties);
   }
   return Type.Object(properties, options);
 }
 
 function arraySchema(node: Json): TSchema {
-  const items = node.items ? jsonSchemaToTypeBox(Array.isArray(node.items) ? node.items[0] : node.items) : Type.Unknown();
   const options: Json = {};
   if (typeof node.minItems === "number") options.minItems = node.minItems;
   if (typeof node.maxItems === "number") options.maxItems = node.maxItems;
   if (node.uniqueItems === true) options.uniqueItems = true;
-  return Type.Array(items, options);
+  if (Array.isArray(node.items)) {
+    return Type.Tuple(node.items.map(convertJsonSchema), {
+      ...options,
+      additionalItems: true,
+      minItems: options.minItems ?? 0,
+    });
+  }
+  return Type.Array(node.items ? convertJsonSchema(node.items) : Type.Unknown(), options);
 }
 
 function numericAndStringConstraints(node: Json): Json {
   const out: Json = {};
-  for (const key of ["minimum", "maximum", "minLength", "maxLength", "pattern", "format"]) {
+  for (const key of [
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+  ]) {
     if (node[key] !== undefined) out[key] = node[key];
   }
   return out;

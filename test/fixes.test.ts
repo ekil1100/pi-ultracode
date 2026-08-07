@@ -14,7 +14,6 @@ import {
   type ThinkingLevel,
 } from "../src/workflow/agent-runner.ts";
 import { writeRescuePatch, applyPatch, captureWorktreeDiff, createWorktree, removeWorktree, reapStaleWorktrees, patchTmpPath } from "../src/workflow/worktree.ts";
-import { createDeterministicMath } from "../src/workflow/runtime.ts";
 
 const MODELS = [
   { provider: "anthropic", id: "claude-sonnet", name: "Sonnet" },
@@ -228,6 +227,7 @@ test("WorkflowAgentRunner shares one modern model runtime and replays public reg
     assert.equal(options.modelRuntime, runtime);
     assert.equal("modelRegistry" in options, false, "modern sessions never receive the removed option");
     assert.equal(options.model, runtimeModel, "the selected model is rebound to the target runtime");
+    assert.deepEqual(options.excludeTools, ["workflow"], "workflow children cannot recursively launch workflows");
   }
   assert.deepEqual(registered, [["custom", providerConfig]]);
   assert.deepEqual(refreshed, [{ allowNetwork: false }]);
@@ -723,7 +723,7 @@ test("writeRescuePatch: sanitizes hostile run/label input", () => {
   try {
     const p = writeRescuePatch(dir, "../etc/passwd", 7, "a;b && rm -rf", "x");
     assert.ok(fs.existsSync(p));
-    assert.equal(path.basename(p), "etcpasswd-7-abrm-rf.patch");
+    assert.match(path.basename(p), /^etcpasswd-7-abrm-rf-[a-f0-9]{12}\.patch$/);
     assert.equal(fs.readFileSync(p, "utf8"), "x\n");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -937,7 +937,7 @@ test("applyPatch: on a binary 3-way conflict, reverts the shared tree to the sha
 });
 
 // ---------------------------------------------------------------------------
-// Nit fixes: tmp-filename collision, Math.random determinism, worktree GC.
+// Nit fixes: tmp-filename collision and worktree GC.
 // ---------------------------------------------------------------------------
 
 // Covers same-thread uniqueness; cross-realm (worker-thread) uniqueness comes
@@ -952,41 +952,6 @@ test("patchTmpPath: every call yields a unique path (no tmp collision)", () => {
   for (const p of seen) {
     assert.ok(p.startsWith(path.join(os.tmpdir(), "ultracode-patch-")), `unexpected path: ${p}`);
   }
-});
-
-test("createDeterministicMath: Math.max/min/floor work; Math.random throws", () => {
-  const m = createDeterministicMath() as {
-    max: (...a: number[]) => number;
-    min: (...a: number[]) => number;
-    floor: (n: number) => number;
-    round: (n: number) => number;
-    random: () => number;
-  };
-  assert.equal(m.max(1, 2), 2);
-  assert.equal(m.min(4, 5), 4);
-  assert.equal(m.floor(1.7), 1);
-  assert.equal(m.round(2.5), 3);
-  assert.throws(() => m.random(), /Math\.random.*forbidden/);
-});
-
-test("createDeterministicMath: copies every Math member + constants, preserves toStringTag", () => {
-  const m = createDeterministicMath() as Record<string, unknown>;
-  for (const key of Object.getOwnPropertyNames(Math)) {
-    if (key === "random") continue;
-    assert.equal(key in m, true, `Math.${key} should be present on the shim`);
-  }
-  assert.equal(m["PI"], Math.PI);
-  assert.equal(m["E"], Math.E);
-  assert.equal(m["SQRT2"], Math.SQRT2);
-  const max = m["max"] as (...a: number[]) => number;
-  const trunc = m["trunc"] as (n: number) => number;
-  const hypot = m["hypot"] as (...a: number[]) => number;
-  assert.equal(max.apply(null, [3, 1, 2]), 3, "max.apply works (this-binding ok after freeze)");
-  assert.equal(trunc(-1.9), -1);
-  assert.equal(hypot(3, 4), 5);
-  // Symbol.toStringTag is copied (Object.getOwnPropertySymbols), so the shim
-  // stringifies as [object Math] like the real Math.
-  assert.equal(Object.prototype.toString.call(m), "[object Math]", "Symbol.toStringTag preserved");
 });
 
 test("reapStaleWorktrees: removes an orphaned (untracked) ultracode-wt-* dir", () => {

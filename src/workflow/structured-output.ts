@@ -7,6 +7,7 @@
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
+import { assertStructuredOutputLimit } from "./value-limits.ts";
 
 export interface StructuredOutputCapture<T = unknown> {
   value: T | undefined;
@@ -36,6 +37,7 @@ export function createStructuredOutputTool<TSchemaDef extends TSchema>({
     ],
     parameters: schema,
     async execute(_toolCallId, params) {
+      assertStructuredOutputLimit(params);
       capture.value = params;
       capture.called = true;
       return {

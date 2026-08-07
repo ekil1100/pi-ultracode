@@ -16,10 +16,14 @@ export interface RunHandle {
   details?: WorkflowRunDetails;
 }
 
+interface RegistryScope {
+  runs: Map<string, RunHandle>;
+  order: string[];
+}
+
 export class WorkflowRegistry {
-  private readonly runs = new Map<string, RunHandle>();
+  private readonly scopes = new Map<string, RegistryScope>();
   private readonly listeners = new Set<() => void>();
-  private order: string[] = [];
   private scopeDir?: string;
 
   register(
@@ -28,12 +32,13 @@ export class WorkflowRegistry {
     abort: () => void,
     details?: WorkflowRunDetails,
   ): RunHandle {
+    const scope = this.currentScope();
     const handle: RunHandle = { snapshot, abort, startedAt: Date.now(), details };
-    this.runs.set(runId, handle);
-    this.order = this.order.filter((id) => id !== runId);
-    this.order.push(runId);
-    // Keep at most the 50 most recent runs in memory without evicting active work.
-    this.trimRuns();
+    scope.runs.set(runId, handle);
+    scope.order = scope.order.filter((id) => id !== runId);
+    scope.order.push(runId);
+    // Keep at most the 50 most recent runs per session without evicting active work.
+    this.trimRuns(scope);
     this.notify();
     return handle;
   }
@@ -56,6 +61,7 @@ export class WorkflowRegistry {
   /** Restore the newest task-detail manifests for the current Pi session. */
   restoreRuns(runsDir: string): number {
     this.setScope(runsDir);
+    const scope = this.currentScope();
     let files: string[];
     try {
       files = fs.readdirSync(runsDir)
@@ -69,7 +75,7 @@ export class WorkflowRegistry {
     let restored = 0;
     for (const file of files) {
       const loaded = WorkflowRunDetails.restore(file);
-      if (!loaded || this.runs.has(loaded.snapshot.runId ?? loaded.details.runId)) continue;
+      if (!loaded || scope.runs.has(loaded.snapshot.runId ?? loaded.details.runId)) continue;
       const runId = loaded.snapshot.runId ?? loaded.details.runId;
       if (loaded.snapshot.status === "running") {
         loaded.snapshot.status = "aborted";
@@ -94,31 +100,32 @@ export class WorkflowRegistry {
         startedAt,
         details: loaded.details,
       };
-      this.runs.set(runId, handle);
-      this.order.push(runId);
+      scope.runs.set(runId, handle);
+      scope.order.push(runId);
       restored++;
     }
-    this.trimRuns();
+    this.trimRuns(scope);
     if (restored) this.notify();
     return restored;
   }
 
+  /** Select a session without discarding live handles from other sessions. */
   setScope(runsDir: string): void {
     const resolved = path.resolve(runsDir);
     if (this.scopeDir === resolved) return;
     this.scopeDir = resolved;
-    this.runs.clear();
-    this.order = [];
+    this.currentScope();
     this.notify();
   }
 
   get(runId: string): RunHandle | undefined {
-    return this.runs.get(runId);
+    return this.currentScope().runs.get(runId);
   }
 
   list(): RunHandle[] {
-    return this.order
-      .map((id) => this.runs.get(id))
+    const scope = this.currentScope();
+    return scope.order
+      .map((id) => scope.runs.get(id))
       .filter((handle): handle is RunHandle => Boolean(handle))
       .sort((left, right) => right.startedAt - left.startedAt);
   }
@@ -128,7 +135,7 @@ export class WorkflowRegistry {
   }
 
   abortAll(): void {
-    for (const handle of this.runs.values()) {
+    for (const handle of this.currentScope().runs.values()) {
       if (handle.snapshot.status === "running") {
         try {
           handle.abort();
@@ -139,16 +146,26 @@ export class WorkflowRegistry {
     }
   }
 
-  private trimRuns(): void {
-    while (this.runs.size > 50) {
-      const candidate = [...this.runs.entries()].sort((left, right) => {
+  private currentScope(): RegistryScope {
+    const key = this.scopeDir ?? "<default>";
+    let scope = this.scopes.get(key);
+    if (!scope) {
+      scope = { runs: new Map(), order: [] };
+      this.scopes.set(key, scope);
+    }
+    return scope;
+  }
+
+  private trimRuns(scope: RegistryScope): void {
+    while (scope.runs.size > 50) {
+      const candidate = [...scope.runs.entries()].sort((left, right) => {
         const leftActive = left[1].snapshot.status === "running" ? 1 : 0;
         const rightActive = right[1].snapshot.status === "running" ? 1 : 0;
         return leftActive - rightActive || left[1].startedAt - right[1].startedAt;
       })[0];
       if (!candidate) break;
-      this.runs.delete(candidate[0]);
-      this.order = this.order.filter((id) => id !== candidate[0]);
+      scope.runs.delete(candidate[0]);
+      scope.order = scope.order.filter((id) => id !== candidate[0]);
     }
   }
 }

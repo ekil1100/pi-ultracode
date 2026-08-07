@@ -31,6 +31,8 @@ export interface WorkflowAgentUsageSnapshot {
 
 export interface WorkflowAgentSnapshot {
   id: number;
+  /** Stable orchestration identity; display order continues to use id. */
+  callPath?: string;
   label: string;
   phase?: string;
   workflowPath?: string[];
@@ -84,6 +86,10 @@ export interface WorkflowSnapshot {
   spentTokens: number;
   newTokens: number;
   replayedTokens: number;
+  /** Effective logical agent-slot cap for this run; usage-only, not a token budget. */
+  maxAgents?: number;
+  /** Lifetime live-agent admissions across resume generations. */
+  agentsUsed?: number;
   /** Sanitized session-scoped workflow detail manifest for headless consumers. */
   detailsManifestPath?: string;
   durationMs?: number;
@@ -92,7 +98,7 @@ export interface WorkflowSnapshot {
 }
 
 export interface RenderOptions {
-  maxAgents?: number;
+  maxAgentRows?: number;
   maxLogs?: number;
   showResultPreviews?: boolean;
   /** @deprecated No-op retained for source compatibility. */
@@ -132,7 +138,7 @@ export function recompute(snapshot: WorkflowSnapshot): WorkflowSnapshot {
 }
 
 export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderOptions = {}): string[] {
-  const maxAgents = options.maxAgents ?? 6;
+  const maxAgentRows = options.maxAgentRows ?? 6;
   const maxLogs = options.maxLogs ?? 2;
   const showResultPreviews = options.showResultPreviews ?? false;
   const now = options.now ?? Date.now();
@@ -150,7 +156,10 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
   ].filter(Boolean);
   const state = stateParts.length ? `, ${stateParts.join(", ")}` : "";
   const cached = snapshot.cachedCount ? ` · ${snapshot.cachedCount} cached` : "";
-  const header = `◆ ${statusMark(snapshot.status)} ${shorten(snapshot.name, 60)} (${snapshot.doneCount}/${snapshot.agentCount} done${state})${cached}${tokens}`;
+  const agentSlots = snapshot.maxAgents
+    ? ` · agents ${snapshot.agentsUsed ?? snapshot.agentCount}/${snapshot.maxAgents}`
+    : "";
+  const header = `◆ ${statusMark(snapshot.status)} ${shorten(snapshot.name, 60)} (${snapshot.doneCount}/${snapshot.agentCount} done${state})${cached}${agentSlots}${tokens}`;
   const lines = [header];
 
   const phaseNames = unique([
@@ -181,19 +190,19 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
     lines.push(
       `  ${marker} ${shorten(phase, 60)} ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}${cancelled ? ` · ${cancelled} cancelled` : ""}`,
     );
-    for (const agent of agents.slice(-maxAgents)) {
+    for (const agent of agents.slice(-maxAgentRows)) {
       lines.push(...renderAgentLines(agent, { showResultPreviews, now }));
     }
-    if (agents.length > maxAgents) lines.push(`    … ${agents.length - maxAgents} earlier agents`);
+    if (agents.length > maxAgentRows) lines.push(`    … ${agents.length - maxAgentRows} earlier agents`);
   }
 
   const unphased = snapshot.agents.filter((a) => !rendered.has(a));
   if (unphased.length) {
     lines.push("  (unphased)");
-    for (const agent of unphased.slice(-maxAgents)) {
+    for (const agent of unphased.slice(-maxAgentRows)) {
       lines.push(...renderAgentLines(agent, { showResultPreviews, now }));
     }
-    if (unphased.length > maxAgents) lines.push(`    … ${unphased.length - maxAgents} earlier agents`);
+    if (unphased.length > maxAgentRows) lines.push(`    … ${unphased.length - maxAgentRows} earlier agents`);
   }
 
   for (const log of snapshot.logs.slice(-maxLogs)) lines.push(`  log: ${shorten(log, 100)}`);

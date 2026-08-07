@@ -485,6 +485,79 @@ test("workflow tool keeps raw deltas out of tool details while the private task 
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+test("high-frequency telemetry does not rewrite the durable manifest hot path", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-telemetry-hotpath-"));
+  try {
+    const runWorkflowFn = (async (_script: string, options: any) => {
+      options.onAgentStart?.({ id: 1, label: "hot", prompt: "p", cached: false });
+      const runsDir = path.join(root, "ultracode-runs");
+      const manifestPath = path.join(
+        runsDir,
+        fs.readdirSync(runsDir).find((entry) => entry.endsWith(".details.json"))!,
+      );
+      const before = fs.readFileSync(manifestPath, "utf8");
+      for (let index = 0; index < 100; index++) {
+        options.onAgentTelemetry?.({
+          id: 1,
+          label: "hot",
+          kind: index % 2 === 0 ? "tool_start" : "tool_end",
+          toolCallId: `tool-${Math.floor(index / 2)}`,
+          toolName: "read",
+        });
+      }
+      assert.equal(
+        fs.readFileSync(manifestPath, "utf8"),
+        before,
+        "telemetry is retained in the bounded transcript without fsyncing the full manifest per event",
+      );
+      options.onAgentEnd?.({
+        id: 1,
+        label: "hot",
+        status: "done",
+        result: "done",
+        usage: { outputTokens: 1, inputTokens: 1, totalTokens: 2, cost: 0 },
+      });
+      return {
+        result: "done",
+        agentCount: 1,
+        cachedCount: 0,
+        spentTokens: 1,
+        newTokens: 2,
+        replayedTokens: 0,
+        durationMs: 1,
+        logs: [],
+        phases: [],
+        meta: { name: "telemetry_hotpath" },
+      };
+    }) as any;
+    const tool = createWorkflowTool({ runWorkflowFn });
+    await tool.execute(
+      "telemetry-hotpath",
+      { script: `export const meta = { name: 'telemetry_hotpath', description: 'x' }\nreturn 'done'` } as any,
+      undefined,
+      undefined,
+      { cwd: process.cwd(), sessionManager: { getSessionDir: () => root } } as any,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("details restore rejects a manifest whose runId does not match its filename", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-runid-"));
+  try {
+    const details = new WorkflowRunDetails({ runId: "wf_run_b", name: "B", runsDir: root });
+    const snapshot = createSnapshot({ name: "B", description: "x" }, "wf_run_b");
+    details.persist(snapshot);
+    const mismatchedPath = path.join(root, "wf_run_a.details.json");
+    fs.copyFileSync(details.manifestPath, mismatchedPath);
+    assert.equal(WorkflowRunDetails.restore(mismatchedPath), undefined);
+    assert.equal(fs.existsSync(path.join(root, "wf_run_a.tasks")), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("registry restoration marks interrupted runs and tasks as cancelled", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-stale-"));
   const details = new WorkflowRunDetails({ runId: "wf_stale", name: "stale", runsDir: root });
@@ -501,6 +574,154 @@ test("registry restoration marks interrupted runs and tasks as cancelled", () =>
   assert.equal(restored.snapshot.agents[0]?.status, "cancelled");
   assert.equal(restored.details?.getTaskSummary(1)?.status, "cancelled");
   fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("resume generations hide stale task summaries while retaining cached transcripts", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-generation-"));
+  try {
+    const details = new WorkflowRunDetails({ runId: "wf_generation", name: "generation", runsDir: root });
+    details.startTask({ id: 1, label: "A", prompt: "a" });
+    details.finishTask(1, { status: "done", result: "a" });
+    details.startTask({ id: 2, label: "B", prompt: "b" });
+    details.finishTask(2, { status: "done", result: "b" });
+    const firstTranscript = details.getTaskSummary(1)?.transcriptPath;
+    let snapshot = createSnapshot({ name: "generation", description: "x" }, "wf_generation");
+    snapshot.agents = [
+      { id: 1, label: "A", status: "done" },
+      { id: 2, label: "B", status: "done" },
+    ];
+    details.persist(recompute(snapshot));
+
+    const restored = WorkflowRunDetails.restore(details.manifestPath)!.details;
+    restored.beginGeneration();
+    assert.deepEqual(restored.listTasks(), []);
+    restored.startTask({ id: 1, label: "A", prompt: "a", cached: true });
+    assert.deepEqual(restored.listTasks().map((task) => task.id), [1]);
+    assert.equal(restored.getTaskSummary(1)?.transcriptPath, firstTranscript);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a resume failure before the first task preserves prior task summaries", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-empty-generation-"));
+  try {
+    const details = new WorkflowRunDetails({
+      runId: "wf_empty_generation",
+      name: "empty_generation",
+      runsDir: root,
+    });
+    details.startTask({ id: 1, callPath: "$/a:0", label: "A", prompt: "a" });
+    details.finishTask(1, { status: "done", result: "a" });
+    let snapshot = createSnapshot({ name: "empty_generation", description: "x" }, "wf_empty_generation");
+    snapshot.agents = [{ id: 1, callPath: "$/a:0", label: "A", status: "done" }];
+    details.persist(recompute(snapshot));
+
+    const resumed = WorkflowRunDetails.restore(details.manifestPath)!.details;
+    resumed.beginGeneration();
+    const failed = createSnapshot({ name: "empty_generation", description: "x" }, "wf_empty_generation");
+    failed.status = "failed";
+    resumed.close(recompute(failed));
+
+    const restoredAgain = WorkflowRunDetails.restore(details.manifestPath)!.details;
+    restoredAgain.beginGeneration();
+    const replayed = restoredAgain.startTask({
+      id: 1,
+      callPath: "$/a:0",
+      label: "A",
+      prompt: "a",
+      cached: true,
+    });
+    assert.equal(replayed.resultPreview, "a");
+    assert.ok(replayed.transcriptPath);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resume task transcripts follow stable callPath instead of completion-order ids", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-call-path-"));
+  try {
+    const details = new WorkflowRunDetails({ runId: "wf_call_path", name: "call_path", runsDir: root });
+    details.startTask({ id: 1, callPath: "$/p:0/b:0/a:0", label: "A", prompt: "prompt A" });
+    details.finishTask(1, { status: "done", result: "A" });
+    details.startTask({ id: 2, callPath: "$/p:0/b:1/a:0", label: "B", prompt: "prompt B" });
+    details.finishTask(2, { status: "done", result: "B" });
+    const bTranscript = details.getTaskSummary(2)?.transcriptPath;
+    let snapshot = createSnapshot({ name: "call_path", description: "x" }, "wf_call_path");
+    snapshot.agents = [
+      { id: 1, callPath: "$/p:0/b:0/a:0", label: "A", status: "done" },
+      { id: 2, callPath: "$/p:0/b:1/a:0", label: "B", status: "done" },
+    ];
+    details.persist(recompute(snapshot));
+
+    const restored = WorkflowRunDetails.restore(details.manifestPath)!.details;
+    restored.beginGeneration();
+    const replayed = restored.startTask({
+      id: 1,
+      callPath: "$/p:0/b:1/a:0",
+      label: "B",
+      prompt: "prompt B",
+      cached: true,
+    });
+    assert.equal(replayed.transcriptPath, bTranscript);
+    assert.equal(replayed.label, "B");
+    assert.equal(replayed.id, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("live reordered calls cannot overwrite another callPath transcript", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-transcript-key-"));
+  try {
+    const details = new WorkflowRunDetails({ runId: "wf_transcript_key", name: "transcript_key", runsDir: root });
+    details.startTask({ id: 1, callPath: "$/b", label: "B", prompt: "prompt B" });
+    details.finishTask(1, { status: "done", result: "B" });
+    details.startTask({ id: 2, callPath: "$/a", label: "A", prompt: "old prompt A" });
+    details.finishTask(2, { status: "error", error: "failed" });
+    let snapshot = createSnapshot({ name: "transcript_key", description: "x" }, "wf_transcript_key");
+    snapshot.agents = [
+      { id: 1, callPath: "$/b", label: "B", status: "done" },
+      { id: 2, callPath: "$/a", label: "A", status: "error" },
+    ];
+    details.persist(recompute(snapshot));
+
+    const resumed = WorkflowRunDetails.restore(details.manifestPath)!.details;
+    resumed.beginGeneration();
+    resumed.startTask({ id: 1, callPath: "$/a", label: "A", prompt: "new prompt A" });
+    resumed.startTask({ id: 2, callPath: "$/b", label: "B", prompt: "prompt B", cached: true });
+    assert.equal(resumed.getTask(2)?.prompt, "prompt B");
+    assert.equal(fs.existsSync(resumed.getTaskSummary(2)?.transcriptPath ?? ""), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("registry preserves active handles when switching session scopes", () => {
+  const rootA = fs.mkdtempSync(path.join(os.tmpdir(), "uc-registry-a-"));
+  const rootB = fs.mkdtempSync(path.join(os.tmpdir(), "uc-registry-b-"));
+  try {
+    const registry = new WorkflowRegistry();
+    let abortsA = 0;
+    let abortsB = 0;
+    registry.setScope(rootA);
+    registry.register("wf_a", createSnapshot({ name: "a", description: "x" }, "wf_a"), () => { abortsA++; });
+    registry.setScope(rootB);
+    registry.register("wf_b", createSnapshot({ name: "b", description: "x" }, "wf_b"), () => { abortsB++; });
+    assert.equal(registry.get("wf_a"), undefined);
+    assert.ok(registry.get("wf_b"));
+
+    registry.setScope(rootA);
+    assert.ok(registry.get("wf_a"), "switching back restores the live in-memory handle");
+    assert.equal(registry.get("wf_b"), undefined);
+    registry.abortAll();
+    assert.equal(abortsA, 1);
+    assert.equal(abortsB, 0, "abort remains scoped to the selected session");
+  } finally {
+    fs.rmSync(rootA, { recursive: true, force: true });
+    fs.rmSync(rootB, { recursive: true, force: true });
+  }
 });
 
 test("workflow overlay renders responsive task stats and consumes Escape before closing", () => {
