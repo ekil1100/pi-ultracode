@@ -17,6 +17,7 @@ import { createWorkflowTool, type WorkflowToolDeps } from "../src/workflow/tool.
 import { UltracodeMode, type ThinkingPreferenceStore } from "../src/mode.ts";
 import { isThinkingLevel, piVersionSupportsMaxThinking } from "../src/thinking.ts";
 import { registerCommands } from "../src/commands.ts";
+import { WorkflowRegistry } from "../src/workflow/registry.ts";
 
 export interface ThinkingPreferenceContext {
   cwd: string;
@@ -38,14 +39,16 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     ...workflowDeps
   } = extraDeps;
 
+  const registry = workflowDeps.registry ?? new WorkflowRegistry();
   const workflowTool = createWorkflowTool({
     getThinkingLevel: () => mode.getSubagentThinkingLevel(),
     ...workflowDeps,
+    registry,
     isExecutionAllowed: () => mode.isEnforcing(),
   });
   pi.registerTool(workflowTool);
 
-  registerCommands(pi, mode);
+  registerCommands(pi, mode, registry);
 
   // Opt-in via CLI flag: `pi --ultracode`.
   pi.registerFlag("ultracode", {

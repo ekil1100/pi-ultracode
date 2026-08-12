@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import { SettingsManager } from "@earendil-works/pi-coding-agent";
 import ultracodeExtension from "../extensions/ultracode.ts";
 import { createWorkflowTool, workflowRunsDir } from "../src/workflow/tool.ts";
-import { getRegistry } from "../src/workflow/registry.ts";
+import { WorkflowRegistry } from "../src/workflow/registry.ts";
 import { createSnapshot } from "../src/workflow/display.ts";
 import { activeWorkflowCount, clearWorkflowLeasesForTests } from "../src/workflow/leases.ts";
 import { MAX_WORKFLOW_ARGS_BYTES } from "../src/workflow/value-limits.ts";
@@ -500,13 +501,16 @@ test("model and manual effort changes reassert max and refresh status", async ()
   assert.ok(turn?.systemPrompt.includes("<ultracode>"));
 });
 
-test("/workflows and F6 open the interactive overlay; abort remains available", async () => {
+test("/workflows and F6 use the extension session's registry; abort remains isolated", async () => {
+  const registry = new WorkflowRegistry();
+  const otherRegistry = new WorkflowRegistry();
   const { pi, state } = makeMockPi();
-  extension(pi);
+  extension(pi, { registry });
   const { ctx, widgets, customCalls } = makeCtx(state);
 
-  const registry = getRegistry();
-  registry.setScope(workflowRunsDir(ctx));
+  let otherAborted = false;
+  const other = createSnapshot({ name: "other", description: "x" }, "wf_other");
+  otherRegistry.register("wf_other", other, () => { otherAborted = true; });
   const snap = createSnapshot({ name: "demo", description: "x" }, "wf_overlaytest");
   snap.status = "completed";
   registry.register("wf_overlaytest", snap, () => {});
@@ -524,6 +528,26 @@ test("/workflows and F6 open the interactive overlay; abort remains available", 
   registry.register("wf_aborttest", active, () => { aborted = true; });
   await handler("abort", ctx);
   assert.equal(aborted, true);
+  assert.equal(otherAborted, false, "abort cannot cross an extension-session registry");
+});
+
+test("workflow run artifacts are physically separated by Pi session id", () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-session-scope-"));
+  try {
+    const a = workflowRunsDir({
+      cwd: process.cwd(),
+      sessionManager: { getSessionDir: () => sessionDir, getSessionId: () => "session-a" },
+    });
+    const b = workflowRunsDir({
+      cwd: process.cwd(),
+      sessionManager: { getSessionDir: () => sessionDir, getSessionId: () => "session-b" },
+    });
+    assert.notEqual(a, b);
+    assert.equal(path.dirname(a), path.join(sessionDir, "ultracode-runs"));
+    assert.equal(path.dirname(b), path.join(sessionDir, "ultracode-runs"));
+  } finally {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
 });
 
 test("workflow tool executes a script end-to-end with an injected runner", async () => {
@@ -613,6 +637,83 @@ test("workflow tool resumes a prior run from its journal", async () => {
   fs.rmSync(sessionDir, { recursive: true, force: true });
 });
 
+test("workflow resume cannot replay across repository or cwd targets", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-resume-target-session-"));
+  const firstCwd = fs.mkdtempSync(path.join(os.tmpdir(), "uc-resume-target-a-"));
+  const secondCwd = fs.mkdtempSync(path.join(os.tmpdir(), "uc-resume-target-b-"));
+  let runnerCalls = 0;
+  try {
+    const tool = createWorkflowTool({
+      testRunner: {
+        run: async () => {
+          runnerCalls++;
+          return { value: "done", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: firstCwd };
+        },
+      },
+    });
+    const sessionManager = { getSessionDir: () => sessionDir };
+    const script = `export const meta = { name: 'resume_target', description: 'x' }\nreturn await agent('one')`;
+    const first = await tool.execute("target-a", { script } as any, undefined, undefined, {
+      cwd: firstCwd,
+      sessionManager,
+    } as any);
+    const runId = (first.details as any).runId as string;
+    assert.equal(runnerCalls, 1);
+
+    await assert.rejects(
+      tool.execute("target-b", { script, resumeFromRunId: runId } as any, undefined, undefined, {
+        cwd: secondCwd,
+        sessionManager,
+      } as any),
+      /immutable repository\/cwd target/i,
+    );
+    assert.equal(runnerCalls, 1);
+  } finally {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+    fs.rmSync(firstCwd, { recursive: true, force: true });
+    fs.rmSync(secondCwd, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool validates completed worktree effects before resume", async () => {
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-resume-delivery-session-"));
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "uc-resume-delivery-repo-"));
+  const git = (args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
+  let runnerCalls = 0;
+  try {
+    git(["init", "-q"]);
+    git(["config", "user.email", "t@t"]);
+    git(["config", "user.name", "t"]);
+    fs.writeFileSync(path.join(repo, "f.txt"), "base\n");
+    git(["add", "."]);
+    git(["commit", "-qm", "base"]);
+    const tool = createWorkflowTool({
+      testRunner: {
+        run: async (call: any) => {
+          runnerCalls++;
+          fs.writeFileSync(path.join(call.cwd, "f.txt"), "agent\n");
+          return { value: "done", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: call.cwd };
+        },
+      },
+    });
+    const ctx: any = { cwd: repo, sessionManager: { getSessionDir: () => sessionDir } };
+    const script = `export const meta = { name: 'resume_delivery', description: 'x' }\nreturn await agent('write', { isolation: 'worktree' })`;
+    const first = await tool.execute("delivery-first", { script } as any, undefined, undefined, ctx);
+    const runId = (first.details as any).runId as string;
+    assert.equal(runnerCalls, 1);
+    git(["checkout", "--", "f.txt"]);
+
+    await assert.rejects(
+      tool.execute("delivery-resume", { script, resumeFromRunId: runId } as any, undefined, undefined, ctx),
+      /delivery.*no longer present|verif/i,
+    );
+    assert.equal(runnerCalls, 1);
+  } finally {
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});
+
 test("saved workflow names cannot traverse outside the workflows directory", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "uc-workflow-name-"));
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-workflow-name-session-"));
@@ -639,6 +740,49 @@ test("saved workflow names cannot traverse outside the workflows directory", asy
   }
 });
 
+test("project saved workflows require project trust", async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "uc-workflow-trust-"));
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-workflow-trust-session-"));
+  const name = `project_only_${Date.now().toString(36)}`;
+  let runtimeCalls = 0;
+  try {
+    const workflowsDir = path.join(cwd, ".pi", "ultracode", "workflows");
+    fs.mkdirSync(workflowsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(workflowsDir, `${name}.workflow.js`),
+      `export const meta = { name: '${name}', description: 'x' }\nreturn 1`,
+    );
+    const tool = createWorkflowTool({
+      runWorkflowFn: (async (_script: string, options: any) => {
+        runtimeCalls++;
+        return {
+          meta: { name, description: "x" }, result: 1, logs: [], phases: [],
+          agentCount: 0, agentsUsed: 0, cachedCount: 0, spentTokens: 0,
+          newTokens: 0, replayedTokens: 0, durationMs: 1, maxAgents: options.maxAgents,
+        };
+      }) as any,
+    });
+    const baseCtx = { cwd, sessionManager: { getSessionDir: () => sessionDir } };
+    await assert.rejects(
+      tool.execute("untrusted-name", { name } as any, undefined, undefined, {
+        ...baseCtx,
+        isProjectTrusted: () => false,
+      } as any),
+      /no accessible saved workflow/i,
+    );
+    assert.equal(runtimeCalls, 0);
+
+    await tool.execute("trusted-name", { name } as any, undefined, undefined, {
+      ...baseCtx,
+      isProjectTrusted: () => true,
+    } as any);
+    assert.equal(runtimeCalls, 1);
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
 test("saved workflow names reject symlinked source files", async () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "uc-workflow-symlink-"));
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-workflow-symlink-session-"));
@@ -649,7 +793,11 @@ test("saved workflow names reject symlinked source files", async () => {
     fs.mkdirSync(workflowsDir, { recursive: true });
     fs.symlinkSync(outside, path.join(workflowsDir, "linked.workflow.js"));
     const tool = createWorkflowTool();
-    const ctx: any = { cwd, sessionManager: { getSessionDir: () => sessionDir } };
+    const ctx: any = {
+      cwd,
+      sessionManager: { getSessionDir: () => sessionDir },
+      isProjectTrusted: () => true,
+    };
     await assert.rejects(
       tool.execute("saved-symlink", { name: "linked" } as any, undefined, undefined, ctx),
       /symlink/,
@@ -673,7 +821,11 @@ test("saved workflow names reject symlinked parent directories", async () => {
     );
     fs.symlinkSync(outside, path.join(cwd, ".pi"));
     const tool = createWorkflowTool();
-    const ctx: any = { cwd, sessionManager: { getSessionDir: () => sessionDir } };
+    const ctx: any = {
+      cwd,
+      sessionManager: { getSessionDir: () => sessionDir },
+      isProjectTrusted: () => true,
+    };
     await assert.rejects(
       tool.execute("saved-parent-symlink", { name: "linked" } as any, undefined, undefined, ctx),
       /symlink/,
@@ -786,10 +938,11 @@ test("workflow tool forwards the raw ultracode max level and injected model runt
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-think-"));
   try {
     const modelRuntime = { marker: "shared-runtime", getModel: () => undefined };
-    let captured: { thinkingLevel?: string; modelRuntime?: unknown } = {};
+    let captured: { thinkingLevel?: string; modelRuntime?: unknown; projectTrusted?: boolean } = {};
     const fakeRun = async (_script: string, options: any) => {
       captured.thinkingLevel = options.thinkingLevel;
       captured.modelRuntime = options.modelRuntime;
+      captured.projectTrusted = options.projectTrusted;
       return {
         meta: { name: "x", description: "x" },
         result: { ok: true },
@@ -806,11 +959,21 @@ test("workflow tool forwards the raw ultracode max level and injected model runt
       modelRuntime,
       runWorkflowFn: fakeRun as any,
     });
-    const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+    let trustReads = 0;
+    const ctx: any = {
+      cwd: process.cwd(),
+      sessionManager: { getSessionDir: () => sessionDir },
+      isProjectTrusted: () => {
+        trustReads++;
+        return false;
+      },
+    };
     const script = `export const meta = { name: 'x', description: 'x' }\nagent('a', { label: 'a' })`;
     await tool.execute("tc1", { script } as any, undefined, undefined, ctx);
     assert.equal(captured.thinkingLevel, "max", "raw max thinking level is forwarded to runWorkflow");
     assert.equal(captured.modelRuntime, modelRuntime, "SDK hosts can share their canonical runtime");
+    assert.equal(captured.projectTrusted, false, "the parent project trust decision is forwarded unchanged");
+    assert.equal(trustReads, 1, "project trust is captured once per tool invocation");
   } finally {
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
@@ -1261,7 +1424,118 @@ test("workflow tool cannot commit success after an external abort race", async (
   }
 });
 
-test("workflow tool propagates journal close failures after an otherwise successful run", async () => {
+test("workflow tool publishes completed only after terminal journal commit", async () => {
+  clearWorkflowLeasesForTests();
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-terminal-publication-"));
+  const registry = new WorkflowRegistry();
+  const statuses: string[] = [];
+  registry.subscribe(() => {
+    const status = registry.list()[0]?.snapshot.status;
+    if (status) statuses.push(status);
+  });
+  try {
+    const tool = createWorkflowTool({
+      registry,
+      runWorkflowFn: (async (_script: string, options: any) => {
+        const recordResult = options.journal.recordResult.bind(options.journal);
+        options.journal.recordResult = (record: any) => {
+          if (record.ok) throw new Error("terminal commit failed");
+          return recordResult(record);
+        };
+        return {
+          meta: { name: "terminal_publication", description: "x" }, result: 1,
+          logs: [], phases: [], agentCount: 0, agentsUsed: 0, cachedCount: 0,
+          spentTokens: 0, newTokens: 0, replayedTokens: 0, durationMs: 1, maxAgents: 128,
+        };
+      }) as any,
+    });
+    const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+    const script = `export const meta = { name: 'terminal_publication', description: 'x' }\nreturn 1`;
+    await assert.rejects(
+      tool.execute("terminal-publication", { script } as any, undefined, undefined, ctx),
+      /terminal commit failed/i,
+    );
+    assert.equal(statuses.includes("completed"), false);
+    assert.equal(registry.list()[0]?.snapshot.status, "failed");
+  } finally {
+    clearWorkflowLeasesForTests();
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool isolates observer mutations from its durable completed result", async () => {
+  clearWorkflowLeasesForTests();
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-terminal-observer-isolation-"));
+  const registry = new WorkflowRegistry();
+  registry.subscribe(() => {
+    const view = registry.list()[0];
+    if (view?.snapshot.status === "completed") (view.snapshot.result as any).ok = false;
+  });
+  try {
+    const tool = createWorkflowTool({
+      registry,
+      runWorkflowFn: (async () => ({
+        meta: { name: "terminal_observer_isolation", description: "x" }, result: { ok: true },
+        logs: [], phases: [], agentCount: 0, agentsUsed: 0, cachedCount: 0,
+        spentTokens: 0, newTokens: 0, replayedTokens: 0, durationMs: 1, maxAgents: 128,
+      })) as any,
+    });
+    const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+    const script = `export const meta = { name: 'terminal_observer_isolation', description: 'x' }\nreturn { ok: true }`;
+    const output: any = await tool.execute(
+      "terminal-observer-isolation",
+      { script } as any,
+      undefined,
+      (update: any) => {
+        if (update.details.status === "completed") update.details.result.ok = false;
+      },
+      ctx,
+    );
+
+    assert.deepEqual(output.details.result, { ok: true });
+    assert.match(output.content[0].text, /"ok": true/);
+    assert.deepEqual(registry.get(output.details.runId)?.snapshot.result, { ok: true });
+    const records = fs.readFileSync(
+      path.join(sessionDir, "ultracode-runs", `${output.details.runId}.jsonl`),
+      "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(records.findLast((record) => record.type === "result")?.result, { ok: true });
+  } finally {
+    clearWorkflowLeasesForTests();
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool preserves primary failure across failed-state observers", async () => {
+  clearWorkflowLeasesForTests();
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-failure-observer-"));
+  try {
+    const tool = createWorkflowTool({
+      runWorkflowFn: (async () => { throw new Error("PRIMARY failure"); }) as any,
+    });
+    const ctx: any = {
+      cwd: process.cwd(),
+      sessionManager: { getSessionDir: () => sessionDir },
+      ui: { notify: () => { throw new Error("NOTIFY secondary"); } },
+    };
+    const script = `export const meta = { name: 'failure_observer', description: 'x' }\nreturn 1`;
+    await assert.rejects(
+      tool.execute(
+        "failure-observer",
+        { script } as any,
+        undefined,
+        () => { throw new Error("UPDATE secondary"); },
+        ctx,
+      ),
+      /PRIMARY failure/i,
+    );
+  } finally {
+    clearWorkflowLeasesForTests();
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool keeps a durable success when final journal close reports an error", async () => {
   clearWorkflowLeasesForTests();
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-journal-close-fail-"));
   try {
@@ -1281,9 +1555,34 @@ test("workflow tool propagates journal close failures after an otherwise success
     });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'journal_close_fail', description: 'x' }\nreturn 1`;
+    const result = await tool.execute("journal-close-fail", { script } as any, undefined, undefined, ctx);
+    assert.match((result.content[0] as any).text, /Workflow journal_close_fail completed/);
+    assert.equal(activeWorkflowCount(path.join(sessionDir, "ultracode-runs")), 0);
+  } finally {
+    clearWorkflowLeasesForTests();
+    fs.rmSync(sessionDir, { recursive: true, force: true });
+  }
+});
+
+test("workflow tool preserves a primary failure when journal close also fails", async () => {
+  clearWorkflowLeasesForTests();
+  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-journal-primary-fail-"));
+  try {
+    const tool = createWorkflowTool({
+      runWorkflowFn: (async (_script: string, options: any) => {
+        const close = options.journal.close.bind(options.journal);
+        options.journal.close = () => {
+          close();
+          throw new Error("secondary close failure");
+        };
+        throw new Error("primary execution failure");
+      }) as any,
+    });
+    const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+    const script = `export const meta = { name: 'journal_primary_fail', description: 'x' }\nreturn 1`;
     await assert.rejects(
-      tool.execute("journal-close-fail", { script } as any, undefined, undefined, ctx),
-      /workflow journal close failed: synthetic journal close failure/,
+      tool.execute("journal-primary-fail", { script } as any, undefined, undefined, ctx),
+      /primary execution failure/i,
     );
     assert.equal(activeWorkflowCount(path.join(sessionDir, "ultracode-runs")), 0);
   } finally {

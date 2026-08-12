@@ -9,6 +9,7 @@
  * claim that Node's vm is a security sandbox.
  */
 
+import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { parseWorkflowScript, type WorkflowMeta } from "./parser.ts";
@@ -39,12 +40,7 @@ import type {
   ThinkingLevel,
 } from "./agent-runner.ts";
 import { safeDisplayText } from "./display-text.ts";
-import {
-  artifactPathExists,
-  readArtifactFile,
-  readContainedArtifactFile,
-  standaloneWorkflowRunsDir,
-} from "./run-artifacts.ts";
+import { standaloneWorkflowRunsDir } from "./run-artifacts.ts";
 import {
   assertWorkflowArgsLimit,
   assertWorkflowOutputLimit,
@@ -52,8 +48,11 @@ import {
 } from "./value-limits.ts";
 
 import { discoverAgentTypes, resolveAgentType, type AgentTypeDef } from "./agent-types.ts";
+import { readSavedWorkflowByName } from "./saved-workflow.ts";
+import { resolveRepositoryContext } from "./repository-context.ts";
 import {
   agentCallKey,
+  hashBytes,
   hashString,
   stableStringify,
   RunJournal,
@@ -64,8 +63,8 @@ import {
   captureWorktreeDiff,
   createWorktree,
   hasChanges,
-  isGitRepo,
   removeWorktree,
+  verifyAppliedPatch,
   writeRescuePatch,
   type Worktree,
   type WorktreeDiff,
@@ -73,6 +72,7 @@ import {
 
 const MAX_CONCURRENCY = 16;
 const DEFAULT_CLEANUP_TIMEOUT_MS = 25_000;
+const REPOSITORY_APPLY_LOCKS = new Map<string, Mutex>();
 export { DEFAULT_MAX_AGENTS, ABSOLUTE_MAX_AGENTS };
 export const MAX_WORKFLOW_LOGS = 256;
 export const WORKFLOW_LOG_OMITTED_TEXT = "additional workflow logs omitted";
@@ -91,6 +91,10 @@ export type AgentActivityEvent = AgentEventBase & AgentActivityInput;
 export interface WorkflowRunOptions {
   cwd?: string;
   args?: unknown;
+  /** Parent session's immutable project-trust decision. Defaults to false. */
+  projectTrusted?: boolean;
+  /** Canonical repository and relative-cwd identity. Computed when omitted. */
+  targetIdentity?: string;
   signal?: AbortSignal;
   concurrency?: number;
   /** Logical cap on agent() slots for this workflow. Defaults to 128; absolute range 1..1024. */
@@ -113,7 +117,7 @@ export interface WorkflowRunOptions {
   runner?: { run: WorkflowAgentRunner["run"] };
   journal?: RunJournal;
   /** Loads a saved workflow body by name; defaults to disk discovery. */
-  loadSavedWorkflow?: (nameOrRef: string | { scriptPath: string }) => { meta: WorkflowMeta; body: string };
+  loadSavedWorkflow?: (name: string) => { meta: WorkflowMeta; body: string };
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
   onAgentStart?: (event: AgentEventBase & {
@@ -160,6 +164,8 @@ export interface WorkflowRunResult<T = unknown> {
 
 interface ActivePanelTrace {
   branchCount: number;
+  panelReservationId: string;
+  branchReservationIds: string[];
   calls: Array<{ callPath: string; status: "pending" | "success" | "failed" }>;
 }
 
@@ -175,23 +181,41 @@ interface RuntimeState {
   maxAgents: number;
 }
 
+type WorktreeOutcome =
+  | { status: "unchanged" | "applied"; keepWorktree: false }
+  | { status: "rescued"; keepWorktree: false; recoveryPath: string }
+  | { status: "preserved"; keepWorktree: true; recoveryPath: string };
+
 export async function runWorkflow<T = unknown>(
   rawScript: string,
   options: WorkflowRunOptions = {},
 ): Promise<WorkflowRunResult<T>> {
   if (options.signal?.aborted) throw new WorkflowAbortError();
   assertWorkflowArgsLimit(options.args);
+  if (options.journal && options.journal.projectTrusted !== options.projectTrusted) {
+    throw new WorkflowPolicyError("workflow journal project trust context does not match this execution");
+  }
+  const actualTargetIdentity = resolveRepositoryContext(options.cwd ?? process.cwd()).identity;
+  if (options.targetIdentity !== undefined && options.targetIdentity !== actualTargetIdentity) {
+    throw new WorkflowPolicyError("workflow target identity does not match the actual cwd");
+  }
+  const targetIdentity = actualTargetIdentity;
+  if (options.journal && options.journal.targetIdentity !== targetIdentity) {
+    throw new WorkflowPolicyError("workflow journal repository/cwd target does not match this execution");
+  }
+  const cleanupTimeoutMs = normalizeCleanupTimeout(options.cleanupTimeoutMs);
+  const effectiveOptions: WorkflowRunOptions = { ...options, targetIdentity, cleanupTimeoutMs };
   const started = Date.now();
   const maxAgents = normalizeMaxAgents(options.maxAgents ?? options.journal?.effectiveMaxAgents);
   const { meta, body } = parseWorkflowScript(rawScript);
-  const runtime = new Runtime(options, maxAgents);
+  const runtime = new Runtime(effectiveOptions, maxAgents);
   const onOuterAbort = () => runtime.abort();
   options.signal?.addEventListener("abort", onOuterAbort, { once: true });
   if (options.signal?.aborted) runtime.abort();
   try {
     const result = await runtime.runBody(body, options.args, meta.name);
     if (runtime.policyError) throw runtime.policyError;
-    await runtime.drain(normalizeCleanupTimeout(options.cleanupTimeoutMs));
+    await runtime.drain(cleanupTimeoutMs);
     if (runtime.policyError) throw runtime.policyError;
     assertWorkflowOutputLimit(result);
     // Keep the public value detached from the Worker message object.
@@ -213,10 +237,14 @@ export async function runWorkflow<T = unknown>(
   } catch (error) {
     runtime.abort();
     if (error instanceof WorkflowCleanupTimeoutError) throw error;
-    const cleanupTimeoutMs = normalizeCleanupTimeout(options.cleanupTimeoutMs);
     try {
       await runtime.drain(cleanupTimeoutMs);
     } catch (cleanupError) {
+      const policy = runtime.policyError ?? (isWorkflowPolicyError(error) ? error : undefined);
+      if (policy) {
+        (policy as WorkflowPolicyError & { cleanupError?: unknown }).cleanupError = cleanupError;
+        throw policy;
+      }
       throw cleanupError;
     }
     if (runtime.policyError) throw runtime.policyError;
@@ -237,7 +265,6 @@ class Runtime implements ScriptExecutorHost {
   private readonly agentTypes: Map<string, AgentTypeDef>;
   private readonly limiter: <R>(fn: () => Promise<R>) => Promise<R>;
   private readonly pending = new Set<Promise<unknown>>();
-  private readonly applyLock = new Mutex();
   private readonly childController = new AbortController();
   private readonly scriptController = new AbortController();
   private readonly admission: AgentAdmission;
@@ -245,13 +272,14 @@ class Runtime implements ScriptExecutorHost {
   private readonly agentRequestOccurrences = new Map<string, number>();
   private readonly nestedRequestOccurrences = new Map<string, number>();
   private readonly activePanelTraces = new Map<string, ActivePanelTrace>();
+  private cleanupDeadline?: number;
   policyError: WorkflowPolicyError | undefined;
 
   constructor(options: WorkflowRunOptions, maxAgents: number) {
     this.options = options;
     this.cwd = options.cwd ?? process.cwd();
     this.runnerInstance = options.runner;
-    this.agentTypes = discoverAgentTypes(this.cwd);
+    this.agentTypes = discoverAgentTypes(this.cwd, options.projectTrusted ?? false);
     this.admission = new AgentAdmission(maxAgents, options.journal?.agentsUsed ?? 0);
     this.state = {
       logs: [],
@@ -274,22 +302,33 @@ class Runtime implements ScriptExecutorHost {
   }
 
   abort(): void {
-    if (!this.childController.signal.aborted) this.childController.abort();
+    this.cleanupDeadline ??= Date.now() + (this.options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS);
+    this.abortChildren();
     if (!this.scriptController.signal.aborted) this.scriptController.abort();
+  }
+
+  abortChildren(): void {
+    this.cleanupDeadline ??= Date.now() + (this.options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS);
+    if (!this.childController.signal.aborted) this.childController.abort();
   }
 
   async drain(timeoutMs?: number): Promise<void> {
     const configuredTimeoutMs = timeoutMs;
-    const deadline = configuredTimeoutMs === undefined ? undefined : Date.now() + configuredTimeoutMs;
-    while (this.pending.size > 0) {
-      const batch = Promise.allSettled([...this.pending]);
-      if (deadline === undefined) {
-        await batch;
-        continue;
+    if (configuredTimeoutMs !== undefined) this.cleanupDeadline ??= Date.now() + configuredTimeoutMs;
+    const deadline = configuredTimeoutMs === undefined ? undefined : this.cleanupDeadline;
+    try {
+      while (this.pending.size > 0) {
+        const batch = Promise.allSettled([...this.pending]);
+        if (deadline === undefined) {
+          await batch;
+          continue;
+        }
+        const remainingMs = deadline - Date.now();
+        if (remainingMs <= 0) throw new WorkflowCleanupTimeoutError(configuredTimeoutMs!);
+        await raceWithCleanupTimeout(batch, remainingMs, configuredTimeoutMs!);
       }
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) throw new WorkflowCleanupTimeoutError(configuredTimeoutMs!);
-      await raceWithCleanupTimeout(batch, remainingMs, configuredTimeoutMs!);
+    } finally {
+      this.releaseOpenPanels();
     }
   }
 
@@ -298,6 +337,7 @@ class Runtime implements ScriptExecutorHost {
     if (!this.runnerInstance) {
       this.runnerInstance = new WorkflowAgentRunner({
         cwd: this.cwd,
+        projectTrusted: this.options.projectTrusted ?? false,
         modelRegistry: this.options.modelRegistry,
         modelRuntime: this.options.modelRuntime,
         model: this.options.model,
@@ -317,6 +357,7 @@ class Runtime implements ScriptExecutorHost {
       stallTimeoutMs: this.options.stallTimeoutMs,
       hostCallLimit: this.options.hostCallLimit,
       workerMemoryLimitMb: this.options.workerMemoryLimitMb,
+      fatalDrainTimeoutMs: this.options.cleanupTimeoutMs,
     });
   }
 
@@ -379,7 +420,12 @@ class Runtime implements ScriptExecutorHost {
         this.admission.releasePanel(panel.panelReservationId);
         throw new WorkflowPolicyError(`workflow produced duplicate parallel callPath: ${callPath}`);
       }
-      this.activePanelTraces.set(callPath, { branchCount: payload.branchCount, calls: [] });
+      this.activePanelTraces.set(callPath, {
+        branchCount: payload.branchCount,
+        panelReservationId: panel.panelReservationId,
+        branchReservationIds: [...panel.branchReservationIds],
+        calls: [],
+      });
       return panel;
     } catch (error) {
       this.recordPolicyError(error);
@@ -433,17 +479,17 @@ class Runtime implements ScriptExecutorHost {
   }): Promise<void> {
     const callPath = typeof payload.callPath === "string" ? payload.callPath : undefined;
     const trace = callPath ? this.activePanelTraces.get(callPath) : undefined;
-    if (payload.completed && callPath && trace) {
-      const branchOutcomes = Array.isArray(payload.branchOutcomes)
-        ? payload.branchOutcomes
-        : [];
-      if (
-        branchOutcomes.length !== trace.branchCount
-        || branchOutcomes.some((outcome) => outcome !== "success" && outcome !== "failed")
-      ) {
-        throw new WorkflowPolicyError(`workflow returned invalid branch outcomes for ${callPath}`);
-      }
-      try {
+    try {
+      if (payload.completed && callPath && trace) {
+        const branchOutcomes = Array.isArray(payload.branchOutcomes)
+          ? payload.branchOutcomes
+          : [];
+        if (
+          branchOutcomes.length !== trace.branchCount
+          || branchOutcomes.some((outcome) => outcome !== "success" && outcome !== "failed")
+        ) {
+          throw new WorkflowPolicyError(`workflow returned invalid branch outcomes for ${callPath}`);
+        }
         this.options.journal?.recordPanelComplete(
           callPath,
           trace.branchCount,
@@ -453,14 +499,25 @@ class Runtime implements ScriptExecutorHost {
             status: call.status === "success" ? "success" : "failed",
           })),
         );
-      } catch (error) {
-        const failure = journalPolicyError(error, "workflow panel completion commit failed");
-        this.recordPolicyError(failure);
-        throw failure;
       }
+    } catch (error) {
+      const failure = journalPolicyError(error, "workflow panel completion commit failed");
+      this.recordPolicyError(failure);
+      throw failure;
+    } finally {
+      this.admission.releasePanel(payload.reservationId);
+      if (callPath && trace) this.releasePanelTrace(callPath, trace);
     }
-    this.admission.releasePanel(payload.reservationId);
-    if (callPath) this.activePanelTraces.delete(callPath);
+  }
+
+  private releasePanelTrace(callPath: string, trace: ActivePanelTrace): void {
+    for (const reservationId of trace.branchReservationIds) this.admission.releasePanel(reservationId);
+    this.admission.releasePanel(trace.panelReservationId);
+    this.activePanelTraces.delete(callPath);
+  }
+
+  private releaseOpenPanels(): void {
+    for (const [callPath, trace] of this.activePanelTraces) this.releasePanelTrace(callPath, trace);
   }
 
   private beginPanelAgent(callPath: string): void {
@@ -494,7 +551,8 @@ class Runtime implements ScriptExecutorHost {
     const requestOccurrence = this.nestedRequestOccurrences.get(requestBase) ?? 0;
     this.nestedRequestOccurrences.set(requestBase, requestOccurrence + 1);
     const callPath = `${requestBase}:${requestOccurrence}`;
-    const loader = this.options.loadSavedWorkflow ?? ((r) => loadSavedWorkflowFromDisk(r, this.cwd));
+    const loader = this.options.loadSavedWorkflow
+      ?? ((r) => loadSavedWorkflowFromDisk(r, this.cwd, this.options.projectTrusted ?? false));
     const loaded = loader(ref);
     const sourceHash = hashString(
       `${stableStringify(loaded.meta)}\u0000${loaded.body}\u0000${argsJson}`,
@@ -552,6 +610,11 @@ class Runtime implements ScriptExecutorHost {
     const label = opts.label?.trim() || defaultLabel(assignedPhase, id);
     const workflowPath = Array.isArray(payload.workflowPath) ? [...payload.workflowPath] : [];
     const agentTypeDef = resolveAgentType(opts.agentType, this.agentTypes);
+    if (opts.agentType !== undefined && !agentTypeDef) {
+      const error = new WorkflowPolicyError(`unknown agent type: ${opts.agentType}`);
+      this.recordPolicyError(error);
+      throw error;
+    }
     const selection = resolveModelSelection({
       pattern: opts.model,
       roleModel: agentTypeDef?.model,
@@ -566,10 +629,12 @@ class Runtime implements ScriptExecutorHost {
       agentTypeDefinition: agentTypeDef,
       effectiveModel: modelIdentity(selection.model),
       effectiveThinking: selection.thinkingLevel,
+      targetIdentity: this.options.targetIdentity,
     });
 
     let cached: JournalAgentRecord | undefined;
     try {
+      this.assertTargetIdentityCurrent();
       cached = this.options.journal?.lookup(callPath, key);
     } catch (error) {
       const failure = journalPolicyError(error, "workflow cache lookup failed");
@@ -577,6 +642,7 @@ class Runtime implements ScriptExecutorHost {
       throw failure;
     }
     if (cached) {
+      await this.verifyCachedDelivery(cached);
       this.beginPanelAgent(callPath);
       this.state.cachedCount++;
       this.state.spent += cached.outputTokens ?? 0;
@@ -609,7 +675,7 @@ class Runtime implements ScriptExecutorHost {
         structuredOutput: opts.schema != null,
         cachedRecord: cloneResult(cached, "cached agent record"),
       }));
-      this.notifyObserver(() => this.options.onAgentEnd?.({
+      this.notifyObserverBestEffort(() => this.options.onAgentEnd?.({
         id,
         callPath,
         label,
@@ -652,12 +718,13 @@ class Runtime implements ScriptExecutorHost {
         structuredOutput: opts.schema != null,
       }));
       let worktree: Worktree | undefined;
-      let keepWorktree = false;
+      let worktreeSettled = false;
+      let keepWorktree = true;
       let observedUsage: AgentUsage | undefined;
       try {
         this.throwIfAborted();
         if (opts.isolation === "worktree") {
-          worktree = this.tryCreateWorktree(id);
+          worktree = this.createIsolatedWorktree(id);
         }
 
         const runner = this.getRunner();
@@ -698,62 +765,87 @@ class Runtime implements ScriptExecutorHost {
           throw error;
         }
 
-        if (worktree) keepWorktree = await this.integrateWorktree(worktree, id, label);
-        this.notifyObserver(() => this.options.onAgentEnd?.({
+        const commitAgent = (delivery?: { patchPath: string; patchHash: string }) => {
+          this.assertTargetIdentityCurrent();
+          try {
+            this.options.journal?.recordAgent({
+              callPath,
+              seq: id,
+              key,
+              label,
+              value: clonedValue,
+              inputTokens: usage.inputTokens,
+              outputTokens: usage.outputTokens,
+              totalTokens: usage.totalTokens,
+              cacheReadTokens: usage.cacheReadTokens,
+              cacheWriteTokens: usage.cacheWriteTokens,
+              cost: usage.cost,
+              turns: usage.turns,
+              toolUses: usage.toolUses,
+              retries: usage.retries,
+              compactions: usage.compactions,
+              requestedModelId: opts.model,
+              requestedEffort: this.options.thinkingLevel,
+              modelId: result.modelId,
+              effort: result.effort,
+              agentType: opts.agentType,
+              isolation: opts.isolation,
+              structuredOutput: opts.schema != null,
+              deliveryPatchPath: delivery?.patchPath,
+              deliveryPatchHash: delivery?.patchHash,
+              startedAt: agentStartedAt,
+              durationMs: Date.now() - agentStartedAt,
+            });
+          } catch (error) {
+            const failure = journalPolicyError(error, "workflow agent-result commit failed");
+            this.recordPolicyError(failure);
+            throw failure;
+          }
+        };
+
+        if (worktree) {
+          const outcome = await this.integrateWorktree(worktree, id, label, callPath, commitAgent);
+          worktreeSettled = true;
+          keepWorktree = outcome.keepWorktree;
+          if (outcome.status === "rescued" || outcome.status === "preserved") {
+            throw new Error(`worktree changes were not delivered; recover from ${outcome.recoveryPath}`);
+          }
+        } else {
+          commitAgent();
+        }
+        // The durable agent record is the publication point. Completion observers
+        // run afterward and cannot veto a committed result.
+        this.notifyObserverBestEffort(() => this.options.onAgentEnd?.({
           id,
           callPath,
           label,
           phase: assignedPhase,
           workflowPath,
-          result: clonedValue,
+          result: cloneResult(clonedValue, "live observer result"),
           status: "done",
           usage,
           modelId: result.modelId,
           effort: result.effort,
         }));
-        // Commit resume state only after observers accepted the successful
-        // completion. Otherwise a callback failure could return null live but
-        // replay a success from the journal on the next generation.
-        try {
-          this.options.journal?.recordAgent({
-            callPath,
-            seq: id,
-            key,
-            label,
-            value: clonedValue,
-            inputTokens: usage.inputTokens,
-            outputTokens: usage.outputTokens,
-            totalTokens: usage.totalTokens,
-            cacheReadTokens: usage.cacheReadTokens,
-            cacheWriteTokens: usage.cacheWriteTokens,
-            cost: usage.cost,
-            turns: usage.turns,
-            toolUses: usage.toolUses,
-            retries: usage.retries,
-            compactions: usage.compactions,
-            requestedModelId: opts.model,
-            requestedEffort: this.options.thinkingLevel,
-            modelId: result.modelId,
-            effort: result.effort,
-            agentType: opts.agentType,
-            isolation: opts.isolation,
-            structuredOutput: opts.schema != null,
-            startedAt: agentStartedAt,
-            durationMs: Date.now() - agentStartedAt,
-          });
-        } catch (error) {
-          const failure = journalPolicyError(error, "workflow agent-result commit failed");
-          this.recordPolicyError(failure);
-          throw failure;
-        }
         this.finishPanelAgent(callPath, "success");
         return clonedValue;
       } catch (error) {
+        if (worktree && !worktreeSettled) {
+          const outcome = await this.recoverFailedWorktree(worktree, id, label);
+          worktreeSettled = true;
+          keepWorktree = outcome.keepWorktree;
+          if (this.childController.signal.aborted || this.options.signal?.aborted || isWorkflowPolicyError(error)) {
+            // Recursive worktree removal is not synchronously deadline-safe.
+            // Preserve it on cancellation/policy cleanup instead of overrunning the budget.
+            keepWorktree = true;
+            this.logLineBestEffort(`worktree[${label}]: cleanup cancelled; worktree KEPT at ${worktree.path}`);
+          }
+        }
         if (this.childController.signal.aborted || this.options.signal?.aborted || isWorkflowPolicyError(error)) throw error;
         const message = error instanceof Error ? error.message : String(error);
         this.finishPanelAgent(callPath, "failed");
         this.logLine(`agent ${label} failed: ${message}`);
-        this.notifyObserver(() => this.options.onAgentEnd?.({
+        this.notifyObserverBestEffort(() => this.options.onAgentEnd?.({
           id,
           callPath,
           label,
@@ -766,17 +858,47 @@ class Runtime implements ScriptExecutorHost {
         }));
         return null;
       } finally {
-        if (worktree && !keepWorktree) {
+        if (worktree && worktreeSettled && !keepWorktree) {
           try {
             removeWorktree(worktree);
           } catch {
-            // ignore cleanup failures
+            // A cleanup failure must not change the delivery outcome.
           }
         }
       }
     });
     this.track(run);
     return await run;
+  }
+
+  private async verifyCachedDelivery(record: JournalAgentRecord): Promise<void> {
+    if (!record.deliveryPatchPath || !record.deliveryPatchHash) return;
+    const context = resolveRepositoryContext(this.cwd);
+    if (!context.repoRoot || !this.options.journal) {
+      const error = new WorkflowPolicyError(`cached worktree delivery at ${record.callPath} has no matching Git target`);
+      this.recordPolicyError(error);
+      throw error;
+    }
+    const patchRoot = path.join(path.dirname(this.options.journal.filePath), "patches");
+    try {
+      const valid = await repositoryApplyLock(context.repoRoot).run(async () =>
+        verifyAppliedPatch(
+          context.repoRoot!,
+          record.deliveryPatchPath!,
+          record.deliveryPatchHash!,
+          patchRoot,
+        ));
+      if (!valid) {
+        throw new Error("the delivered patch is no longer present in the shared working tree");
+      }
+    } catch (error) {
+      const failure = new WorkflowPolicyError(
+        `cached worktree delivery at ${record.callPath} requires recovery: ${errorMessage(error)}`,
+      );
+      (failure as Error & { cause?: unknown }).cause = error;
+      this.recordPolicyError(failure);
+      throw failure;
+    }
   }
 
   private notifyObserver(callback: () => void): void {
@@ -790,94 +912,148 @@ class Runtime implements ScriptExecutorHost {
     }
   }
 
+  private notifyObserverBestEffort(callback: () => void): void {
+    try {
+      callback();
+    } catch (error) {
+      this.logLineBestEffort(`workflow completion observer failed: ${errorMessage(error)}`);
+    }
+  }
+
   private recordPolicyError(error: unknown): void {
     if (isWorkflowPolicyError(error)) {
       this.policyError ??= error;
-      this.abort();
+      // Let the Worker finish branch/panel finally blocks; only child work stops here.
+      this.abortChildren();
     }
   }
 
-  private tryCreateWorktree(index: number): Worktree | undefined {
-    if (!isGitRepo(this.cwd)) {
-      this.logLine(`agent #${index}: isolation:'worktree' ignored — not a git repository`);
-      return undefined;
-    }
+  private createIsolatedWorktree(index: number): Worktree {
+    this.assertTargetIdentityCurrent();
+    const runId = this.options.journal ? path.basename(this.options.journal.filePath, ".jsonl") : "run";
     try {
-      const runId = this.options.journal ? path.basename(this.options.journal.filePath, ".jsonl") : "run";
-      return createWorktree(this.cwd, runId, index);
-    } catch (error) {
-      this.logLine(`agent #${index}: worktree setup failed (${errorMessage(error)}); running in shared cwd`);
-      return undefined;
-    }
-  }
-
-  /**
-   * Fold a worktree's changes back into the shared working tree. Returns true
-   * when the worktree must be KEPT (its changes are not safely preserved
-   * elsewhere — e.g. apply conflicted AND the rescue write failed). Never throws:
-   * a writeback failure must not discard the agent's already-completed result
-   * or its token spend.
-   */
-  private async integrateWorktree(worktree: Worktree, id: number, label: string): Promise<boolean> {
-    // Outer safety net: a writeback/integration failure (including a host
-    // onUpdate callback throwing during a log line) must never discard the
-    // agent's completed work. Fail-safe toward KEEPING the worktree.
-    try {
-      let diff: WorktreeDiff;
+      const worktree = createWorktree(this.cwd, runId, index);
       try {
-        diff = captureWorktreeDiff(worktree);
+        this.assertTargetIdentityCurrent();
       } catch (error) {
-        this.logLine(
-          `worktree[${label}]: diff capture failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} (branch ${worktree.branch}) — recover with: git -C ${worktree.path} diff`,
-        );
-        return true;
+        removeWorktree(worktree);
+        throw error;
       }
-      if (!hasChanges(diff)) {
-        this.logLine(`worktree[${label}]: no changes (auto-removed)`);
-        return false;
-      }
-      // Apply patches back to the shared tree sequentially to avoid corruption.
-      let keep = false;
-      await this.applyLock.run(async () => {
-        const applied = applyPatch(this.cwd, diff.patch);
-        if (applied) {
-          this.logLine(
-            `worktree[${label}]: ${diff.filesChanged} file(s), +${diff.insertions}/-${diff.deletions} applied to working tree`,
-          );
-          return;
-        }
-        // 3-way conflict: `applyPatch` already reverted the shared tree to its
-        // pre-apply state. Persist the patch so the agent's work is recoverable
-        // before the worktree is removed.
-        const runId = this.options.journal
-          ? path.basename(this.options.journal.filePath, ".jsonl")
-          : "run";
-        const rescueDir = this.rescueDir();
-        try {
-          const rescue = writeRescuePatch(rescueDir, runId, id, label, diff.patch);
-          this.logLine(
-            `worktree[${label}]: ${diff.filesChanged} file(s), +${diff.insertions}/-${diff.deletions} could NOT be auto-applied (3-way conflict); patch saved to ${rescue} — review and apply with: git apply --3way ${rescue}`,
-          );
-        } catch (error) {
-          // Rescue write failed (disk full / permission / bad path). Keep the
-          // worktree so the user can recover the changes manually.
-          keep = true;
-          this.logLine(
-            `worktree[${label}]: ${diff.filesChanged} file(s) could NOT be auto-applied (3-way conflict) AND rescue write failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} (branch ${worktree.branch}) — recover with: git -C ${worktree.path} diff`,
-          );
-        }
-      });
-      return keep;
+      return worktree;
     } catch (error) {
-      try {
-        this.logLine(
-          `worktree[${label}]: integration failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} (branch ${worktree.branch}) — recover with: git -C ${worktree.path} diff`,
-        );
-      } catch {
-        // best-effort logging
-      }
-      return true;
+      if (isWorkflowPolicyError(error)) throw error;
+      throw new Error(`agent #${index}: worktree setup failed: ${errorMessage(error)}`);
     }
+  }
+
+  /** Fold a successful isolated result into the shared repository. */
+  private async integrateWorktree(
+    worktree: Worktree,
+    id: number,
+    label: string,
+    callPath: string,
+    commitAgent: (delivery?: { patchPath: string; patchHash: string }) => void,
+  ): Promise<WorktreeOutcome> {
+    try {
+      const diff = captureWorktreeDiff(worktree);
+      if (!hasChanges(diff)) {
+        commitAgent();
+        this.logLineBestEffort(`worktree[${label}]: no changes (auto-removed)`);
+        return { status: "unchanged", keepWorktree: false };
+      }
+
+      // Persist the exact delivery material before the shared repository changes.
+      const runId = this.options.journal
+        ? path.basename(this.options.journal.filePath, ".jsonl")
+        : "run";
+      const durablePatch = writeRescuePatch(this.rescueDir(), runId, id, label, diff.patch);
+      const patchHash = hashBytes(fs.readFileSync(durablePatch));
+      const applyLock = repositoryApplyLock(worktree.repoRoot);
+      return await applyLock.run(async () => {
+        this.throwIfAborted();
+        this.assertTargetIdentityCurrent();
+        this.options.journal?.recordDeliveryStart(callPath, durablePatch, patchHash);
+        if (!applyPatch(worktree.repoRoot, diff.patch)) {
+          this.logLineBestEffort(
+            `worktree[${label}]: changes could NOT be applied cleanly; patch saved to ${durablePatch} — review and apply manually`,
+          );
+          return { status: "rescued", keepWorktree: false, recoveryPath: durablePatch } as const;
+        }
+        commitAgent({ patchPath: durablePatch, patchHash });
+        if (!this.options.journal) {
+          try {
+            fs.unlinkSync(durablePatch);
+          } catch {
+            // Standalone runs have no replay state to verify.
+          }
+        }
+        this.logLineBestEffort(
+          `worktree[${label}]: ${diff.filesChanged} file(s), +${diff.insertions}/-${diff.deletions} applied to working tree`,
+        );
+        return { status: "applied", keepWorktree: false } as const;
+      });
+    } catch (error) {
+      this.logLineBestEffort(
+        `worktree[${label}]: integration failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} — recover with: git -C ${worktree.path} diff`,
+      );
+      if (isWorkflowPolicyError(error)) throw error;
+      return { status: "preserved", keepWorktree: true, recoveryPath: worktree.path };
+    }
+  }
+
+  /** Preserve edits from a runner/policy/abort failure without publishing them. */
+  private async recoverFailedWorktree(worktree: Worktree, id: number, label: string): Promise<WorktreeOutcome> {
+    try {
+      const diff = captureWorktreeDiff(worktree, this.remainingCleanupTimeout());
+      if (!hasChanges(diff)) return { status: "unchanged", keepWorktree: false };
+      return this.rescueDiff(worktree, diff, id, label, "agent failed before delivery");
+    } catch (error) {
+      this.logLineBestEffort(
+        `worktree[${label}]: recovery capture failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} — recover with: git -C ${worktree.path} diff`,
+      );
+      return { status: "preserved", keepWorktree: true, recoveryPath: worktree.path };
+    }
+  }
+
+  private rescueDiff(
+    worktree: Worktree,
+    diff: WorktreeDiff,
+    id: number,
+    label: string,
+    reason: string,
+  ): WorktreeOutcome {
+    const runId = this.options.journal
+      ? path.basename(this.options.journal.filePath, ".jsonl")
+      : "run";
+    try {
+      const rescue = writeRescuePatch(this.rescueDir(), runId, id, label, diff.patch);
+      this.logLineBestEffort(
+        `worktree[${label}]: ${reason}; patch saved to ${rescue} — review and apply manually`,
+      );
+      return { status: "rescued", keepWorktree: false, recoveryPath: rescue };
+    } catch (error) {
+      this.logLineBestEffort(
+        `worktree[${label}]: ${reason} AND rescue write failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} — recover with: git -C ${worktree.path} diff`,
+      );
+      return { status: "preserved", keepWorktree: true, recoveryPath: worktree.path };
+    }
+  }
+
+  private assertTargetIdentityCurrent(): void {
+    const expected = this.options.targetIdentity;
+    const actual = resolveRepositoryContext(this.cwd).identity;
+    if (expected !== actual) {
+      const error = new WorkflowPolicyError("workflow repository/cwd target changed during execution");
+      this.recordPolicyError(error);
+      throw error;
+    }
+  }
+
+  private remainingCleanupTimeout(): number {
+    if (this.cleanupDeadline === undefined) return DEFAULT_CLEANUP_TIMEOUT_MS;
+    const remaining = this.cleanupDeadline - Date.now();
+    if (remaining <= 0) throw new WorkflowCleanupTimeoutError(this.options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS);
+    return remaining;
   }
 
   /** Write rescue patches beside the journal or in a user-owned cwd-hash scope. */
@@ -893,6 +1069,14 @@ class Runtime implements ScriptExecutorHost {
       () => this.pending.delete(promise),
       () => this.pending.delete(promise),
     );
+  }
+
+  private logLineBestEffort(text: string): void {
+    try {
+      this.logLine(text);
+    } catch {
+      // Durable runtime state is authoritative; display observers cannot veto it.
+    }
   }
 
   private logLine(text: string): void {
@@ -921,47 +1105,37 @@ function normalizeAgentOptions(value: unknown): AgentOptions {
   if (typeof value !== "object") throw new TypeError("agent options must be an object");
   const options = value as AgentOptions;
   assertWorkflowSchemaLimit(options.schema);
+  if (options.isolation !== undefined && options.isolation !== "worktree") {
+    throw new TypeError("agent isolation must be 'worktree' when provided");
+  }
   return {
     label: optionalString(options.label, "agent label"),
     phase: optionalString(options.phase, "agent phase"),
     schema: options.schema,
     model: optionalString(options.model, "agent model"),
-    isolation: options.isolation === "worktree" ? "worktree" : undefined,
-    agentType: optionalString(options.agentType, "agent type"),
+    isolation: options.isolation,
+    agentType: optionalNonEmptyTrimmedString(options.agentType, "agent type"),
   };
 }
 
-function normalizeWorkflowRef(value: unknown): string | { scriptPath: string } {
-  if (typeof value === "string") {
-    if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) {
-      throw new TypeError("workflow() name must contain only letters, numbers, underscore, or hyphen");
-    }
-    return value;
+function normalizeWorkflowRef(value: unknown): string {
+  if (typeof value !== "string") {
+    throw new TypeError("workflow() expects a saved workflow name string; scriptPath is not supported");
   }
-  if (value && typeof value === "object" && typeof (value as any).scriptPath === "string") {
-    return { scriptPath: (value as any).scriptPath };
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) {
+    throw new TypeError("workflow() name must contain only letters, numbers, underscore, or hyphen");
   }
-  throw new TypeError("workflow() expects a workflow name string or { scriptPath }");
+  return value;
 }
 
 export function loadSavedWorkflowFromDisk(
-  ref: string | { scriptPath: string },
+  ref: string,
   cwd: string,
+  projectTrusted = false,
 ): { meta: WorkflowMeta; body: string } {
-  if (typeof ref === "object") {
-    const scriptPath = path.isAbsolute(ref.scriptPath) ? ref.scriptPath : path.join(cwd, ref.scriptPath);
-    return parseWorkflowScript(readArtifactFile(scriptPath, "nested workflow script", 16 * 1024 * 1024));
-  }
-  for (const root of [cwd, os.homedir()]) {
-    const dir = path.join(root, ".pi", "ultracode", "workflows");
-    for (const candidate of [`${ref}.workflow.js`, `${ref}.js`]) {
-      const full = path.join(dir, candidate);
-      if (artifactPathExists(full)) {
-        return parseWorkflowScript(readContainedArtifactFile(root, full, "saved nested workflow", 16 * 1024 * 1024));
-      }
-    }
-  }
-  throw new Error(`workflow() could not find a saved workflow for ${JSON.stringify(ref)}`);
+  const saved = readSavedWorkflowByName(ref, cwd, projectTrusted);
+  if (saved) return parseWorkflowScript(saved.script);
+  throw new Error(`workflow() could not find an accessible saved workflow for ${JSON.stringify(ref)}`);
 }
 
 function buildInstructions(phase: string | undefined, opts: AgentOptions): string | undefined {
@@ -1094,6 +1268,24 @@ function createLimiter(limit: number, signal: AbortSignal): <T>(fn: () => Promis
   };
 }
 
+function repositoryApplyLock(repoRoot: string): Mutex {
+  const key = fsRealpathOrResolve(repoRoot);
+  let lock = REPOSITORY_APPLY_LOCKS.get(key);
+  if (!lock) {
+    lock = new Mutex();
+    REPOSITORY_APPLY_LOCKS.set(key, lock);
+  }
+  return lock;
+}
+
+function fsRealpathOrResolve(value: string): string {
+  try {
+    return path.resolve(value);
+  } catch {
+    return value;
+  }
+}
+
 class Mutex {
   private tail: Promise<unknown> = Promise.resolve();
   run<T>(fn: () => Promise<T>): Promise<T> {
@@ -1114,6 +1306,14 @@ function requireString(value: unknown, name: string): string {
 function optionalString(value: unknown, name: string): string | undefined {
   if (value === undefined || value === null) return undefined;
   return requireString(value, name);
+}
+
+function optionalNonEmptyTrimmedString(value: unknown, name: string): string | undefined {
+  const string = optionalString(value, name);
+  if (string === undefined) return undefined;
+  const trimmed = string.trim();
+  if (!trimmed) throw new TypeError(`${name} must not be empty`);
+  return trimmed;
 }
 
 function journalPolicyError(error: unknown, operation: string): WorkflowPolicyError {

@@ -41,7 +41,7 @@ export {
   type AgentTypeDef,
 } from "./workflow/agent-types.ts";
 export { RunJournal, agentCallKey, hashString, stableStringify } from "./workflow/journal.ts";
-export { getRegistry, WorkflowRegistry } from "./workflow/registry.ts";
+export { WorkflowRegistry } from "./workflow/registry.ts";
 export {
   createSnapshot,
   recompute,

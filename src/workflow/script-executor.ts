@@ -14,6 +14,8 @@ import {
 
 export interface ScriptExecutorHost {
   agent(payload: any): Promise<unknown>;
+  /** Cancel child work after a fatal script policy without terminating branch finally blocks. */
+  abortChildren?(error: Error): void;
   reservePanel(payload: {
     callPath?: unknown;
     reserveAgents: number;
@@ -49,6 +51,8 @@ export interface ScriptExecutorOptions {
   hostCallLimit?: number;
   /** Internal test seam for the Worker's V8 old-generation heap cap. */
   workerMemoryLimitMb?: number;
+  /** Bound for fatal host-RPC draining before forced termination. */
+  fatalDrainTimeoutMs?: number;
 }
 
 type TerminationCause = "abort" | "stall" | "fatal" | "error" | "cleanup";
@@ -59,6 +63,7 @@ export async function executeWorkflowScript(
   options: ScriptExecutorOptions,
 ): Promise<unknown> {
   if (options.signal.aborted) throw new WorkflowAbortError();
+  const fatalDrainTimeoutMs = normalizeFatalDrainTimeout(options.fatalDrainTimeoutMs);
   const worker = new Worker(new URL("./script-worker.mjs", import.meta.url), {
     workerData: {
       body,
@@ -79,6 +84,7 @@ export async function executeWorkflowScript(
   let terminationCause: TerminationCause | undefined;
   let fatalError: Error | undefined;
   let watchdog: NodeJS.Timeout | undefined;
+  let fatalDrainTimer: NodeJS.Timeout | undefined;
 
   const terminate = (cause: TerminationCause): void => {
     terminationCause ??= cause;
@@ -97,17 +103,40 @@ export async function executeWorkflowScript(
         if (settled) return;
         settled = true;
         if (watchdog) clearInterval(watchdog);
+        if (fatalDrainTimer) clearTimeout(fatalDrainTimer);
         if (ok) resolve(value);
         else reject(value);
+      };
+      let workerReportedResult = false;
+      const maybeSettleFatal = (): void => {
+        if (!fatalError || !workerReportedResult || pendingRpcCount > 0) return;
+        settle(false, fatalError);
+        terminate("fatal");
       };
       const rejectAndTerminate = (error: unknown, cause: TerminationCause): void => {
         if (cause === "fatal" && error instanceof Error) fatalError ??= error;
         settle(false, error);
         terminate(cause);
       };
+      const beginFatalDrain = (error: Error): void => {
+        fatalError ??= error;
+        terminationCause ??= "fatal";
+        try {
+          host.abortChildren?.(fatalError);
+        } catch {
+          // Fatal draining remains authoritative even if cancellation notification fails.
+        }
+        if (!fatalDrainTimer) {
+          fatalDrainTimer = setTimeout(() => {
+            if (!settled && fatalError) rejectAndTerminate(fatalError, "fatal");
+          }, fatalDrainTimeoutMs);
+          fatalDrainTimer.unref?.();
+        }
+        maybeSettleFatal();
+      };
 
       watchdog = setInterval(() => {
-        if (settled) return;
+        if (settled || fatalError) return;
         const now = Date.now();
         if (now - lastHeartbeat > stallTimeoutMs) {
           if (options.signal.aborted) {
@@ -143,9 +172,7 @@ export async function executeWorkflowScript(
           return;
         }
         if (message.type === "fatal") {
-          const error = reviveError(message.error);
-          fatalError = error;
-          rejectAndTerminate(error, "fatal");
+          beginFatalDrain(reviveError(message.error));
           return;
         }
         if (message.type === "event") {
@@ -164,15 +191,23 @@ export async function executeWorkflowScript(
           void handleRpc(message).finally(() => {
             pendingRpcCount = Math.max(0, pendingRpcCount - 1);
             lastProgress = Date.now();
+            maybeSettleFatal();
           });
           return;
         }
         if (message.type === "result") {
-          if (message.ok) settle(true, message.value);
-          else {
+          workerReportedResult = true;
+          if (fatalError) {
+            maybeSettleFatal();
+          } else if (message.ok) {
+            settle(true, message.value);
+          } else {
             const error = reviveError(message.error);
-            if (error instanceof WorkflowPolicyError) fatalError ??= error;
-            settle(false, fatalError ?? error);
+            if (error instanceof WorkflowPolicyError) {
+              beginFatalDrain(error);
+            } else {
+              settle(false, error);
+            }
           }
         }
       });
@@ -180,7 +215,8 @@ export async function executeWorkflowScript(
       worker.on("error", (error: NodeJS.ErrnoException) => {
         if (settled) return;
         if (error.code === "ERR_WORKER_OUT_OF_MEMORY") {
-          settle(false, new WorkflowPolicyError("workflow script exceeded its worker memory limit"));
+          workerReportedResult = true;
+          beginFatalDrain(new WorkflowPolicyError("workflow script exceeded its worker memory limit"));
           return;
         }
         settle(false, error);
@@ -189,7 +225,8 @@ export async function executeWorkflowScript(
       worker.on("exit", (code) => {
         if (settled) return;
         if (fatalError) {
-          settle(false, fatalError);
+          workerReportedResult = true;
+          maybeSettleFatal();
         } else if (terminationCause === "abort" || options.signal.aborted) {
           settle(false, new WorkflowAbortError());
         } else if (terminationCause === "stall") {
@@ -240,6 +277,7 @@ export async function executeWorkflowScript(
   } finally {
     settled = true;
     if (watchdog) clearInterval(watchdog);
+    if (fatalDrainTimer) clearTimeout(fatalDrainTimer);
     options.signal.removeEventListener("abort", abortWorker);
     terminate("cleanup");
     await worker.terminate().catch(() => undefined);
@@ -260,6 +298,14 @@ function workerResourceLimits(value: number | undefined): {
     maxYoungGenerationSizeMb: Math.max(8, Math.min(32, Math.floor(oldGenerationMb / 4))),
     stackSizeMb: 8,
   };
+}
+
+function normalizeFatalDrainTimeout(value: number | undefined): number {
+  if (value === undefined) return 25_000;
+  if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1) {
+    throw new WorkflowPolicyError("workflow fatal drain timeout must be a positive integer");
+  }
+  return value;
 }
 
 function normalizeHostCallLimit(value: number | undefined): number {

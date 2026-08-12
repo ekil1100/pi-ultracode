@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import fsDefault from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
+import { execFileSync } from "node:child_process";
 import * as path from "node:path";
 import { jsonSchemaToTypeBox } from "../src/workflow/json-schema.ts";
 import { Check } from "typebox/value";
@@ -20,6 +21,7 @@ import { UltracodeMode } from "../src/mode.ts";
 import { piVersionSupportsMaxThinking } from "../src/thinking.ts";
 import { acquireWorkflowLease, activeWorkflowCount, clearWorkflowLeasesForTests } from "../src/workflow/leases.ts";
 import { writeArtifactFile } from "../src/workflow/run-artifacts.ts";
+import { resolveRepositoryContext } from "../src/workflow/repository-context.ts";
 import {
   assertStructuredOutputLimit,
   assertWorkflowArgsLimit,
@@ -253,12 +255,85 @@ test("parseAgentTypeFile builds an AgentTypeDef", () => {
   assert.equal(def!.systemPrompt, "Find vulns.");
 });
 
-test("discoverAgentTypes includes built-ins and resolves case-insensitively", () => {
-  const types = discoverAgentTypes(os.tmpdir());
-  assert.ok(types.has("Explore"));
-  assert.ok(types.has("code-reviewer"));
-  assert.equal(resolveAgentType("explore", types)?.name, "Explore");
-  assert.equal(resolveAgentType("nope", types), undefined);
+test("discoverAgentTypes respects project trust and keeps read-only built-ins authoritative", () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "uc-agent-types-"));
+  try {
+    const projectDir = path.join(cwd, ".pi", "ultracode", "agents");
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, "custom.md"), "---\nname: custom\ndescription: project role\n---\nPROJECT\n");
+    fs.writeFileSync(path.join(projectDir, "explore.md"), "---\nname: Explore\ntools: bash\n---\nOVERRIDE\n");
+    const sharedProjectDir = path.join(cwd, ".pi", "agents");
+    fs.mkdirSync(sharedProjectDir, { recursive: true });
+    fs.writeFileSync(path.join(sharedProjectDir, "shared.md"), "---\nname: shared\n---\nSHARED PROJECT\n");
+    fs.writeFileSync(path.join(sharedProjectDir, "reviewer.md"), "---\nname: Reviewer\ntools: bash\n---\nSHARED REVIEWER\n");
+    fs.writeFileSync(path.join(projectDir, "reviewer.md"), "---\nname: reviewer\ntools: read\n---\nPROJECT REVIEWER\n");
+
+    const untrusted = discoverAgentTypes(cwd, false);
+    assert.equal(untrusted.has("custom"), false);
+    assert.equal(untrusted.has("shared"), false);
+    assert.deepEqual(resolveAgentType("explore", untrusted)?.tools, ["read", "grep", "find", "ls"]);
+
+    const trusted = discoverAgentTypes(cwd, true);
+    assert.equal(trusted.get("custom")?.systemPrompt, "PROJECT");
+    assert.equal(trusted.get("shared")?.systemPrompt, "SHARED PROJECT");
+    assert.deepEqual(resolveAgentType("  explore  ", trusted)?.tools, ["read", "grep", "find", "ls"]);
+    assert.equal(resolveAgentType("REVIEWER", trusted)?.systemPrompt, "PROJECT REVIEWER");
+    assert.deepEqual(resolveAgentType("REVIEWER", trusted)?.tools, ["read"]);
+    assert.equal(resolveAgentType("nope", trusted), undefined);
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("published workflow globals compile with strict Node consumer types", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-types-consumer-"));
+  try {
+    const declaration = path.resolve("types", "workflow.d.ts");
+    fs.writeFileSync(path.join(dir, "consumer.ts"), `/// <reference path=${JSON.stringify(declaration)} />\ncwd;\n`);
+    fs.writeFileSync(path.join(dir, "tsconfig.json"), JSON.stringify({
+      compilerOptions: {
+        target: "ES2022",
+        module: "NodeNext",
+        moduleResolution: "NodeNext",
+        strict: true,
+        skipLibCheck: false,
+        noEmit: true,
+        types: ["node"],
+        typeRoots: [path.resolve("node_modules", "@types")],
+      },
+      files: ["consumer.ts", declaration],
+    }));
+    execFileSync(path.resolve("node_modules", ".bin", "tsc"), ["-p", path.join(dir, "tsconfig.json")], {
+      cwd: process.cwd(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("repository identity changes when a repository is recreated at the same path", () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), "uc-repo-instance-"));
+  const repo = path.join(parent, "repo");
+  const init = (content: string) => {
+    fs.mkdirSync(repo);
+    execFileSync("git", ["init", "-q"], { cwd: repo });
+    execFileSync("git", ["config", "user.email", "t@t"], { cwd: repo });
+    execFileSync("git", ["config", "user.name", "t"], { cwd: repo });
+    fs.writeFileSync(path.join(repo, "f.txt"), `${content}\n`);
+    execFileSync("git", ["add", "."], { cwd: repo });
+    execFileSync("git", ["commit", "-qm", "base"], { cwd: repo });
+  };
+  try {
+    init("first");
+    const first = resolveRepositoryContext(repo).identity;
+    fs.rmSync(repo, { recursive: true, force: true });
+    init("second");
+    const second = resolveRepositoryContext(repo).identity;
+    assert.notEqual(second, first);
+  } finally {
+    fs.rmSync(parent, { recursive: true, force: true });
+  }
 });
 
 test("hash + stableStringify are stable and key-order independent", () => {
@@ -293,14 +368,14 @@ test("artifact writes reject symlinked parent directories below their trusted ro
 test("RunJournal records and looks up cached agents on resume", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-"));
   const runId = "wf_x";
-  const j = RunJournal.create(dir, { type: "run", runId, name: "n", scriptHash: "1", startedAt: 0 });
+  const j = RunJournal.create(dir, { type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "n", scriptHash: "1", startedAt: 0 });
   j.recordAdmission("$/a:0", "k1", 1);
   j.recordAgent({ callPath: "$/a:0", seq: 1, key: "k1", label: "a", value: "v1", outputTokens: 5 });
   j.recordAdmission("$/a:1", "k2", 2);
   j.recordAgent({ callPath: "$/a:1", seq: 2, key: "k2", label: "b", value: { x: 1 }, outputTokens: 6 });
   j.close();
 
-  const r = RunJournal.resume(dir, runId, { type: "run", runId, name: "n", scriptHash: "1", startedAt: 1 });
+  const r = RunJournal.resume(dir, runId, { type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "n", scriptHash: "1", startedAt: 1 });
   assert.equal(r.lookup("$/a:0", "k1")?.value, "v1");
   assert.deepEqual(r.lookup("$/a:1", "k2")?.value, { x: 1 });
   assert.throws(() => r.lookup("$/a:0", "different-key"), /diverged/);
@@ -314,7 +389,7 @@ test("RunJournal treats JSON object key order as part of immutable args", () => 
   const runId = "wf_args_order";
   try {
     const journal = RunJournal.create(dir, {
-      type: "run",
+      type: "run", projectTrusted: false, targetIdentity: "test-target",
       runId,
       name: "args_order",
       scriptHash: "1",
@@ -324,7 +399,7 @@ test("RunJournal treats JSON object key order as part of immutable args", () => 
     journal.close();
     assert.throws(
       () => RunJournal.resume(dir, runId, {
-        type: "run",
+        type: "run", projectTrusted: false, targetIdentity: "test-target",
         runId,
         name: "args_order",
         scriptHash: "1",
@@ -343,7 +418,7 @@ test("RunJournal rejects a conflicting panel definition before append", () => {
   const runId = "wf_panel_definition";
   try {
     const journal = RunJournal.create(dir, {
-      type: "run", runId, name: "panel_definition", scriptHash: "1", startedAt: 0,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "panel_definition", scriptHash: "1", startedAt: 0,
     });
     journal.recordPanelOpen("$/p:0", 1, 1);
     const before = fs.readFileSync(journal.filePath, "utf8");
@@ -354,7 +429,7 @@ test("RunJournal rejects a conflicting panel definition before append", () => {
     assert.equal(fs.readFileSync(journal.filePath, "utf8"), before);
     journal.close();
     const resumed = RunJournal.resume(dir, runId, {
-      type: "run", runId, name: "panel_definition", scriptHash: "1", startedAt: 1,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "panel_definition", scriptHash: "1", startedAt: 1,
     });
     resumed.close();
   } finally {
@@ -366,7 +441,7 @@ test("RunJournal rechecks final panel admissions before completion", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-panel-final-admission-"));
   try {
     const journal = RunJournal.create(dir, {
-      type: "run", runId: "wf_panel_final_admission", name: "panel_final_admission", scriptHash: "1", startedAt: 0,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId: "wf_panel_final_admission", name: "panel_final_admission", scriptHash: "1", startedAt: 0,
     });
     journal.recordPanelOpen("$/p:0", 2, 2);
     journal.recordPanelBranch("$/p:0", 0, "success", []);
@@ -381,7 +456,7 @@ test("RunJournal rechecks final panel admissions before completion", () => {
     journal.close();
     assert.throws(
       () => RunJournal.resume(dir, "wf_panel_final_admission", {
-        type: "run",
+        type: "run", projectTrusted: false, targetIdentity: "test-target",
         runId: "wf_panel_final_admission",
         name: "panel_final_admission",
         scriptHash: "1",
@@ -398,7 +473,7 @@ test("RunJournal poisons the descriptor after a partial append failure", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-poison-"));
   const runId = "wf_poison";
   const journal = RunJournal.create(dir, {
-    type: "run", runId, name: "poison", scriptHash: "1", startedAt: 0,
+    type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "poison", scriptHash: "1", startedAt: 0,
   });
   const originalWrite = fsDefault.writeFileSync;
   let injected = false;
@@ -431,7 +506,7 @@ test("RunJournal poisons the descriptor after a partial append failure", () => {
     assert.throws(() => journal.close(), /synthetic partial write/i);
 
     const resumed = RunJournal.resume(dir, runId, {
-      type: "run", runId, name: "poison", scriptHash: "1", startedAt: 1,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "poison", scriptHash: "1", startedAt: 1,
     });
     assert.equal(resumed.agentsUsed, 0);
     resumed.close();
@@ -443,7 +518,7 @@ test("RunJournal poisons the descriptor after a partial append failure", () => {
 test("RunJournal preserves a close fsync failure across retries", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-close-fsync-"));
   const journal = RunJournal.create(dir, {
-    type: "run", runId: "wf_close_fsync", name: "close_fsync", scriptHash: "1", startedAt: 0,
+    type: "run", projectTrusted: false, targetIdentity: "test-target", runId: "wf_close_fsync", name: "close_fsync", scriptHash: "1", startedAt: 0,
   });
   const originalFsync = fsDefault.fsyncSync;
   let injected = false;
@@ -473,7 +548,7 @@ test("RunJournal rejects invalid metadata before writing a self-corrupting recor
   try {
     assert.throws(
       () => RunJournal.create(dir, {
-        type: "run",
+        type: "run", projectTrusted: false, targetIdentity: "test-target",
         runId: "wf_invalid_create",
         name: "invalid_create",
         scriptHash: "1",
@@ -485,19 +560,19 @@ test("RunJournal rejects invalid metadata before writing a self-corrupting recor
 
     const runId = "wf_invalid_resume";
     const journal = RunJournal.create(dir, {
-      type: "run", runId, name: "valid", scriptHash: "1", startedAt: 0,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "valid", scriptHash: "1", startedAt: 0,
     });
     journal.close();
     const before = fs.readFileSync(journal.filePath, "utf8");
     assert.throws(
       () => RunJournal.resume(dir, runId, {
-        type: "run", runId, name: "valid", scriptHash: "1", startedAt: Number.NaN,
+        type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "valid", scriptHash: "1", startedAt: Number.NaN,
       }),
       /invalid run header|invalid resume/i,
     );
     assert.equal(fs.readFileSync(journal.filePath, "utf8"), before);
     const resumed = RunJournal.resume(dir, runId, {
-      type: "run", runId, name: "valid", scriptHash: "1", startedAt: 1,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "valid", scriptHash: "1", startedAt: 1,
     });
     resumed.close();
   } finally {
@@ -510,7 +585,7 @@ test("RunJournal rejects semantically corrupt cached agent records", () => {
   const runId = "wf_corrupt_agent";
   try {
     const journal = RunJournal.create(dir, {
-      type: "run", runId, name: "corrupt", scriptHash: "1", startedAt: 0,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "corrupt", scriptHash: "1", startedAt: 0,
     });
     journal.recordAdmission("$/a:0", "k", 1);
     journal.close();
@@ -525,9 +600,97 @@ test("RunJournal rejects semantically corrupt cached agent records", () => {
     })}\n`);
     assert.throws(
       () => RunJournal.resume(dir, runId, {
-        type: "run", runId, name: "corrupt", scriptHash: "1", startedAt: 1,
+        type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "corrupt", scriptHash: "1", startedAt: 1,
       }),
       /invalid agent record/i,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal enforces one terminal result per execution generation", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-terminal-"));
+  try {
+    const journal = RunJournal.create(dir, {
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId: "wf_terminal", name: "terminal", scriptHash: "1", startedAt: 0,
+    });
+    journal.recordResult({ ok: true, result: 1, agentCount: 0, durationMs: 1 });
+    assert.throws(
+      () => journal.recordResult({ ok: false, error: "late failure", agentCount: 0, durationMs: 2 }),
+      /already has a terminal result/i,
+    );
+    assert.throws(
+      () => journal.recordAdmission("$/late", "late", 1),
+      /generation already has a terminal result/i,
+    );
+    journal.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal rejects pending delivery before appending a resume generation", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-pending-delivery-"));
+  const runId = "wf_pending_delivery";
+  try {
+    const patch = path.join(dir, "recovery.patch");
+    fs.writeFileSync(patch, "patch\n");
+    const journal = RunJournal.create(dir, {
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "pending_delivery", scriptHash: "1", startedAt: 0,
+    });
+    journal.recordAdmission("$/a:0", "k", 1);
+    journal.recordDeliveryStart("$/a:0", patch, hashString("patch\n"));
+    journal.close();
+    const before = fs.readFileSync(journal.filePath, "utf8");
+    assert.throws(
+      () => RunJournal.resume(dir, runId, {
+        type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "pending_delivery", scriptHash: "1", startedAt: 1,
+      }),
+      /requires recovery before resume/i,
+    );
+    assert.equal(fs.readFileSync(journal.filePath, "utf8"), before);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal loader rejects records after a generation terminal", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-terminal-corrupt-"));
+  const runId = "wf_terminal_corrupt";
+  try {
+    const journal = RunJournal.create(dir, {
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "terminal_corrupt", scriptHash: "1", startedAt: 0,
+    });
+    journal.recordResult({ ok: true, result: 1, agentCount: 0, durationMs: 1 });
+    journal.close();
+    fs.appendFileSync(journal.filePath, `${JSON.stringify({
+      type: "admit", callPath: "$/late", inputHash: "late", ordinal: 1,
+    })}\n`);
+    assert.throws(
+      () => RunJournal.resume(dir, runId, {
+        type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "terminal_corrupt", scriptHash: "1", startedAt: 1,
+      }),
+      /record after.*terminal|terminal.*record/i,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("RunJournal rejects resume across project trust contexts", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-j-trust-"));
+  const runId = "wf_trust";
+  try {
+    const journal = RunJournal.create(dir, {
+      type: "run", targetIdentity: "test-target", runId, name: "trust", scriptHash: "1", projectTrusted: true, startedAt: 0,
+    });
+    journal.close();
+    assert.throws(
+      () => RunJournal.resume(dir, runId, {
+        type: "run", targetIdentity: "test-target", runId, name: "trust", scriptHash: "1", projectTrusted: false, startedAt: 1,
+      }),
+      /immutable project trust context/i,
     );
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -539,7 +702,7 @@ test("RunJournal rejects an append before it would exceed the restore cap", () =
   const runId = "wf_cap";
   try {
     const journal = RunJournal.create(dir, {
-      type: "run", runId, name: "cap", scriptHash: "1", startedAt: 0,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "cap", scriptHash: "1", startedAt: 0,
     });
     const sizeBefore = fs.statSync(journal.filePath).size;
     assert.throws(
@@ -554,7 +717,7 @@ test("RunJournal rejects an append before it would exceed the restore cap", () =
     assert.equal(fs.statSync(journal.filePath).size, sizeBefore);
     journal.close();
     const resumed = RunJournal.resume(dir, runId, {
-      type: "run", runId, name: "cap", scriptHash: "1", startedAt: 1,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "cap", scriptHash: "1", startedAt: 1,
     });
     resumed.close();
   } finally {
@@ -567,13 +730,13 @@ test("RunJournal resume discards only a torn final JSONL record", () => {
   const runId = "wf_torn";
   try {
     const journal = RunJournal.create(dir, {
-      type: "run", runId, name: "torn", scriptHash: "1", startedAt: 0,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "torn", scriptHash: "1", startedAt: 0,
     });
     journal.close();
     fs.appendFileSync(journal.filePath, '{"type":"result","ok":');
 
     const resumed = RunJournal.resume(dir, runId, {
-      type: "run", runId, name: "torn", scriptHash: "1", startedAt: 1,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "torn", scriptHash: "1", startedAt: 1,
     });
     resumed.close();
     const lines = fs.readFileSync(journal.filePath, "utf8").trim().split("\n");
@@ -589,27 +752,27 @@ test("RunJournal terminates a valid final record but rejects corruption before E
   try {
     const validRunId = "wf_valid_tail";
     const valid = RunJournal.create(dir, {
-      type: "run", runId: validRunId, name: "valid", scriptHash: "1", startedAt: 0,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId: validRunId, name: "valid", scriptHash: "1", startedAt: 0,
     });
     valid.close();
     fs.appendFileSync(valid.filePath, JSON.stringify({
       type: "result", ok: true, result: 1, agentCount: 0, durationMs: 0,
     }));
     const resumed = RunJournal.resume(dir, validRunId, {
-      type: "run", runId: validRunId, name: "valid", scriptHash: "1", startedAt: 1,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId: validRunId, name: "valid", scriptHash: "1", startedAt: 1,
     });
     resumed.close();
     assert.doesNotThrow(() => fs.readFileSync(valid.filePath, "utf8").trim().split("\n").map((line) => JSON.parse(line)));
 
     const invalidRunId = "wf_invalid_middle";
     const invalid = RunJournal.create(dir, {
-      type: "run", runId: invalidRunId, name: "invalid", scriptHash: "1", startedAt: 0,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId: invalidRunId, name: "invalid", scriptHash: "1", startedAt: 0,
     });
     invalid.close();
     fs.appendFileSync(invalid.filePath, "not-json\n");
     assert.throws(
       () => RunJournal.resume(dir, invalidRunId, {
-        type: "run", runId: invalidRunId, name: "invalid", scriptHash: "1", startedAt: 1,
+        type: "run", projectTrusted: false, targetIdentity: "test-target", runId: invalidRunId, name: "invalid", scriptHash: "1", startedAt: 1,
       }),
       /invalid JSON on line 2/,
     );
@@ -623,13 +786,13 @@ test("RunJournal follows the single-owner session model without lock artifacts",
   const runId = "wf_single_owner";
   try {
     const journal = RunJournal.create(dir, {
-      type: "run", runId, name: "single-owner", scriptHash: "1", startedAt: 0,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "single-owner", scriptHash: "1", startedAt: 0,
     });
     assert.equal(fs.existsSync(`${journal.filePath}.lock`), false);
     journal.close();
 
     const resumed = RunJournal.resume(dir, runId, {
-      type: "run", runId, name: "single-owner", scriptHash: "1", startedAt: 1,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "single-owner", scriptHash: "1", startedAt: 1,
     });
     assert.equal(fs.existsSync(`${resumed.filePath}.lock`), false);
     resumed.close();
@@ -643,10 +806,10 @@ test("RunJournal fails closed on unsupported journal versions", () => {
   try {
     const runId = "wf_old";
     fs.writeFileSync(path.join(dir, `${runId}.jsonl`), `${JSON.stringify({
-      type: "run", journalVersion: 2, runId, name: "old", scriptHash: "1", startedAt: 0, maxAgents: 128,
+      type: "run", projectTrusted: false, targetIdentity: "test-target", journalVersion: 2, runId, name: "old", scriptHash: "1", startedAt: 0, maxAgents: 128,
     })}\n`);
     assert.throws(
-      () => RunJournal.resume(dir, runId, { type: "run", runId, name: "old", scriptHash: "1", startedAt: 1 }),
+      () => RunJournal.resume(dir, runId, { type: "run", projectTrusted: false, targetIdentity: "test-target", runId, name: "old", scriptHash: "1", startedAt: 1 }),
       /unsupported workflow journal version/,
     );
   } finally {

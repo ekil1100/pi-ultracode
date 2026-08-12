@@ -4,11 +4,11 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { UltracodeMode } from "./mode.ts";
-import { getRegistry } from "./workflow/registry.ts";
+import type { WorkflowRegistry } from "./workflow/registry.ts";
 import { workflowRunsDir } from "./workflow/tool.ts";
 import { openWorkflowOverlay } from "./workflow/workflow-overlay.ts";
 
-export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
+export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode, registry: WorkflowRegistry): void {
   pi.registerCommand("ultracode", {
     description: "Toggle ultracode mode (max thinking + default workflow orchestration). Bare /ultracode toggles; subcommands: on|off|status",
     getArgumentCompletions(prefix: string) {
@@ -67,7 +67,6 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
   });
 
   const openWorkflows = async (ctx: any, runId?: string) => {
-    const registry = getRegistry();
     registry.restoreRuns(workflowRunsDir(ctx));
     await openWorkflowOverlay(ctx, registry, runId);
   };
@@ -77,7 +76,7 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
     getArgumentCompletions(prefix: string) {
       const values = [
         "abort",
-        ...getRegistry().list().map((handle) => handle.snapshot.runId).filter((runId): runId is string => Boolean(runId)),
+        ...registry.list().map((handle) => handle.snapshot.runId).filter((runId): runId is string => Boolean(runId)),
       ];
       return [...new Set(values)]
         .filter((value) => value.startsWith(prefix))
@@ -86,7 +85,7 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode): void {
     handler: async (args: string, ctx) => {
       const arg = args.trim();
       if (arg.toLowerCase() === "abort") {
-        getRegistry().abortAll();
+        registry.abortAll();
         ctx.ui.notify("Requested abort of all active workflow runs.", "warning");
         return;
       }

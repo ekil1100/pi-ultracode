@@ -33,6 +33,7 @@ export interface ParsedWorkflow {
 export const WORKFLOW_CHECKPOINT_IDENTIFIER = "__ultracodeCheckpoint";
 const WORKFLOW_LOOP_IDENTIFIER = "__ultracodeLoop";
 const WORKFLOW_INVOKE_IDENTIFIER = "__ultracodeInvoke";
+const WORKFLOW_SAFE_MAP_IDENTIFIER = "__ultracodeMapThunks";
 const WORKFLOW_INTERNAL_CALLS = {
   agent: "__ultracodeAgent",
   parallel: "__ultracodeParallel",
@@ -43,6 +44,7 @@ const WORKFLOW_RESERVED_IDENTIFIERS = new Set([
   WORKFLOW_CHECKPOINT_IDENTIFIER,
   WORKFLOW_LOOP_IDENTIFIER,
   WORKFLOW_INVOKE_IDENTIFIER,
+  WORKFLOW_SAFE_MAP_IDENTIFIER,
   ...Object.values(WORKFLOW_INTERNAL_CALLS),
 ]);
 export const DEFAULT_WORKFLOW_CHECKPOINT_LIMIT = 1_000_000;
@@ -249,10 +251,18 @@ function assertDeterministicAst(
   if (isUnsupportedClassEagerOrchestration(node, orchestrationBindings)) {
     throw new Error("Workflow classes may call orchestration only from ordinary methods, not constructors, fields, or static blocks.");
   }
-  if (isUnsupportedFactoryProperty(node) || isUnsupportedAccessorForwarding(node, orchestrationBindings)) {
-    throw new Error("Workflow orchestration helper properties must use static methods; accessor forwarding is unsupported.");
+  if (
+    isUnsupportedFactoryProperty(node)
+    || isUnsupportedAccessorForwarding(node, orchestrationBindings)
+    || isAmbiguousOrchestrationContainer(node)
+  ) {
+    throw new Error("Workflow orchestration helper properties must use unique static methods without spreads; accessor forwarding is unsupported.");
   }
-  if (isUnsupportedCompositeFactory(node)) {
+  if (
+    isUnsupportedCompositeFactory(node, orchestrationBindings)
+    || isUnsupportedAnonymousHelperExtraction(node)
+    || isUnsupportedHelperDestructuringAssignment(node, orchestrationBindings)
+  ) {
     throw new Error("Workflow orchestration helper factories must use a direct function, object, or class declaration.");
   }
   if (isUnsupportedHelperAssignment(node, orchestrationBindings)) {
@@ -267,10 +277,11 @@ function assertDeterministicAst(
     isDynamicMethodCall(node)
     || isDynamicOrchestrationMember(node, orchestrationBindings)
     || isOrchestrationDestructure(node, orchestrationBindings)
-    || isOrchestrationArgumentEscape(node, orchestrationBindings)
+    || isOrchestrationArgumentEscape(node, orchestrationBindings, parent)
     || isOrchestrationFunctionAlias(node, parent)
     || isOrchestrationMemberAlias(node, parent, orchestrationBindings)
     || isOrchestrationBindingEscape(node, parent, orchestrationBindings)
+    || isTaintedTaggedCall(node, orchestrationBindings)
   ) {
     throw new Error(
       "Workflow scripts must use a static method name; dynamic method calls can bypass deterministic promise checks.",
@@ -278,6 +289,9 @@ function assertDeterministicAst(
   }
   if (node.type === "Identifier" && node.name === "globalThis") {
     throw new Error("Workflow scripts must not access globalThis; use the declared workflow globals directly.");
+  }
+  if (node.type === "Identifier" && node.name === "process" && isIdentifierReference(node, parent)) {
+    throw new Error("Workflow scripts do not expose process; use the declared cwd global directly.");
   }
   if (
     node.type === "MemberExpression"
@@ -335,10 +349,21 @@ function collectCallSiteEdits(
 ): void {
   const orchestrationBindings = collectOrchestrationBindings(root);
   const localFunctions = collectLocalFunctionNames(root, orchestrationBindings);
-  const stack: Array<{ node: AnyNode; loops: string[] }> = [{ node: root, loops: [] }];
+  const stack: Array<{ node: AnyNode; parent?: AnyNode; loops: string[] }> = [{ node: root, loops: [] }];
   while (stack.length > 0) {
-    const { node, loops } = stack.pop()!;
-    if (
+    const { node, parent, loops } = stack.pop()!;
+    if (isSafeParallelMap(node, parent, orchestrationBindings)) {
+      const openOffset = source.slice(node.callee.end, node.end).indexOf("(");
+      if (openOffset < 0) throw new Error("unable to instrument safe parallel map");
+      const openParen = node.callee.end + openOffset;
+      const receiver = source.slice(node.callee.object.start, node.callee.object.end);
+      replacements.push({
+        start: node.callee.start,
+        end: node.callee.end,
+        text: WORKFLOW_SAFE_MAP_IDENTIFIER,
+      });
+      insertions.push({ pos: openParen + 1, text: `${receiver},` });
+    } else if (
       node.type === "CallExpression"
       && node.callee?.type === "Identifier"
       && Object.hasOwn(WORKFLOW_INTERNAL_CALLS, node.callee.name)
@@ -359,7 +384,8 @@ function collectCallSiteEdits(
         text: `${JSON.stringify(callSite)}${node.arguments.length > 0 ? "," : ""}`,
       });
     } else if (node.type === "CallExpression" && (
-      (node.callee?.type === "Identifier" && localFunctions.has(node.callee.name))
+      (node.callee?.type === "Identifier"
+        && (localFunctions.has(node.callee.name) || orchestrationBindings.has(node.callee.name)))
       || (node.callee?.type === "MemberExpression"
         && isTaintedStaticMember(node.callee, orchestrationBindings))
     )) {
@@ -394,6 +420,7 @@ function collectCallSiteEdits(
     for (const child of astChildren(node)) {
       stack.push({
         node: child,
+        parent: node,
         loops: body && loopSite && child === body ? [...loops, loopSite] : loops,
       });
     }
@@ -521,8 +548,8 @@ function collectOrchestrationBindings(root: AnyNode): Set<string> {
         ? containsDirectOrchestration(definition.value)
         : containsUnconsumedOrchestration(definition.value);
       if (tainted) seeds.add(definition.name);
-      if (definition.value.type === "ObjectExpression") {
-        for (const member of objectFactoryMembers(definition.name, definition.value)) addMemberSeed(seeds, member);
+      if (definition.value.type === "ObjectExpression" || definition.value.type === "ArrayExpression") {
+        for (const member of containerFactoryMembers(definition.name, definition.value)) addMemberSeed(seeds, member);
       }
       for (const alias of collectStaticAliases(definition.name, definition.value)) {
         const targets = aliases.get(alias.source) ?? new Set<string>();
@@ -620,18 +647,28 @@ function collectReferencedIdentifiers(root: AnyNode): Set<string> {
   return references;
 }
 
-function objectFactoryMembers(name: string, node: AnyNode): string[] {
+function containerFactoryMembers(name: string, node: AnyNode): string[] {
   const members: string[] = [];
-  for (const property of node.properties ?? []) {
-    if (property.type !== "Property") continue;
-    const key = property.computed
-      ? staticStringOf(property.key)
-      : property.key?.name ?? (typeof property.key?.value === "string" ? property.key.value : undefined);
-    if (!key) continue;
+  const entries: Array<{ key: string; value: AnyNode }> = [];
+  if (node.type === "ObjectExpression") {
+    for (const property of node.properties ?? []) {
+      if (property.type !== "Property") continue;
+      const key = property.computed
+        ? staticStringOf(property.key)
+        : property.key?.name ?? (typeof property.key?.value === "string" ? property.key.value : undefined);
+      if (key !== undefined) entries.push({ key, value: property.value });
+    }
+  } else if (node.type === "ArrayExpression") {
+    for (let index = 0; index < (node.elements?.length ?? 0); index++) {
+      const value = node.elements[index];
+      if (value && value.type !== "SpreadElement") entries.push({ key: String(index), value });
+    }
+  }
+  for (const { key, value } of entries) {
     const member = `${name}.${key}`;
-    if (isFunctionNode(property.value) && containsDirectOrchestration(property.value)) members.push(member);
-    if (property.value?.type === "ObjectExpression") {
-      members.push(...objectFactoryMembers(member, property.value));
+    if (isFunctionNode(value) && containsDirectOrchestration(value)) members.push(member);
+    if (value.type === "ObjectExpression" || value.type === "ArrayExpression") {
+      members.push(...containerFactoryMembers(member, value));
     }
   }
   return members;
@@ -759,7 +796,11 @@ function isDynamicOrchestrationMember(node: AnyNode, bindings: ReadonlySet<strin
     && isOrchestrationExpression(node.object, bindings);
 }
 
-function isOrchestrationArgumentEscape(node: AnyNode, bindings: ReadonlySet<string>): boolean {
+function isOrchestrationArgumentEscape(
+  node: AnyNode,
+  bindings: ReadonlySet<string>,
+  parent?: AnyNode,
+): boolean {
   if (node.type === "TaggedTemplateExpression") {
     return (node.quasi?.expressions ?? []).some((expression: AnyNode) =>
       isOrchestrationExpression(expression, bindings)
@@ -769,19 +810,98 @@ function isOrchestrationArgumentEscape(node: AnyNode, bindings: ReadonlySet<stri
     node.type === "CallExpression"
     && node.callee?.type === "Identifier"
     && ORCHESTRATION_FUNCTIONS.has(node.callee.name)
-  ) return false;
+  ) {
+    return node.arguments.some((argument: AnyNode) =>
+      containsEagerOrchestration(
+        argument.type === "SpreadElement" ? argument.argument : argument,
+        bindings,
+      ));
+  }
+  if (isSafeParallelMap(node, parent, bindings)) return false;
   return (node.type === "CallExpression" || node.type === "NewExpression")
-    && node.arguments.some((argument: AnyNode) =>
-      argument.type === "SpreadElement"
-        ? isOrchestrationExpression(argument.argument, bindings)
-        : isOrchestrationExpression(argument, bindings)
-    );
+    && node.arguments.some((argument: AnyNode) => {
+      const value = argument.type === "SpreadElement" ? argument.argument : argument;
+      return isOrchestrationExpression(value, bindings)
+        || containsEscapingOrchestration(value, bindings);
+    });
+}
+
+function containsEagerOrchestration(root: AnyNode, bindings: ReadonlySet<string>): boolean {
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    if (isFunctionNode(node)) continue;
+    if (node.type === "CallExpression" && isOrchestrationExpression(node, bindings)) return true;
+    if (node.type === "Identifier" && bindings.has(node.name)) return true;
+    if (node.type === "MemberExpression" && isTaintedStaticMember(node, bindings)) return true;
+    stack.push(...astChildren(node));
+  }
+  return false;
+}
+
+/** Find raw orchestration capabilities passed to another call; awaited results are plain data. */
+function containsEscapingOrchestration(root: AnyNode, bindings: ReadonlySet<string>): boolean {
+  const stack: Array<{ node: AnyNode; parent?: AnyNode }> = [{ node: root }];
+  while (stack.length > 0) {
+    const { node, parent } = stack.pop()!;
+    if (node.type === "AwaitExpression") continue;
+    if (isFunctionNode(node) && containsOrchestrationCall(node, bindings)) return true;
+    if (node.type === "CallExpression" && isOrchestrationExpression(node, bindings)) return true;
+    if (node.type === "MemberExpression" && propertyNameOf(node) !== undefined) {
+      if (isOrchestrationExpression(node, bindings)) return true;
+      continue;
+    }
+    if (
+      node.type === "Identifier"
+      && isIdentifierReference(node, parent)
+      && (bindings.has(node.name) || hasTaintedMember(bindings, node.name))
+    ) return true;
+    for (const child of astChildren(node)) stack.push({ node: child, parent: node });
+  }
+  return false;
+}
+
+function isSafeParallelMap(
+  node: AnyNode,
+  parent: AnyNode | undefined,
+  bindings: ReadonlySet<string>,
+): boolean {
+  if (
+    node.type !== "CallExpression"
+    || node.callee?.type !== "MemberExpression"
+    || propertyNameOf(node.callee) !== "map"
+    || parent?.type !== "CallExpression"
+    || parent.callee?.type !== "Identifier"
+    || parent.callee.name !== "parallel"
+    || !parent.arguments.includes(node)
+    || node.arguments?.length !== 1
+    || containsOrchestrationCall(node.callee.object, bindings)
+  ) return false;
+  const mapper = node.arguments[0];
+  if (
+    !mapper
+    || (mapper.type !== "ArrowFunctionExpression" && mapper.type !== "FunctionExpression")
+    || mapper.async
+    || mapper.generator
+    || (mapper.params ?? []).some((parameter: AnyNode) => containsOrchestrationCall(parameter, bindings))
+  ) return false;
+  const expressions = mapper.body?.type === "SequenceExpression"
+    ? mapper.body.expressions
+    : [mapper.body];
+  const thunk = expressions?.at(-1);
+  if (!isFunctionNode(thunk)) return false;
+  return expressions.slice(0, -1).every((expression: AnyNode) =>
+    !containsOrchestrationCall(expression, bindings));
 }
 
 function isUnsupportedHelperCall(node: AnyNode, bindings: ReadonlySet<string>): boolean {
   if (node.type !== "CallExpression") return false;
   if (node.callee?.type === "MemberExpression") {
-    if (node.callee.object?.type === "ThisExpression" || node.callee.object?.type === "AwaitExpression") return true;
+    if (
+      node.callee.object?.type === "ThisExpression"
+      || node.callee.object?.type === "AwaitExpression"
+      || node.callee.object?.type === "Super"
+    ) return true;
     return (node.callee.object?.type === "CallExpression" || node.callee.object?.type === "NewExpression")
       && isOrchestrationExpression(node.callee.object, bindings);
   }
@@ -844,10 +964,97 @@ function isUnsupportedAccessorForwarding(node: AnyNode, bindings: ReadonlySet<st
   return containsDirectOrchestration(value);
 }
 
-function isUnsupportedCompositeFactory(node: AnyNode): boolean {
+function isAmbiguousOrchestrationContainer(node: AnyNode): boolean {
+  if (node.type !== "ObjectExpression" || !containsDirectOrchestration(node)) return false;
+  const seen = new Set<string>();
+  for (const property of node.properties ?? []) {
+    if (property.type !== "Property") return true;
+    const key = property.computed ? staticStringOf(property.key) : propertyKeyName(property.key);
+    if (key === undefined || key === "__proto__" || seen.has(key)) return true;
+    seen.add(key);
+  }
+  return false;
+}
+
+function isUnsupportedCompositeFactory(node: AnyNode, bindings: ReadonlySet<string>): boolean {
   if (node.type !== "VariableDeclarator" || !node.init) return false;
-  return ["ConditionalExpression", "LogicalExpression", "SequenceExpression"].includes(node.init.type)
-    && containsDirectOrchestration(node.init);
+  if (["ConditionalExpression", "LogicalExpression", "SequenceExpression"].includes(node.init.type)) {
+    return containsDirectOrchestration(node.init);
+  }
+  const init = node.init.type === "ChainExpression" ? node.init.expression : node.init;
+  if (init.type !== "CallExpression") return false;
+  if (init.callee?.type === "Identifier") return bindings.has(init.callee.name);
+  if (isFunctionNode(init.callee)) return containsOrchestrationCall(init.callee, bindings);
+  if (init.callee?.type !== "MemberExpression") {
+    return containsOrchestrationCall(init.callee, bindings)
+      || isOrchestrationExpression(init.callee, bindings);
+  }
+  if (isTaintedStaticMember(init.callee, bindings)) return true;
+  return init.callee.object?.type === "Identifier"
+    && hasTaintedMember(bindings, init.callee.object.name);
+}
+
+function isUnsupportedAnonymousHelperExtraction(node: AnyNode): boolean {
+  if (node.type !== "VariableDeclarator" || !node.init) return false;
+  const init = node.init.type === "ChainExpression" ? node.init.expression : node.init;
+  if (node.id?.type === "ObjectPattern" || node.id?.type === "ArrayPattern") {
+    return destructureSelectsOrchestration(node.id, init);
+  }
+  if (node.id?.type !== "Identifier" || init.type !== "MemberExpression") return false;
+  const selected = selectedLiteralMember(init);
+  return selected ? containsDirectOrchestration(selected) : containsDirectOrchestration(init.object);
+}
+
+function isUnsupportedHelperDestructuringAssignment(
+  node: AnyNode,
+  bindings: ReadonlySet<string>,
+): boolean {
+  return node.type === "AssignmentExpression"
+    && (node.left?.type === "ObjectPattern" || node.left?.type === "ArrayPattern")
+    && (
+      destructureSelectsOrchestration(node.left, node.right)
+      || isOrchestrationExpression(node.right, bindings)
+    );
+}
+
+function destructureSelectsOrchestration(pattern: AnyNode, value: AnyNode): boolean {
+  if (pattern.type === "ObjectPattern" && value.type === "ObjectExpression") {
+    for (const selected of pattern.properties ?? []) {
+      if (selected.type !== "Property") return true;
+      const key = propertyKeyName(selected.key);
+      if (key === undefined) return true;
+      const match = findLastStaticProperty(value.properties ?? [], key);
+      if (match && containsDirectOrchestration(match.value)) return true;
+    }
+    return false;
+  }
+  if (pattern.type === "ArrayPattern" && value.type === "ArrayExpression") {
+    return (pattern.elements ?? []).some((selected: AnyNode | null, index: number) =>
+      !!selected && !!value.elements?.[index] && containsDirectOrchestration(value.elements[index]));
+  }
+  return containsDirectOrchestration(value);
+}
+
+function selectedLiteralMember(member: AnyNode): AnyNode | undefined {
+  const key = propertyNameOf(member);
+  if (key === undefined) return undefined;
+  if (member.object?.type === "ObjectExpression") {
+    return findLastStaticProperty(member.object.properties ?? [], key)?.value;
+  }
+  if (member.object?.type === "ArrayExpression" && /^\d+$/.test(key)) {
+    return member.object.elements?.[Number(key)] ?? undefined;
+  }
+  return undefined;
+}
+
+function findLastStaticProperty(properties: AnyNode[], key: string): AnyNode | undefined {
+  for (let index = properties.length - 1; index >= 0; index--) {
+    const property = properties[index];
+    if (property.type !== "Property") continue;
+    const candidate = property.computed ? staticStringOf(property.key) : propertyKeyName(property.key);
+    if (candidate === key) return property;
+  }
+  return undefined;
 }
 
 function isUnsupportedHelperAssignment(node: AnyNode, bindings: ReadonlySet<string>): boolean {
@@ -886,6 +1093,12 @@ function isOrchestrationBindingEscape(
 }
 
 function isTaintedStaticMember(node: AnyNode, bindings: ReadonlySet<string>): boolean {
+  const selected = selectedLiteralMember(node);
+  if (selected) {
+    return isFunctionNode(selected)
+      ? containsOrchestrationCall(selected, bindings)
+      : isOrchestrationExpression(selected, bindings);
+  }
   const member = staticMemberReference(node);
   if (!member) return isOrchestrationExpression(node.object, bindings);
   if (bindings.has(member) || hasTaintedMember(bindings, member)) return true;
@@ -933,6 +1146,14 @@ function isForbiddenPromiseDestructure(node: AnyNode, parent?: AnyNode): boolean
     && ["then", "catch", "finally"].includes(propertyNameOf(node) ?? propertyKeyName(node.key) ?? "");
 }
 
+function isTaintedTaggedCall(node: AnyNode, bindings: ReadonlySet<string>): boolean {
+  if (node.type !== "TaggedTemplateExpression") return false;
+  if (node.tag?.type === "Identifier") return bindings.has(node.tag.name);
+  if (node.tag?.type === "MemberExpression") return isTaintedStaticMember(node.tag, bindings);
+  return node.tag?.type === "ChainExpression"
+    && isOrchestrationExpression(node.tag.expression, bindings);
+}
+
 function isDynamicMethodCall(node: AnyNode): boolean {
   return node.type === "CallExpression"
     && node.callee?.type === "MemberExpression"
@@ -953,13 +1174,8 @@ function isForbiddenPromiseCall(node: AnyNode): boolean {
     && ["all", "allSettled", "race", "any"].includes(propertyNameOf(node.callee) ?? "");
 }
 
-function isForbiddenPromiseMember(node: AnyNode, parent?: AnyNode): boolean {
-  if (node.type !== "MemberExpression") return false;
-  const property = propertyNameOf(node);
-  if (property === "Promise") return true;
-  return ["all", "allSettled", "race", "any"].includes(property ?? "")
-    && parent?.type === "CallExpression"
-    && parent.callee === node;
+function isForbiddenPromiseMember(node: AnyNode, _parent?: AnyNode): boolean {
+  return node.type === "MemberExpression" && propertyNameOf(node) === "Promise";
 }
 
 function isAllowedPromiseReference(node: AnyNode, parent?: AnyNode, grandparent?: AnyNode): boolean {

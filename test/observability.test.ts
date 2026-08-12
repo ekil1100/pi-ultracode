@@ -10,6 +10,7 @@ import {
 } from "../src/workflow/runtime.ts";
 import { createWorkflowTool } from "../src/workflow/tool.ts";
 import { RunJournal } from "../src/workflow/journal.ts";
+import { resolveRepositoryContext } from "../src/workflow/repository-context.ts";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
 import { forwardActivity, toolArgsPreview, type AgentActivityInput } from "../src/workflow/agent-runner.ts";
 import {
@@ -87,8 +88,8 @@ test("cached (resumed) agents do not emit onAgentActivity", async () => {
       return { value: "x", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: "/tmp" };
     },
   };
-  const j1 = RunJournal.create(dir, { type: "run", runId, name: "c", scriptHash: "1", startedAt: 0 });
-  await runWorkflow(script, { runner: liveRunner, journal: j1, onAgentActivity: () => liveActivity++ });
+  const j1 = RunJournal.create(dir, { type: "run", projectTrusted: false, targetIdentity: resolveRepositoryContext(process.cwd()).identity, runId, name: "c", scriptHash: "1", startedAt: 0 });
+  await runWorkflow(script, { projectTrusted: false, runner: liveRunner, journal: j1, onAgentActivity: () => liveActivity++ });
   j1.close();
   assert.equal(liveCalls, 1, "live run calls the runner once");
   assert.equal(liveActivity, 1, "live run emits one activity event");
@@ -103,8 +104,8 @@ test("cached (resumed) agents do not emit onAgentActivity", async () => {
       return { value: "y", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: "/tmp" };
     },
   };
-  const j2 = RunJournal.resume(dir, runId, { type: "run", runId, name: "c", scriptHash: "1", startedAt: 1 });
-  await runWorkflow(script, { runner: cachedRunner, journal: j2, onAgentActivity: () => cachedActivity++ });
+  const j2 = RunJournal.resume(dir, runId, { type: "run", projectTrusted: false, targetIdentity: resolveRepositoryContext(process.cwd()).identity, runId, name: "c", scriptHash: "1", startedAt: 1 });
+  await runWorkflow(script, { projectTrusted: false, runner: cachedRunner, journal: j2, onAgentActivity: () => cachedActivity++ });
   j2.close();
   assert.equal(cachedCalls, 0, "cached replay must not call the runner");
   assert.equal(cachedActivity, 0, "cached replay must not emit activity");
@@ -122,8 +123,8 @@ test("journal records per-agent startedAt/durationMs in the .jsonl log", async (
       return { value: "v", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: "/tmp" };
     },
   };
-  const j = RunJournal.create(dir, { type: "run", runId, name: "jt", scriptHash: "1", startedAt: 0 });
-  await runWorkflow(script, { runner, journal: j });
+  const j = RunJournal.create(dir, { type: "run", projectTrusted: false, targetIdentity: resolveRepositoryContext(process.cwd()).identity, runId, name: "jt", scriptHash: "1", startedAt: 0 });
+  await runWorkflow(script, { projectTrusted: false, runner, journal: j });
   j.close();
 
   const log = fs

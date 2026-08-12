@@ -71,7 +71,7 @@ Press `Esc` to cancel a running workflow. In Pi's fullscreen TUI, use `Ctrl+Page
 
 ## Workflow example
 
-The main agent normally writes workflows for you. Reusable workflows can also be saved under `.pi/ultracode/workflows/*.workflow.js` or `~/.pi/ultracode/workflows/*.workflow.js`.
+The main agent normally writes workflows for you. Reusable workflows can also be saved under `.pi/ultracode/workflows/*.workflow.js` or `~/.pi/ultracode/workflows/*.workflow.js`. Project-scoped workflows are discovered only after Pi marks the project as trusted; user-scoped workflows remain available in untrusted projects.
 
 ```js
 export const meta = {
@@ -107,7 +107,9 @@ Custom agent roles live in:
 
 ```text
 .pi/ultracode/agents/*.md
+.pi/agents/*.md
 ~/.pi/ultracode/agents/*.md
+~/.pi/agent/agents/*.md
 ```
 
 A call can select a role, model, thinking level, or worktree isolation:
@@ -121,15 +123,15 @@ await agent("Implement and test the fix.", {
 });
 ```
 
-Worktree isolation requires a git repository with at least one commit. If setup fails, Ultracode logs the fallback and runs that agent in the shared working directory; avoid parallel writers in that case. A clean working tree is recommended for predictable patch integration.
+Worktree isolation requires a git repository with at least one commit and fails closed if the isolated tree cannot be created. Each call receives a unique detached worktree. Integration preserves the user's index and applies only byte-exact patches that pass cached checks in a private, object-format-matched Git index; raw blobs are then materialized without repository attributes, filters, or EOL conversion. A conflicting patch is saved for manual recovery instead of using a destructive three-way fallback. Successful delivery patches are retained so resume can verify that the shared-tree effect still exists. Isolated trees never link the shared writable `node_modules`; install dependencies there when needed, or run final tests after integration. A clean working tree is recommended for predictable patch integration.
 
 ## Guardrails
 
-A workflow defaults to `maxAgents: 128`, supports at most 16 concurrent agent calls, and allows one level of nested workflows. The lifetime agent limit is preserved across resumes; cached replay does not consume it again.
+A workflow defaults to `maxAgents: 128`, supports at most 16 concurrent agent calls, and allows one level of nested workflows. Nested `workflow()` calls accept only trust-aware saved-workflow names, not explicit paths. The lifetime agent limit is preserved across resumes; cached replay does not consume it again.
 
-Workflow agent sessions retain project context and ordinary skills, but do not initialize ambient Pi extensions or expose parent orchestration tools and skills (`workflow`, `subagent`, `subagent_wait`, or `pi-subagents`). This keeps orchestration at the parent boundary and allows `pi-ultracode` and `pi-subagents` to coexist in the main session.
+Workflow agent sessions retain project context and ordinary skills, but do not initialize ambient Pi extensions or expose parent orchestration tools and skills (`workflow`, `subagent`, `subagent_wait`, or `pi-subagents`). This keeps orchestration at the parent boundary and allows `pi-ultracode` and `pi-subagents` to coexist in the main session. Project-scoped agents and settings follow Pi's project-trust decision. The built-in Explore and Plan roles have a sealed read-only tool list without shell or write tools.
 
-Resume is intentionally immutable: the script, arguments, agent definitions, effective models, and call structure must still match. Changed work starts a new run.
+Resume is intentionally immutable: the normalized script, arguments, canonical repository/relative cwd, project-trust context, agent definitions, effective models, and call structure must still match. Worktree delivery writes a durable recovery intent before changing the shared repository; an interrupted or conflicted delivery blocks automatic replay and reports its recovery patch. Changed work starts a new run.
 
 Token and cost data are reported for observability, not enforced as a budget. Worker and VM restrictions are determinism and liveness guards, not a security sandbox.
 

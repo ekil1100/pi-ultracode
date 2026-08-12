@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parseWorkflowScript, normalizeScript } from "../src/workflow/parser.ts";
+import { runWorkflow } from "../src/workflow/runtime.ts";
 
 test("parses a minimal valid workflow", () => {
   const { meta, body } = parseWorkflowScript(
@@ -47,6 +48,13 @@ test("rejects Math.random()", () => {
   );
 });
 
+test("rejects the undeclared process compatibility shim", () => {
+  assert.throws(
+    () => parseWorkflowScript(`export const meta = { name: 'process_shim', description: 'x' }\nreturn process.cwd()`),
+    /process.*(?:not available|use.*cwd)/i,
+  );
+});
+
 test("rejects new Date()", () => {
   assert.throws(
     () => parseWorkflowScript(`export const meta = { name: 'd', description: 'x' }\nnew Date()`),
@@ -68,7 +76,7 @@ test("rejects spread in meta", () => {
   );
 });
 
-test("rejects native promise chains and combinators", () => {
+test("rejects native promise chains and combinators without reserving ordinary method names", () => {
   for (const body of [
     "agent('x').then(() => 1)",
     "agent('x')['catch'](() => null)",
@@ -81,6 +89,17 @@ test("rejects native promise chains and combinators", () => {
     assert.throws(
       () => parseWorkflowScript(`export const meta = { name: 'promise_policy', description: 'x' }\n${body}`),
       /promise|await|parallel|pipeline/i,
+      body,
+    );
+  }
+
+  for (const body of [
+    "const results = { all() { return 1 } }; return results.all()",
+    "const pool = { race() { return 1 } }; return pool.race()",
+    "const values = { allSettled() { return [] }, any() { return 1 } }; return [values.allSettled(), values.any()]",
+  ]) {
+    assert.doesNotThrow(
+      () => parseWorkflowScript(`export const meta = { name: 'ordinary_methods', description: 'x' }\n${body}`),
       body,
     );
   }
@@ -143,6 +162,27 @@ test("unsupported orchestration helper receivers and aliases fail closed", () =>
     "while (await agent('x')) { break } return null",
     "class Helper { constructor() { agent('x') } }; const helper = new Helper(); return null",
     "class Helper { pending = agent('x') }; const helper = new Helper(); return null",
+    "const run = ({ async run() { return await agent('x') } }).run; return await run()",
+    "const { run } = { async run() { return await agent('x') } }; return await run()",
+    "const helpers = { async run() { return await agent('x') } }; const run = helpers.run.bind(helpers); return await run()",
+    "const target = {}; Object.defineProperty(target, 'run', { value: async () => await agent('x') }); return await target.run()",
+    "function run(value) { return agent(String(value)) }; return await parallel([1, 2].map(run))",
+    "function run() { return agent('x') }; [1].forEach(() => run()); return null",
+    "function run() { return agent('x') }; const target = {}; Object.defineProperty(target, 'run', { value: () => run() }); return await target.run()",
+    "const helpers = [async () => await agent('x')]; const selected = helpers[0]; return await selected()",
+    "const helpers = (() => [async () => await agent('x')])(); return await helpers['0']()",
+    "const helpers = (function () { return { async run() { return await agent('x') } } })(); return await helpers.run()",
+    "function make() { return async () => await agent('x') }; const selected = make(); return await selected()",
+    "const helpers = [async () => await agent('x')]; const selected = helpers.at(0); return await selected()",
+    "const helpers = { async run() { return await agent('x') } }; const selected = helpers?.run; return await selected()",
+    "function make() { return async () => await agent('x') }; const selected = make(); return await selected`tag`",
+    "const run = ({ run: 1, async run() { return await agent('x') } }).run; return await run()",
+    "const { run } = { run: 1, async run() { return await agent('x') } }; return await run()",
+    "const run = ({ ...args, async run() { return await agent('x') } }).run; return await run()",
+    "let run; ({ run } = { async run() { return await agent('x') } }); return await run()",
+    "const helpers = { async run() { return await agent('x') } }; let run; ({ run } = helpers); return await run()",
+    "return await ({ __proto__: { async run() { return await agent('x') } } }).run()",
+    "class Base { async run() { return await agent('x') } }; class Child extends Base { async call() { return await super.run() } }; const child = new Child(); return await child.call()",
   ];
   for (const body of scripts) {
     assert.throws(
@@ -152,12 +192,95 @@ test("unsupported orchestration helper receivers and aliases fail closed", () =>
   }
 });
 
+test("safe parallel map uses an internal intrinsic instead of a mutable receiver method", async () => {
+  const prompts: string[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'safe_map_intrinsic', description: 'x' }
+     try {
+       Array.prototype.map = function (mapper) {
+         mapper(this[0])()
+         return [() => 'tampered']
+       }
+     } catch {}
+     try {
+       Object.getPrototypeOf(Array.prototype.map).call = function (receiver, mapper) {
+         mapper(receiver[0])()
+         return [() => 'tampered-call']
+       }
+     } catch {}
+     return await parallel(['intended'].map((item) => () => agent(item)), { reserveAgents: 1 })`,
+    {
+      runner: {
+        run: async (call: any) => {
+          prompts.push(call.prompt);
+          return { value: `echo:${call.prompt}`, usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: process.cwd() };
+        },
+      },
+    },
+  );
+  assert.deepEqual(prompts, ["intended"]);
+  assert.deepEqual(result.result, ["echo:intended"]);
+
+  let eagerRunnerCalls = 0;
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'unsafe_map_prefix', description: 'x' }
+       return await parallel(['x'].map((item) => (agent('pre-' + item), () => agent('inside-' + item))), { reserveAgents: 1 })`,
+      {
+        runner: {
+          run: async () => {
+            eagerRunnerCalls++;
+            return { value: "unsafe", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: process.cwd() };
+          },
+        },
+      },
+    ),
+    /orchestration|promise checks|static method/i,
+  );
+  assert.equal(eagerRunnerCalls, 0);
+});
+
+test("DSL arguments cannot eagerly start orchestration before admission", async () => {
+  const bodies = [
+    "return await parallel([agent('eager')])",
+    "return await pipeline([agent('eager')], (value) => value)",
+    "return await workflow('child', agent('eager'))",
+    "const pending = agent('eager'); return await parallel([pending])",
+  ];
+  for (const body of bodies) {
+    assert.throws(
+      () => parseWorkflowScript(`export const meta = { name: 'eager_dsl', description: 'x' }\n${body}`),
+      /dynamic method|orchestration|promise checks/i,
+      body,
+    );
+  }
+
+  let runnerCalls = 0;
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'eager_dsl_runtime', description: 'x' }\nreturn await parallel([agent('eager')])`,
+      {
+        runner: {
+          run: async () => {
+            runnerCalls++;
+            return { value: "unsafe", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: process.cwd() };
+          },
+        },
+      },
+    ),
+    /dynamic method|orchestration|promise checks/i,
+  );
+  assert.equal(runnerCalls, 0);
+});
+
 test("factory objects retain ordinary data-property access", () => {
   const parsed = parseWorkflowScript(`export const meta = { name: 'factory_data', description: 'x' }
     const helpers = { spawn() { return agent('unused') }, value: 1 }
     log(helpers.value)
-    return helpers.value`);
+    const extracted = ({ spawn() { return agent('unused') }, value: 2 }).value
+    return helpers.value + extracted`);
   assert.match(parsed.body, /helpers\.value/);
+  assert.match(parsed.body, /extracted/);
 });
 
 test("large alias chains are rejected without a quadratic taint scan", () => {

@@ -104,8 +104,8 @@ declare global {
     >
   ): Promise<Array<Awaited<TResult> | null>>;
 
-  /** Run a saved workflow with strict JSON args (1 MiB) and output (2 MiB); one level of nesting. */
-  function workflow<T = unknown>(nameOrRef: string | { scriptPath: string }, args?: unknown): Promise<T>;
+  /** Run a trust-aware saved workflow by name; strict JSON args/output and one nesting level. */
+  function workflow<T = unknown>(name: string, args?: unknown): Promise<T>;
 
   /** Mark the current phase for progress grouping. */
   function phase(title: string): void;
@@ -119,6 +119,4 @@ declare global {
   /** Working directory for the workflow and its subagents. */
   const cwd: string;
 
-  /** Deterministic process shim exposing only cwd(). */
-  const process: { cwd(): string };
 }

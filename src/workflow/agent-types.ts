@@ -6,7 +6,8 @@
  * places:
  *   - Built-ins defined below (claude, Explore, Plan, general-purpose, code-reviewer).
  *   - Markdown files with YAML-ish frontmatter discovered under:
- *       <cwd>/.pi/ultracode/agents/*.md       (project)
+ *       <cwd>/.pi/ultracode/agents/*.md       (project-specific)
+ *       <cwd>/.pi/agents/*.md                 (project-shared)
  *       ~/.pi/ultracode/agents/*.md           (user)
  *       ~/.pi/agent/agents/*.md               (shared with other tools)
  */
@@ -54,7 +55,7 @@ const BUILTIN_AGENT_TYPES: AgentTypeDef[] = [
     systemPrompt:
       "You are a read-only exploration subagent. Sweep many files/directories and report the conclusion with precise file:line references. Read excerpts rather than whole files. Do NOT modify anything.",
     systemPromptMode: "append",
-    tools: ["read", "grep", "find", "ls", "bash"],
+    tools: ["read", "grep", "find", "ls"],
     source: "builtin",
   },
   {
@@ -63,7 +64,7 @@ const BUILTIN_AGENT_TYPES: AgentTypeDef[] = [
     systemPrompt:
       "You are a software-architect subagent. Produce a concrete, step-by-step implementation plan: critical files, sequence, trade-offs, and risks. Do NOT modify files.",
     systemPromptMode: "append",
-    tools: ["read", "grep", "find", "ls", "bash"],
+    tools: ["read", "grep", "find", "ls"],
     source: "builtin",
   },
   {
@@ -76,14 +77,20 @@ const BUILTIN_AGENT_TYPES: AgentTypeDef[] = [
   },
 ];
 
-export function discoverAgentTypes(cwd: string): Map<string, AgentTypeDef> {
+export function discoverAgentTypes(cwd: string, projectTrusted = false): Map<string, AgentTypeDef> {
   const map = new Map<string, AgentTypeDef>();
-  for (const def of BUILTIN_AGENT_TYPES) map.set(def.name, def);
+  for (const def of BUILTIN_AGENT_TYPES) map.set(def.name.toLowerCase(), def);
+  const protectedBuiltins = new Set(["explore", "plan"]);
 
   const dirs: Array<{ dir: string; source: AgentTypeDef["source"] }> = [
     { dir: path.join(os.homedir(), ".pi", "agent", "agents"), source: "user" },
     { dir: path.join(os.homedir(), ".pi", "ultracode", "agents"), source: "user" },
-    { dir: path.join(cwd, ".pi", "ultracode", "agents"), source: "project" },
+    ...(projectTrusted
+      ? [
+          { dir: path.join(cwd, ".pi", "agents"), source: "project" as const },
+          { dir: path.join(cwd, ".pi", "ultracode", "agents"), source: "project" as const },
+        ]
+      : []),
   ];
 
   for (const { dir, source } of dirs) {
@@ -98,7 +105,9 @@ export function discoverAgentTypes(cwd: string): Map<string, AgentTypeDef> {
       try {
         const content = fs.readFileSync(path.join(dir, entry), "utf8");
         const def = parseAgentTypeFile(content, entry.replace(/\.md$/, ""), source);
-        if (def) map.set(def.name, def); // project overrides user overrides builtin
+        if (def && !protectedBuiltins.has(def.name.toLowerCase())) {
+          map.set(def.name.trim().toLowerCase(), def);
+        }
       } catch {
         // ignore unreadable / malformed agent files
       }
@@ -112,14 +121,9 @@ export function resolveAgentType(
   types: Map<string, AgentTypeDef>,
 ): AgentTypeDef | undefined {
   if (!agentType) return undefined;
-  const found = types.get(agentType);
-  if (found) return found;
-  // Case-insensitive fallback.
-  const lower = agentType.toLowerCase();
-  for (const def of types.values()) {
-    if (def.name.toLowerCase() === lower) return def;
-  }
-  return undefined;
+  const normalized = agentType.trim();
+  if (!normalized) return undefined;
+  return types.get(normalized.toLowerCase());
 }
 
 export function parseAgentTypeFile(

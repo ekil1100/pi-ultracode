@@ -23,19 +23,25 @@ import {
 import * as crypto from "node:crypto";
 import { assertWorkflowArgsLimit, assertWorkflowOutputLimit } from "./value-limits.ts";
 
-export const RUN_JOURNAL_VERSION = 3;
+export const RUN_JOURNAL_VERSION = 4;
 export const MAX_JOURNAL_BYTES = 64 * 1024 * 1024;
 const NO_FOLLOW = fs.constants.O_NOFOLLOW ?? 0;
 
 export interface JournalRunMeta {
   type: "run";
-  journalVersion?: 3;
+  journalVersion?: 4;
   runId: string;
   name: string;
   scriptHash: string;
   args?: unknown;
+  projectTrusted: boolean;
+  targetIdentity: string;
   startedAt: number;
   maxAgents?: number;
+}
+
+export interface JournalResumeOptions {
+  validateDelivery?: (record: JournalAgentRecord) => void;
 }
 
 export interface JournalResumeRecord {
@@ -80,6 +86,13 @@ export interface JournalNestedSourceRecord {
   sourceHash: string;
 }
 
+export interface JournalDeliveryStartRecord {
+  type: "delivery-start";
+  callPath: string;
+  patchPath: string;
+  patchHash: string;
+}
+
 export interface JournalAgentRecord {
   type: "agent";
   /** Stable structural identity assigned in the script Worker. */
@@ -106,6 +119,9 @@ export interface JournalAgentRecord {
   agentType?: string;
   isolation?: string;
   structuredOutput?: boolean;
+  /** Durable material retained to verify a completed worktree side effect on resume. */
+  deliveryPatchPath?: string;
+  deliveryPatchHash?: string;
   transcriptPath?: string;
   startedAt?: number;
   durationMs?: number;
@@ -128,11 +144,16 @@ export type JournalRecord =
   | JournalPanelBranchRecord
   | JournalPanelRecord
   | JournalNestedSourceRecord
+  | JournalDeliveryStartRecord
   | JournalAgentRecord
   | JournalResultRecord;
 
 /** Cryptographic identity hash for scripts, args, and agent requests. */
 export function hashString(input: string): string {
+  return crypto.createHash("sha256").update(input).digest("hex");
+}
+
+export function hashBytes(input: Uint8Array): string {
   return crypto.createHash("sha256").update(input).digest("hex");
 }
 
@@ -152,11 +173,14 @@ interface LoadedJournal {
   completePanels: Map<string, JournalPanelRecord>;
   panelBranches: Map<string, Map<number, JournalPanelBranchRecord>>;
   nestedSources: Map<string, string>;
+  pendingDeliveries: Map<string, JournalDeliveryStartRecord>;
 }
 
 export class RunJournal {
   readonly filePath: string;
   readonly effectiveMaxAgents: number;
+  readonly projectTrusted: boolean;
+  readonly targetIdentity: string;
   private readonly fd: number;
   private readonly priorAgents: Map<string, JournalAgentRecord>;
   private readonly admittedPaths: Set<string>;
@@ -167,17 +191,21 @@ export class RunJournal {
   private readonly openPanelBranches = new Map<string, Map<number, JournalPanelBranchRecord>>();
   private readonly openPanelAdmissions = new Map<string, Set<string>>();
   private readonly nestedSources: Map<string, string>;
+  private readonly pendingDeliveries: Map<string, JournalDeliveryStartRecord>;
   private _agentsUsed: number;
   private bytes: number;
   private fdClosed = false;
   private closed = false;
   private writeFailure?: WorkflowPolicyError;
   private closeFailure?: unknown;
+  private resultRecorded = false;
 
   private constructor(filePath: string, fd: number, loaded: LoadedJournal) {
     this.filePath = filePath;
     this.fd = fd;
     this.effectiveMaxAgents = loaded.effectiveMaxAgents;
+    this.projectTrusted = loaded.header.projectTrusted;
+    this.targetIdentity = loaded.header.targetIdentity;
     this._agentsUsed = loaded.agentsUsed;
     this.bytes = loaded.bytes;
     this.priorAgents = loaded.agents;
@@ -187,6 +215,7 @@ export class RunJournal {
     this.completePanels = loaded.completePanels;
     this.panelBranches = loaded.panelBranches;
     this.nestedSources = loaded.nestedSources;
+    this.pendingDeliveries = loaded.pendingDeliveries;
   }
 
   get agentsUsed(): number {
@@ -200,6 +229,7 @@ export class RunJournal {
     const header: JournalRunMeta = {
       ...meta,
       journalVersion: RUN_JOURNAL_VERSION,
+      projectTrusted: meta.projectTrusted,
       maxAgents: effectiveMaxAgents,
     };
     validateRunRecord(header);
@@ -222,6 +252,7 @@ export class RunJournal {
       completePanels: new Map(),
       panelBranches: new Map(),
       nestedSources: new Map(),
+      pendingDeliveries: new Map(),
     });
     try {
       journal.append(header);
@@ -239,7 +270,12 @@ export class RunJournal {
   }
 
   /** Resume the same immutable run ledger, optionally raising its lifetime cap. */
-  static resume(dir: string, runId: string, meta: JournalRunMeta): RunJournal {
+  static resume(
+    dir: string,
+    runId: string,
+    meta: JournalRunMeta,
+    options: JournalResumeOptions = {},
+  ): RunJournal {
     assertWorkflowArgsLimit(meta.args);
     validateRunRecord(meta);
     ensurePrivateArtifactDirectory(dir);
@@ -255,6 +291,23 @@ export class RunJournal {
       }
       if (JSON.stringify(loaded.header.args) !== JSON.stringify(meta.args)) {
         throw new WorkflowPolicyError(`workflow ${runId} has immutable args; start a new run for changed args`);
+      }
+      if (loaded.header.projectTrusted !== meta.projectTrusted) {
+        throw new WorkflowPolicyError(`workflow ${runId} has an immutable project trust context; start a new run after trust changes`);
+      }
+      if (loaded.header.targetIdentity !== meta.targetIdentity) {
+        throw new WorkflowPolicyError(`workflow ${runId} has an immutable repository/cwd target; start a new run after changing location`);
+      }
+      if (loaded.pendingDeliveries.size > 0) {
+        const pending = [...loaded.pendingDeliveries.values()][0]!;
+        throw new WorkflowPolicyError(
+          `workflow delivery at ${pending.callPath} requires recovery before resume; patch: ${pending.patchPath}`,
+        );
+      }
+      if (options.validateDelivery) {
+        for (const agent of loaded.agents.values()) {
+          if (agent.deliveryPatchPath) options.validateDelivery(agent);
+        }
       }
 
       const requested = meta.maxAgents === undefined
@@ -299,6 +352,12 @@ export class RunJournal {
   }
 
   lookup(callPath: string, key: string): JournalAgentRecord | undefined {
+    const pending = this.pendingDeliveries.get(callPath);
+    if (pending) {
+      throw new WorkflowPolicyError(
+        `workflow delivery at ${callPath} requires recovery before resume; patch: ${pending.patchPath}`,
+      );
+    }
     const prior = this.priorAgents.get(callPath);
     if (!prior) return undefined;
     if (prior.key !== key) {
@@ -478,19 +537,36 @@ export class RunJournal {
     return credit;
   }
 
+  recordDeliveryStart(callPath: string, patchPath: string, patchHash: string): void {
+    if (this.pendingDeliveries.has(callPath) || this.priorAgents.has(callPath)) {
+      throw new WorkflowPolicyError(`workflow delivery already started at ${callPath}`);
+    }
+    const record: JournalDeliveryStartRecord = { type: "delivery-start", callPath, patchPath, patchHash };
+    validateDeliveryStartRecord(record);
+    this.append(record);
+    this.pendingDeliveries.set(callPath, record);
+  }
+
   recordAgent(record: Omit<JournalAgentRecord, "type">): void {
     const full: JournalAgentRecord = { type: "agent", ...record };
     assertWorkflowOutputLimit(full.value, "workflow agent output");
     validateAgentRecord(full);
+    const pending = this.pendingDeliveries.get(full.callPath);
+    assertDeliveryCompletionMatches(pending, full);
     this.append(full);
     this.priorAgents.set(full.callPath, full);
+    this.pendingDeliveries.delete(full.callPath);
   }
 
   recordResult(record: Omit<JournalResultRecord, "type">): void {
+    if (this.resultRecorded) {
+      throw new WorkflowPolicyError("workflow journal generation already has a terminal result");
+    }
     if (record.ok) assertWorkflowOutputLimit(record.result);
     const full: JournalResultRecord = { type: "result", ...record };
     validateResultRecord(full);
     this.append(full);
+    this.resultRecorded = true;
   }
 
   close(): void {
@@ -554,6 +630,10 @@ export class RunJournal {
   }
 
   private append(record: JournalRecord): void {
+    if (this.resultRecorded && record.type !== "resume") {
+      throw new WorkflowPolicyError("workflow journal generation already has a terminal result");
+    }
+    if (record.type === "resume") this.resultRecorded = false;
     if (this.writeFailure) throw this.writeFailure;
     if (this.closeFailure) throw this.closeFailure;
     if (this.closed || this.fdClosed) throw new WorkflowPolicyError("workflow journal is already closed");
@@ -617,7 +697,13 @@ function loadJournal(filePath: string): LoadedJournal {
   const completePanels = new Map<string, JournalPanelRecord>();
   const panelBranches = new Map<string, Map<number, JournalPanelBranchRecord>>();
   const nestedSources = new Map<string, string>();
+  const pendingDeliveries = new Map<string, JournalDeliveryStartRecord>();
+  let generationTerminated = false;
   for (const record of records.slice(1)) {
+    if (generationTerminated && record.type !== "resume") {
+      throw new WorkflowPolicyError("workflow journal contains a record after a generation terminal result");
+    }
+    if (record.type === "resume") generationTerminated = false;
     switch (record.type) {
       case "resume": {
         if (!isNonNegativeFinite(record.startedAt)) invalidJournalRecord("resume");
@@ -648,12 +734,21 @@ function loadJournal(filePath: string): LoadedJournal {
         admittedPaths.add(record.callPath);
         admissionHashes.set(record.callPath, record.inputHash);
         break;
+      case "delivery-start":
+        validateDeliveryStartRecord(record);
+        if (pendingDeliveries.has(record.callPath) || agents.has(record.callPath)) {
+          throw new WorkflowPolicyError(`workflow journal contains duplicate delivery start: ${record.callPath}`);
+        }
+        pendingDeliveries.set(record.callPath, record);
+        break;
       case "agent":
         validateAgentRecord(record);
         if (agents.has(record.callPath)) {
           throw new WorkflowPolicyError(`workflow journal contains duplicate agent result: ${record.callPath}`);
         }
+        assertDeliveryCompletionMatches(pendingDeliveries.get(record.callPath), record);
         agents.set(record.callPath, record);
+        pendingDeliveries.delete(record.callPath);
         break;
       case "panel-open":
         if (
@@ -756,6 +851,7 @@ function loadJournal(filePath: string): LoadedJournal {
       }
       case "result":
         validateResultRecord(record);
+        generationTerminated = true;
         break;
       case "run":
         throw new WorkflowPolicyError("workflow journal contains more than one run header");
@@ -793,6 +889,7 @@ function loadJournal(filePath: string): LoadedJournal {
     completePanels,
     panelBranches,
     nestedSources,
+    pendingDeliveries,
   };
 }
 
@@ -843,6 +940,9 @@ function validateJournalRecordForWrite(record: JournalRecord): void {
         invalidJournalRecord("nested-source");
       }
       return;
+    case "delivery-start":
+      validateDeliveryStartRecord(record);
+      return;
     case "agent":
       validateAgentRecord(record);
       return;
@@ -863,6 +963,8 @@ function validateRunRecord(record: JournalRunMeta): void {
     || !isNonEmptyString(record.name)
     || !isNonEmptyString(record.scriptHash)
     || !isNonNegativeFinite(record.startedAt)
+    || typeof record.projectTrusted !== "boolean"
+    || !isNonEmptyString(record.targetIdentity)
   ) invalidJournalRecord("run header");
   if (record.journalVersion !== undefined && record.journalVersion !== RUN_JOURNAL_VERSION) {
     invalidJournalRecord("run header");
@@ -872,6 +974,33 @@ function validateRunRecord(record: JournalRunMeta): void {
     assertWorkflowArgsLimit(record.args);
   } catch {
     invalidJournalRecord("run header");
+  }
+}
+
+function validateDeliveryStartRecord(record: JournalDeliveryStartRecord): void {
+  if (
+    !isNonEmptyString(record.callPath)
+    || !isNonEmptyString(record.patchPath)
+    || !isNonEmptyString(record.patchHash)
+  ) invalidJournalRecord("delivery-start");
+}
+
+function assertDeliveryCompletionMatches(
+  pending: JournalDeliveryStartRecord | undefined,
+  agent: JournalAgentRecord,
+): void {
+  const hasPath = agent.deliveryPatchPath !== undefined;
+  const hasHash = agent.deliveryPatchHash !== undefined;
+  if (hasPath !== hasHash) invalidJournalRecord("agent delivery completion");
+  if (!pending) {
+    if (hasPath) invalidJournalRecord("agent delivery completion");
+    return;
+  }
+  if (
+    agent.deliveryPatchPath !== pending.patchPath
+    || agent.deliveryPatchHash !== pending.patchHash
+  ) {
+    throw new WorkflowPolicyError(`workflow journal agent delivery does not match intent: ${agent.callPath}`);
   }
 }
 
@@ -914,6 +1043,8 @@ function validateAgentRecord(record: JournalAgentRecord): void {
     "effort",
     "agentType",
     "isolation",
+    "deliveryPatchPath",
+    "deliveryPatchHash",
     "transcriptPath",
   ] as const) {
     if (record[field] !== undefined && typeof record[field] !== "string") invalidJournalRecord("agent");

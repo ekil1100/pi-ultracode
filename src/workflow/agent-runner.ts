@@ -52,6 +52,7 @@ const PARENT_ONLY_CHILD_SKILLS = new Set(["pi-subagents"]);
 export interface WorkflowChildResourceLoaderOptions {
   cwd: string;
   agentDir: string;
+  projectTrusted?: boolean;
   settingsManager?: SettingsManager;
 }
 
@@ -67,7 +68,9 @@ export async function createWorkflowChildResourceLoader(
   options: WorkflowChildResourceLoaderOptions,
 ): Promise<DefaultResourceLoader> {
   const settingsManager = options.settingsManager
-    ?? SettingsManager.create(options.cwd, options.agentDir);
+    ?? SettingsManager.create(options.cwd, options.agentDir, {
+      projectTrusted: options.projectTrusted ?? false,
+    });
   const loader = new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir: options.agentDir,
@@ -221,6 +224,8 @@ export type AgentSessionFactory = (
 
 export interface WorkflowAgentRunnerOptions {
   cwd: string;
+  /** Parent session's immutable project-trust decision. */
+  projectTrusted?: boolean;
   /** Synchronous extension facade used only for model selection and state replay. */
   modelRegistry?: ModelRegistryLike;
   /** Canonical runtime to share across child sessions when supplied by an SDK host. */
@@ -278,6 +283,7 @@ export interface AgentRunCall {
 
 export class WorkflowAgentRunner {
   private readonly baseCwd: string;
+  private readonly projectTrusted: boolean;
   private readonly modelRegistry?: ModelRegistryLike;
   private readonly providedModelRuntime?: ModelRuntimeLike;
   private readonly defaultModel?: ModelLike;
@@ -290,6 +296,7 @@ export class WorkflowAgentRunner {
 
   constructor(options: WorkflowAgentRunnerOptions) {
     this.baseCwd = options.cwd;
+    this.projectTrusted = options.projectTrusted ?? false;
     this.modelRegistry = options.modelRegistry;
     this.providedModelRuntime = options.modelRuntime;
     this.defaultModel = options.model;
@@ -304,10 +311,11 @@ export class WorkflowAgentRunner {
   async run(call: AgentRunCall): Promise<AgentRunResult> {
     if (call.signal?.aborted) throw new Error("Subagent was aborted");
 
-    const cwd = call.cwd ?? this.baseCwd;
+    const executionCwd = call.cwd ?? this.baseCwd;
+    const resourceCwd = this.baseCwd;
     const capture: StructuredOutputCapture<any> = { called: false, value: undefined };
 
-    const customTools: ToolDefinition[] = [...createCodingTools(cwd)];
+    const customTools: ToolDefinition[] = [...createCodingTools(executionCwd)];
     let toolAllowlist: string[] | undefined = call.agentTypeDef?.tools
       ? [...call.agentTypeDef.tools]
       : undefined;
@@ -346,14 +354,21 @@ export class WorkflowAgentRunner {
     }
 
     const createSession = async (level: ThinkingLevel | undefined) => {
-      const settingsManager = SettingsManager.create(cwd, agentDir);
+      const settingsManager = SettingsManager.create(resourceCwd, agentDir, {
+        projectTrusted: this.projectTrusted,
+      });
       const resourceLoader = this.usesPiSessionFactory
-        ? await createWorkflowChildResourceLoader({ cwd, agentDir, settingsManager })
+        ? await createWorkflowChildResourceLoader({
+            cwd: resourceCwd,
+            agentDir,
+            projectTrusted: this.projectTrusted,
+            settingsManager,
+          })
         : undefined;
       return this.createSession({
-        cwd,
+        cwd: executionCwd,
         agentDir,
-        sessionManager: SessionManager.inMemory(cwd),
+        sessionManager: SessionManager.inMemory(executionCwd),
         settingsManager,
         ...(resourceLoader ? { resourceLoader } : {}),
         customTools,
@@ -484,7 +499,7 @@ export class WorkflowAgentRunner {
         usage: readUsage(session, telemetryCounters),
         modelId: actualModelId,
         effort: actualEffort,
-        cwd,
+        cwd: executionCwd,
       };
     } catch (error) {
       hasPrimaryError = true;

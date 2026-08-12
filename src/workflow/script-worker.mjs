@@ -77,7 +77,7 @@ async function executeBody(body, bodyArgs, depth, name, scopePath = "$") {
   });
   return executionContext.run(context, async () => {
     const scriptContext = buildScriptContext(bodyArgs);
-    const wrapped = `(async () => {\n${body}\n})()`;
+    const wrapped = `(async function () {\n"use strict";\n${body}\n})()`;
     return await new vm.Script(wrapped, { filename: `${name || "workflow"}.js` }).runInContext(scriptContext);
   });
 }
@@ -154,6 +154,15 @@ function buildScriptContext(bodyArgs) {
         }
       }
       const sandboxLog = (value) => sync("log", [String(value)])
+      const safeArrayMap = Array.prototype.map
+      const safeArrayIsArray = Array.isArray
+      const safeReflectApply = Reflect.apply
+      const mapThunks = (receiver, mapper) => {
+        if (!safeArrayIsArray(receiver) || typeof mapper !== "function") {
+          throw new TypeError("parallel map requires a realm-local array and mapper")
+        }
+        return safeReflectApply(safeArrayMap, receiver, [mapper])
+      }
       Object.defineProperties(globalThis, {
         __ultracodeAgent: { value: (callSite, ...values) => orchestration("agent", callSite, values) },
         __ultracodeParallel: { value: (callSite, ...values) => orchestration("parallel", callSite, values) },
@@ -161,11 +170,11 @@ function buildScriptContext(bodyArgs) {
         __ultracodeWorkflow: { value: (callSite, ...values) => orchestration("workflow", callSite, values) },
         __ultracodeLoop: { value: (site) => sync("loop", [site]) },
         __ultracodeInvoke: { value: (callSite, fn, thisArg, ...values) => invoke(callSite, fn, thisArg, values) },
+        __ultracodeMapThunks: { value: mapThunks },
         phase: { value: (value) => sync("phase", [value]) },
         log: { value: sandboxLog },
         args: { value: localize(rawArgs), enumerable: true },
         cwd: { value: cwdValue, enumerable: true },
-        process: { value: Object.freeze({ cwd: () => cwdValue }) },
         console: { value: Object.freeze({
           log: sandboxLog,
           info: sandboxLog,
@@ -175,6 +184,7 @@ function buildScriptContext(bodyArgs) {
         structuredClone: { value: (value) => localize(value) },
         Date: { value: undefined },
         Function: { value: undefined },
+        Proxy: { value: undefined },
         eval: { value: undefined },
         require: { value: undefined },
         performance: { value: undefined },
@@ -214,6 +224,8 @@ function buildScriptContext(bodyArgs) {
       })
       Object.freeze(Promise.prototype)
       Object.freeze(Promise)
+      Object.freeze(Array.prototype)
+      Object.freeze(Array)
       Object.defineProperty(Math, "random", {
         value: () => { throw new Error("Math.random() is non-deterministic and forbidden in workflow scripts; vary randomness by agent index instead.") },
         configurable: false,
@@ -279,35 +291,39 @@ async function parallelImpl(callSite, thunks, options = {}) {
   if (thunks.length > MAX_ITEMS_PER_CALL) {
     throw makePolicyError(`parallel() accepts at most ${MAX_ITEMS_PER_CALL} items (got ${thunks.length})`);
   }
-  if (thunks.some((thunk) => typeof thunk !== "function")) {
-    throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)");
+  const plannedThunks = copyDenseDataArray(thunks, "parallel() thunk array");
+  for (const thunk of plannedThunks) {
+    if (typeof thunk !== "function") {
+      throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)");
+    }
   }
   const execution = executionContext.getStore() ?? createExecutionScope({ scopePath: "$" });
-  const reserveAgents = normalizeReserveAgents(options, thunks.length);
+  const reserveAgents = normalizeReserveAgents(options, plannedThunks.length);
   const rawPanelSite = typeof callSite === "string" && callSite ? callSite : "parallel:dynamic";
   const [panelSource, panelLoops = ""] = rawPanelSite.split("@", 2);
-  const panelSite = `${panelSource}#${thunks.length}:${reserveAgents}${panelLoops ? `@${panelLoops}` : ""}`;
+  const panelSite = `${panelSource}#${plannedThunks.length}:${reserveAgents}${panelLoops ? `@${panelLoops}` : ""}`;
   const panelCallPath = allocateCallPath(execution, "parallel", "p", panelSite);
-  if (reserveAgents < thunks.length) {
-    throw makePolicyError(`parallel reserveAgents must be at least the number of thunks (${thunks.length}); got ${reserveAgents}`);
+  if (reserveAgents < plannedThunks.length) {
+    throw makePolicyError(`parallel reserveAgents must be at least the number of thunks (${plannedThunks.length}); got ${reserveAgents}`);
   }
   const parentReservationIds = Array.isArray(execution.reservationIds) ? execution.reservationIds : [];
   const panel = await rpc("reservePanel", {
     callPath: panelCallPath,
     reserveAgents,
-    branchCount: thunks.length,
+    branchCount: plannedThunks.length,
     parentReservationIds,
   });
   const panelReservationId = requireString(panel?.panelReservationId, "panelReservationId");
   const branchReservationIds = Array.isArray(panel?.branchReservationIds) ? panel.branchReservationIds : [];
-  if (branchReservationIds.length !== thunks.length || branchReservationIds.some((id) => typeof id !== "string")) {
+  if (branchReservationIds.length !== plannedThunks.length || branchReservationIds.some((id) => typeof id !== "string")) {
     throw makePolicyError("workflow host returned an invalid parallel reservation panel");
   }
 
   let completed = false;
-  const branchOutcomes = Array.from({ length: thunks.length }, () => "pending");
+  let firstFatal;
+  const branchOutcomes = Array.from({ length: plannedThunks.length }, () => "pending");
   try {
-    const results = await Promise.all(thunks.map(async (thunk, index) => {
+    const branchPromises = plannedThunks.map(async (thunk, index) => {
       const branchReservationId = branchReservationIds[index];
       const childContext = createExecutionScope({
         workflowPath: [...(execution.workflowPath ?? [])],
@@ -329,7 +345,10 @@ async function parallelImpl(callSite, thunks, options = {}) {
           });
           return value;
         } catch (error) {
-          if (isFatal(error)) throw error;
+          if (isFatal(error)) {
+            firstFatal ??= error;
+            throw error;
+          }
           branchOutcomes[index] = "failed";
           await rpc("completePanelBranch", {
             callPath: panelCallPath,
@@ -339,14 +358,19 @@ async function parallelImpl(callSite, thunks, options = {}) {
           logLine(`parallel[${index}] failed: ${messageOf(error)}`);
           return null;
         } finally {
-          await rpc("releasePanel", { reservationId: branchReservationId }).catch(() => undefined);
+          await cleanupRpc("releasePanel", { reservationId: branchReservationId }).catch(() => undefined);
         }
       });
-    }));
+    });
+    const settled = await Promise.allSettled(branchPromises);
+    if (firstFatal) throw firstFatal;
+    const rejected = settled.find((entry) => entry.status === "rejected");
+    if (rejected) throw rejected.reason;
+    const results = settled.map((entry) => entry.value);
     completed = true;
     return results;
   } finally {
-    const release = rpc("releasePanel", {
+    const release = cleanupRpc("releasePanel", {
       reservationId: panelReservationId,
       callPath: panelCallPath,
       completed,
@@ -367,12 +391,13 @@ async function pipelineImpl(callSite, items, ...stages) {
   if (items.length > MAX_ITEMS_PER_CALL) {
     throw makePolicyError(`pipeline() accepts at most ${MAX_ITEMS_PER_CALL} items (got ${items.length})`);
   }
+  const plannedItems = copyDenseDataArray(items, "pipeline() item array");
   if (stages.some((stage) => typeof stage !== "function")) {
     throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
   }
   const execution = executionContext.getStore() ?? createExecutionScope({ scopePath: "$" });
   const pipelineCallPath = allocateCallPath(execution, "pipeline", "l", callSite);
-  return await Promise.all(items.map(async (item, index) => {
+  return await Promise.all(plannedItems.map(async (item, index) => {
     let value = item;
     for (const [stageIndex, stage] of stages.entries()) {
       try {
@@ -395,6 +420,18 @@ async function pipelineImpl(callSite, items, ...stages) {
     }
     return value;
   }));
+}
+
+function copyDenseDataArray(value, label) {
+  const output = new Array(value.length);
+  for (let index = 0; index < value.length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !Object.hasOwn(descriptor, "value")) {
+      throw new TypeError(`${label} must be dense and contain only data elements`);
+    }
+    output[index] = descriptor.value;
+  }
+  return output;
 }
 
 function workflow(callSite, nameOrRef, nestedArgs) {
@@ -520,6 +557,15 @@ function normalizeReserveAgents(options, fallback) {
 function rpc(op, payload) {
   throwIfAborted();
   consumeHostCall();
+  return postRpc(op, payload);
+}
+
+/** Internal finally RPC that remains available after sticky fatal/abort state. */
+function cleanupRpc(op, payload) {
+  return postRpc(op, payload);
+}
+
+function postRpc(op, payload) {
   const id = ++nextRpcId;
   return new Promise((resolve, reject) => {
     rpcWaiters.set(id, { resolve, reject });
@@ -603,9 +649,9 @@ function makePolicyError(message) {
 function markFatal(error) {
   if (!isPolicy(error)) return;
   stickyFatalError ??= error;
+  // Stop new orchestration, but let every already-dispatched RPC settle so
+  // branch and panel finally blocks reflect real sibling completion order.
   aborted = true;
-  for (const waiter of rpcWaiters.values()) waiter.reject(stickyFatalError);
-  rpcWaiters.clear();
   try {
     parentPort.postMessage({ type: "fatal", error: serializeError(stickyFatalError) });
   } catch {

@@ -15,9 +15,10 @@ import {
   MAX_LIVE_TASK_BYTES,
   MAX_TASK_TRANSCRIPT_BYTES,
 } from "../src/workflow/run-details.ts";
-import { WorkflowRegistry, getRegistry } from "../src/workflow/registry.ts";
-import { WorkflowOverlayComponent } from "../src/workflow/workflow-overlay.ts";
+import { WorkflowRegistry } from "../src/workflow/registry.ts";
+import { openWorkflowOverlay, WorkflowOverlayComponent } from "../src/workflow/workflow-overlay.ts";
 import { RunJournal } from "../src/workflow/journal.ts";
+import { resolveRepositoryContext } from "../src/workflow/repository-context.ts";
 import { runWorkflow } from "../src/workflow/runtime.ts";
 import { createWorkflowTool } from "../src/workflow/tool.ts";
 
@@ -413,14 +414,14 @@ test("runWorkflow separates new token usage from cached replay usage", async () 
       cwd: process.cwd(),
     }),
   };
-  const firstJournal = RunJournal.create(root, { type: "run", runId, name: "cache", scriptHash: "1", startedAt: 0 });
-  const first = await runWorkflow(script, { runner, journal: firstJournal });
+  const firstJournal = RunJournal.create(root, { type: "run", projectTrusted: false, targetIdentity: resolveRepositoryContext(process.cwd()).identity, runId, name: "cache", scriptHash: "1", startedAt: 0 });
+  const first = await runWorkflow(script, { projectTrusted: false, runner, journal: firstJournal });
   firstJournal.close();
   assert.equal(first.newTokens, 140);
   assert.equal(first.replayedTokens, 0);
 
-  const secondJournal = RunJournal.resume(root, runId, { type: "run", runId, name: "cache", scriptHash: "1", startedAt: 1 });
-  const second = await runWorkflow(script, {
+  const secondJournal = RunJournal.resume(root, runId, { type: "run", projectTrusted: false, targetIdentity: resolveRepositoryContext(process.cwd()).identity, runId, name: "cache", scriptHash: "1", startedAt: 1 });
+  const second = await runWorkflow(script, { projectTrusted: false,
     runner: { run: async () => { throw new Error("cache miss"); } },
     journal: secondJournal,
   });
@@ -468,7 +469,8 @@ test("workflow tool keeps raw deltas out of tool details while the private task 
       meta: { name: "streaming" },
     };
   }) as any;
-  const tool = createWorkflowTool({ runWorkflowFn });
+  const registry = new WorkflowRegistry();
+  const tool = createWorkflowTool({ runWorkflowFn, registry });
   const result = await tool.execute(
     "tc",
     { script: `export const meta = { name: 'streaming', description: 'x' }\nreturn await agent('p')` } as any,
@@ -479,7 +481,7 @@ test("workflow tool keeps raw deltas out of tool details while the private task 
   assert.doesNotMatch(JSON.stringify(result.details), /LIVE_DELTA/);
   assert.ok(fs.existsSync((result.details as any).detailsManifestPath));
   const runId = (result.details as any).runId;
-  const task = getRegistry().get(runId)?.details?.getTask(1);
+  const task = registry.get(runId)?.details?.getTask(1);
   assert.ok(task);
   assert.match(JSON.stringify(task), /LIVE_DELTA/);
   fs.rmSync(root, { recursive: true, force: true });
@@ -698,36 +700,53 @@ test("live reordered calls cannot overwrite another callPath transcript", () => 
   }
 });
 
-test("registry preserves active handles when switching session scopes", () => {
-  const rootA = fs.mkdtempSync(path.join(os.tmpdir(), "uc-registry-a-"));
-  const rootB = fs.mkdtempSync(path.join(os.tmpdir(), "uc-registry-b-"));
-  try {
-    const registry = new WorkflowRegistry();
-    let abortsA = 0;
-    let abortsB = 0;
-    registry.setScope(rootA);
-    registry.register("wf_a", createSnapshot({ name: "a", description: "x" }, "wf_a"), () => { abortsA++; });
-    registry.setScope(rootB);
-    registry.register("wf_b", createSnapshot({ name: "b", description: "x" }, "wf_b"), () => { abortsB++; });
-    assert.equal(registry.get("wf_a"), undefined);
-    assert.ok(registry.get("wf_b"));
+test("independent registries keep active handles and abort ownership isolated", () => {
+  const registryA = new WorkflowRegistry();
+  const registryB = new WorkflowRegistry();
+  let abortsA = 0;
+  let abortsB = 0;
+  registryA.register("wf_a", createSnapshot({ name: "a", description: "x" }, "wf_a"), () => { abortsA++; });
+  registryB.register("wf_b", createSnapshot({ name: "b", description: "x" }, "wf_b"), () => { abortsB++; });
 
-    registry.setScope(rootA);
-    assert.ok(registry.get("wf_a"), "switching back restores the live in-memory handle");
-    assert.equal(registry.get("wf_b"), undefined);
-    registry.abortAll();
-    assert.equal(abortsA, 1);
-    assert.equal(abortsB, 0, "abort remains scoped to the selected session");
-  } finally {
-    fs.rmSync(rootA, { recursive: true, force: true });
-    fs.rmSync(rootB, { recursive: true, force: true });
-  }
+  assert.ok(registryA.get("wf_a"));
+  assert.equal(registryA.get("wf_b"), undefined);
+  assert.ok(registryB.get("wf_b"));
+  assert.equal(registryB.get("wf_a"), undefined);
+  registryA.abortAll();
+  assert.equal(abortsA, 1);
+  assert.equal(abortsB, 0);
+});
+
+test("workflow overlays are isolated by session registry", async () => {
+  const firstRegistry = new WorkflowRegistry();
+  const secondRegistry = new WorkflowRegistry();
+  firstRegistry.register("wf-overlay-a", createSnapshot({ name: "a", description: "x" }, "wf-overlay-a"), () => {});
+  secondRegistry.register("wf-overlay-b", createSnapshot({ name: "b", description: "x" }, "wf-overlay-b"), () => {});
+  const resolvers: Array<() => void> = [];
+  let customCalls = 0;
+  const context = (): any => ({
+    mode: "tui",
+    ui: {
+      notify: () => {},
+      custom: async () => {
+        customCalls++;
+        await new Promise<void>((resolve) => resolvers.push(resolve));
+      },
+    },
+  });
+
+  const first = openWorkflowOverlay(context(), firstRegistry);
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = openWorkflowOverlay(context(), secondRegistry);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(customCalls, 2, "one session's open overlay must not block another session");
+  for (const resolve of resolvers) resolve();
+  await Promise.all([first, second]);
 });
 
 test("workflow overlay renders responsive task stats and routes navigation in regular and fullscreen TUI", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-overlay-"));
   const registry = new WorkflowRegistry();
-  registry.setScope(root);
   const details = new WorkflowRunDetails({ runId: "wf_overlay", name: "audit", runsDir: root });
   details.startTask({
     id: 1,

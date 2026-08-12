@@ -5,7 +5,6 @@
  */
 
 import * as crypto from "node:crypto";
-import * as os from "node:os";
 import * as path from "node:path";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
@@ -26,7 +25,7 @@ import {
 } from "./runtime.ts";
 import type { ModelRuntimeLike, ThinkingLevel } from "./agent-runner.ts";
 import { RunJournal, hashString, type JournalAgentRecord } from "./journal.ts";
-import { getRegistry } from "./registry.ts";
+import { WorkflowRegistry } from "./registry.ts";
 import { normalizeMaxAgents } from "./admission.ts";
 import { acquireWorkflowLease, type WorkflowLease } from "./leases.ts";
 import {
@@ -34,11 +33,13 @@ import {
   assertRegularArtifactFile,
   ensurePrivateArtifactDirectory,
   readArtifactFile,
-  readContainedArtifactFile,
   standaloneWorkflowRunsDir,
   writeArtifactFile,
 } from "./run-artifacts.ts";
 import { assertWorkflowArgsLimit } from "./value-limits.ts";
+import { readSavedWorkflowByName } from "./saved-workflow.ts";
+import { resolveRepositoryContext } from "./repository-context.ts";
+import { verifyAppliedPatch } from "./worktree.ts";
 import {
   WorkflowRunDetails,
   normalizeTaskUsage,
@@ -63,7 +64,10 @@ const workflowToolSchema = Type.Object({
     Type.String({ description: "Path to a workflow script file to run instead of an inline `script`." }),
   ),
   name: Type.Optional(
-    Type.String({ description: "Name of a saved workflow (under .pi/ultracode/workflows/) to run." }),
+    Type.String({
+      description:
+        "Name of a saved workflow under project .pi/ultracode/workflows/ or user-scoped ~/.pi/ultracode/workflows/.",
+    }),
   ),
   args: Type.Optional(
     Type.Any({ description: "Optional JSON value exposed to the workflow script as the global `args`." }),
@@ -85,6 +89,8 @@ const workflowToolSchema = Type.Object({
 }, { additionalProperties: false });
 
 export interface WorkflowToolDeps {
+  /** Session-owned workflow registry shared with commands and overlays. */
+  registry?: WorkflowRegistry;
   /** Canonical runtime supplied by an SDK host; shared by all child sessions. */
   modelRuntime?: ModelRuntimeLike;
   /** The ultracode effort level to forward to every workflow subagent as its
@@ -116,6 +122,7 @@ function nextRunId(): string {
 }
 
 export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<typeof workflowToolSchema, any> {
+  const registry = deps.registry ?? new WorkflowRegistry();
   return defineTool({
     name: "workflow",
     label: "Workflow",
@@ -139,9 +146,12 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         if (signal?.aborted || controller.signal.aborted) throw new Error("Workflow was aborted before it started");
 
       const cwd = ctx.cwd;
+      const projectTrusted = ctx.isProjectTrusted?.() ?? false;
+      const repositoryContext = resolveRepositoryContext(cwd);
+      const targetIdentity = repositoryContext.identity;
       assertWorkflowArgsLimit(params.args);
       const requestedMaxAgents = params.maxAgents === undefined ? undefined : normalizeMaxAgents(params.maxAgents);
-      const resolvedScript = resolveScript(params, cwd);
+      const resolvedScript = resolveScript(params, cwd, projectTrusted);
       const script = normalizeScript(resolvedScript.script);
       const sourceLabel = resolvedScript.sourceLabel;
       const parsed = parseWorkflowScript(script);
@@ -162,7 +172,6 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       const workflowStartedAt = Date.now();
       let lease: WorkflowLease | undefined;
       let journal: RunJournal | undefined;
-      let toolSucceeded = false;
       lease = acquireWorkflowLease(runsDir, runId);
       try {
 
@@ -187,11 +196,27 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         name: parsed.meta.name,
         scriptHash: hashString(script),
         args: params.args,
+        projectTrusted,
+        targetIdentity,
         startedAt: Date.now(),
         maxAgents: requestedMaxAgents,
       };
       journal = resuming
-        ? RunJournal.resume(runsDir, runId, journalMeta)
+        ? RunJournal.resume(runsDir, runId, journalMeta, {
+            validateDelivery(record) {
+              if (!record.deliveryPatchPath || !record.deliveryPatchHash || !repositoryContext.repoRoot) {
+                throw new Error(`workflow delivery at ${record.callPath} has no verifiable Git target`);
+              }
+              if (!verifyAppliedPatch(
+                repositoryContext.repoRoot,
+                record.deliveryPatchPath,
+                record.deliveryPatchHash,
+                path.join(runsDir, "patches"),
+              )) {
+                throw new Error(`workflow delivery at ${record.callPath} is no longer present; start a new run`);
+              }
+            },
+          })
         : RunJournal.create(runsDir, journalMeta);
       const activeJournal = journal;
       const effectiveMaxAgents = activeJournal.effectiveMaxAgents;
@@ -215,14 +240,15 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       if (resuming) runDetails.beginGeneration();
       snapshot.detailsManifestPath = runDetails.manifestPath;
       if (controller.signal.aborted) throw new Error("Workflow was aborted before it started");
-      const registry = getRegistry();
-      registry.setScope(runsDir);
       const handle = registry.register(runId, snapshot, requestAbort, runDetails);
       let updateObserverEnabled = true;
       const emitUpdate = () => {
         if (!onUpdate || !updateObserverEnabled) return;
         try {
-          onUpdate({ content: [{ type: "text", text: renderWorkflowText(snapshot) }], details: snapshot });
+          onUpdate({
+            content: [{ type: "text", text: renderWorkflowText(snapshot) }],
+            details: structuredClone(snapshot),
+          });
         } catch (error) {
           updateObserverEnabled = false;
           throw error;
@@ -276,6 +302,8 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         const result = await run(script, {
           cwd,
           args: params.args,
+          projectTrusted,
+          targetIdentity,
           signal: controller.signal,
           thinkingLevel,
           modelRegistry: ctx.modelRegistry as any,
@@ -419,6 +447,13 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         if (heartbeatFailed) throw heartbeatError;
         if (abortRequested || controller.signal.aborted) throw new Error("Workflow execution ended after cancellation");
 
+        // The terminal journal record is the publication point for tool success.
+        journal?.recordResult({
+          ok: true,
+          result: result.result,
+          agentCount: result.agentCount,
+          durationMs: result.durationMs,
+        });
         acceptingEvents = false;
         for (const agent of snapshot.agents) clearAgentTransient(agent);
         snapshot.result = result.result;
@@ -437,22 +472,23 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           // best-effort manifest close
         }
         registry.notify();
-        journal?.recordResult({
-          ok: true,
-          result: result.result,
-          agentCount: result.agentCount,
-          durationMs: result.durationMs,
-        });
-        emitUpdate();
+        try {
+          emitUpdate();
+        } catch {
+          // The durable workflow result is authoritative; display observers are best-effort.
+        }
 
         const agentsUsed = result.agentsUsed ?? activeJournal.agentsUsed;
-        ctx.ui?.notify(
-          `Workflow ${displayName} completed: ${agentsUsed}/${result.maxAgents ?? effectiveMaxAgents} lifetime agent slot(s), ~${result.spentTokens} output tokens.`,
-          "info",
-        );
+        try {
+          ctx.ui?.notify(
+            `Workflow ${displayName} completed: ${agentsUsed}/${result.maxAgents ?? effectiveMaxAgents} lifetime agent slot(s), ~${result.spentTokens} output tokens.`,
+            "info",
+          );
+        } catch {
+          // UI notification failure cannot reverse a committed result.
+        }
 
         const cachedNote = result.cachedCount ? ` (${result.cachedCount} cached from resume)` : "";
-        toolSucceeded = true;
         return {
           content: [
             {
@@ -464,7 +500,13 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
                 `Result:\n${safeJson(result.result)}`,
             },
           ],
-          details: { ...snapshot, runId, scriptPath, source: sourceLabel, maxAgents: result.maxAgents ?? effectiveMaxAgents },
+          details: {
+            ...structuredClone(snapshot),
+            runId,
+            scriptPath,
+            source: sourceLabel,
+            maxAgents: result.maxAgents ?? effectiveMaxAgents,
+          },
         };
       } catch (error) {
         const failure = heartbeatFailed ? heartbeatError : error;
@@ -509,11 +551,19 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
           // A poisoned journal must not append after a partial write; preserve
           // the execution failure that brought us into this path.
         }
-        emitUpdate();
-        ctx.ui?.notify(
-          `Workflow ${displayName} ${aborted ? "was aborted" : "failed"}${aborted ? "" : `: ${errorText}`}`,
-          aborted ? "warning" : "error",
-        );
+        try {
+          emitUpdate();
+        } catch {
+          // Failed-state observers cannot replace the primary workflow failure.
+        }
+        try {
+          ctx.ui?.notify(
+            `Workflow ${displayName} ${aborted ? "was aborted" : "failed"}${aborted ? "" : `: ${errorText}`}`,
+            aborted ? "warning" : "error",
+          );
+        } catch {
+          // UI notification is best-effort on failure paths.
+        }
         if (aborted) {
           throw new Error(`Workflow ${displayName} was aborted (runId: ${runId})`, { cause: failure });
         }
@@ -532,19 +582,15 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         }
       }
       } finally {
-        let journalCloseError: unknown;
         try {
           journal?.close();
-        } catch (error) {
-          journalCloseError = error;
+        } catch {
+          // A close failure must not reverse durable success or mask a primary failure.
         }
         try {
           lease?.release();
         } catch {
           // best-effort cleanup; active-run leases must never mask the original error
-        }
-        if (toolSucceeded && journalCloseError) {
-          throw new Error(`workflow journal close failed: ${statusText(journalCloseError)}`, { cause: journalCloseError });
         }
       }
       } finally {
@@ -572,6 +618,7 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
 function resolveScript(
   params: { script?: string; scriptPath?: string; name?: string },
   cwd: string,
+  projectTrusted: boolean,
 ): { script: string; sourceLabel: string } {
   if (params.script && params.script.trim()) {
     return { script: normalizeScript(params.script), sourceLabel: "inline" };
@@ -582,32 +629,36 @@ function resolveScript(
   }
   if (params.name) {
     requireSafeWorkflowName(params.name);
-    const roots = [cwd, os.homedir()];
-    for (const root of roots) {
-      const dir = path.join(root, ".pi", "ultracode", "workflows");
-      for (const candidate of [`${params.name}.workflow.js`, `${params.name}.js`]) {
-        const full = path.join(dir, candidate);
-        if (artifactPathExists(full)) {
-          return {
-            script: readContainedArtifactFile(root, full, "saved workflow", 16 * 1024 * 1024),
-            sourceLabel: `name:${params.name}`,
-          };
-        }
-      }
+    const saved = readSavedWorkflowByName(params.name, cwd, projectTrusted);
+    if (saved) {
+      return {
+        script: saved.script,
+        sourceLabel: `name:${params.name}:${saved.scope}`,
+      };
     }
-    throw new Error(`workflow: no saved workflow named "${params.name}" found under .pi/ultracode/workflows/`);
+    throw new Error(`workflow: no accessible saved workflow named "${params.name}" was found`);
   }
   throw new Error("workflow requires one of: `script`, `scriptPath`, or `name`.");
 }
 
-export function workflowRunsDir(ctx: { sessionManager?: { getSessionDir?: () => string }; cwd: string }): string {
+export function workflowRunsDir(ctx: {
+  sessionManager?: { getSessionDir?: () => string; getSessionId?: () => string };
+  cwd: string;
+}): string {
+  let sessionDir: string | undefined;
+  let sessionId: string | undefined;
   try {
-    const sessionDir = ctx.sessionManager?.getSessionDir?.();
-    if (sessionDir) return path.join(sessionDir, "ultracode-runs");
+    sessionDir = ctx.sessionManager?.getSessionDir?.();
+    sessionId = ctx.sessionManager?.getSessionId?.();
   } catch {
-    // fall through
+    // Fall through to the standalone artifact root.
   }
-  return standaloneWorkflowRunsDir(ctx.cwd);
+  const base = sessionDir
+    ? path.join(sessionDir, "ultracode-runs")
+    : standaloneWorkflowRunsDir(ctx.cwd);
+  if (!sessionId) return base;
+  const scope = crypto.createHash("sha256").update(sessionId).digest("hex").slice(0, 32);
+  return path.join(base, `session-${scope}`);
 }
 
 function safeJson(value: unknown): string {

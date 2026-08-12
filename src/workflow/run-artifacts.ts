@@ -16,21 +16,30 @@ export function ensurePrivateArtifactDirectory(dir: string, trustedRoot?: string
     ensureContainedDirectory(trustedRoot, dir);
     return;
   }
-  let created = false;
-  try {
-    fs.lstatSync(dir);
-  } catch (error: any) {
-    if (error?.code !== "ENOENT") throw error;
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-    created = true;
+  const target = path.resolve(dir);
+  const missing: string[] = [];
+  let current = target;
+  while (true) {
+    try {
+      assertRealDirectory(current);
+      break;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      missing.push(current);
+      const parent = path.dirname(current);
+      if (parent === current) throw error;
+      current = parent;
+    }
   }
-  assertRealDirectory(dir);
-  if (process.platform !== "win32") fs.chmodSync(dir, 0o700);
-  if (created) {
-    fsyncArtifactDirectory(dir);
-    const parent = path.dirname(dir);
-    if (parent !== dir) fsyncArtifactDirectory(parent);
+  for (const directory of missing.reverse()) {
+    fs.mkdirSync(directory, { mode: 0o700 });
+    assertRealDirectory(directory);
+    if (process.platform !== "win32") fs.chmodSync(directory, 0o700);
+    fsyncArtifactDirectory(directory);
+    fsyncArtifactDirectory(path.dirname(directory));
   }
+  assertRealDirectory(target);
+  if (process.platform !== "win32") fs.chmodSync(target, 0o700);
 }
 
 function ensureContainedDirectory(trustedRoot: string, dir: string): void {
@@ -112,6 +121,10 @@ export function readContainedArtifactFile(
   maxBytes = 16 * 1024 * 1024,
 ): string {
   const root = path.resolve(trustedRoot);
+  const rootStat = fs.lstatSync(root);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`${label} trusted root must be a real directory: ${root}`);
+  }
   const target = path.resolve(filePath);
   const relative = path.relative(root, target);
   if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
@@ -130,7 +143,40 @@ export function readContainedArtifactFile(
   return readArtifactFile(target, label, maxBytes);
 }
 
+export function readContainedArtifactBytes(
+  trustedRoot: string,
+  filePath: string,
+  label: string,
+  maxBytes = 16 * 1024 * 1024,
+): Buffer {
+  const root = path.resolve(trustedRoot);
+  const rootStat = fs.lstatSync(root);
+  if (rootStat.isSymbolicLink() || !rootStat.isDirectory()) {
+    throw new Error(`${label} trusted root must be a real directory: ${root}`);
+  }
+  const target = path.resolve(filePath);
+  const relative = path.relative(root, target);
+  if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new Error(`${label} must stay inside ${root}`);
+  }
+  let current = root;
+  const parts = relative.split(path.sep);
+  for (const [index, part] of parts.entries()) {
+    current = path.join(current, part);
+    const stat = fs.lstatSync(current);
+    if (stat.isSymbolicLink()) throw new Error(`${label} path may not contain symlinks: ${current}`);
+    if (index < parts.length - 1 && !stat.isDirectory()) {
+      throw new Error(`${label} parent must be a directory: ${current}`);
+    }
+  }
+  return readArtifactBytes(target, label, maxBytes);
+}
+
 export function readArtifactFile(filePath: string, label: string, maxBytes = 16 * 1024 * 1024): string {
+  return readArtifactBytes(filePath, label, maxBytes).toString("utf8");
+}
+
+export function readArtifactBytes(filePath: string, label: string, maxBytes = 16 * 1024 * 1024): Buffer {
   assertRegularArtifactFile(filePath, label);
   const fd = fs.openSync(filePath, fs.constants.O_RDONLY | NO_FOLLOW);
   try {
@@ -147,7 +193,7 @@ export function readArtifactFile(filePath: string, label: string, maxBytes = 16 
       total += bytesRead;
     }
     if (total > maxBytes) throw new Error(`${label} exceeds ${maxBytes} bytes: ${filePath}`);
-    return Buffer.concat(chunks, total).toString("utf8");
+    return Buffer.concat(chunks, total);
   } finally {
     fs.closeSync(fd);
   }

@@ -22,7 +22,7 @@ import type {
 
 const MIN_SPLIT_WIDTH = 100;
 const MAX_RENDER_FPS_INTERVAL_MS = 100;
-let overlayOpen = false;
+const OPEN_OVERLAYS = new WeakSet<WorkflowRegistry>();
 
 type OverlayNavigationKey = "pageUp" | "pageDown" | "end";
 
@@ -56,7 +56,7 @@ export async function openWorkflowOverlay(
     );
     return;
   }
-  if (overlayOpen) {
+  if (OPEN_OVERLAYS.has(registry)) {
     ctx.ui.notify("Workflow detail is already open.", "info");
     return;
   }
@@ -80,7 +80,7 @@ export async function openWorkflowOverlay(
     preferredRunId = matches[0]!.snapshot.runId;
   }
 
-  overlayOpen = true;
+  OPEN_OVERLAYS.add(registry);
   try {
     await ctx.ui.custom<void>(
       (tui, theme, _keybindings, done) => new WorkflowOverlayComponent({
@@ -102,7 +102,7 @@ export async function openWorkflowOverlay(
       },
     );
   } finally {
-    overlayOpen = false;
+    OPEN_OVERLAYS.delete(registry);
   }
 }
 

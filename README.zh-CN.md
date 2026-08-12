@@ -71,7 +71,7 @@ Pi 会自行判断工作流是否有帮助。小任务仍可继续使用普通�
 
 ## 工作流示例
 
-通常由主代理自动编写工作流。需要复用时，可以保存到 `.pi/ultracode/workflows/*.workflow.js` 或 `~/.pi/ultracode/workflows/*.workflow.js`。
+通常由主代理自动编写工作流。需要复用时，可以保存到 `.pi/ultracode/workflows/*.workflow.js` 或 `~/.pi/ultracode/workflows/*.workflow.js`。只有 Pi 将项目标记为可信后，才会发现项目级工作流；用户级工作流在未信任项目中仍可使用。
 
 ```js
 export const meta = {
@@ -107,7 +107,9 @@ return findings.filter(Boolean);
 
 ```text
 .pi/ultracode/agents/*.md
+.pi/agents/*.md
 ~/.pi/ultracode/agents/*.md
+~/.pi/agent/agents/*.md
 ```
 
 每次调用都可以选择角色、模型、思考强度或 worktree 隔离：
@@ -121,15 +123,15 @@ await agent("Implement and test the fix.", {
 });
 ```
 
-Worktree 隔离只能在至少有一个 commit 的 Git 仓库中使用。如果创建失败，Ultracode 会记录回退信息，并让该代理在共享工作目录中运行；此时应避免并行写入。为保证补丁集成可预测，建议保持工作区干净。
+Worktree 隔离只能在至少有一个 commit 的 Git 仓库中使用；隔离树创建失败时会直接失败，不会回退到共享工作目录。每次调用都会获得唯一的 detached worktree。补丁集成不修改用户 index；byte-exact patch 会先在 object format 匹配的私有 Git index 中完成 cached check，再绕开仓库 attributes、filter 与 EOL 转换直接 materialize 原始 blob；冲突补丁会保存供人工恢复，不使用可能破坏 index 的三方合并回退。成功交付的补丁会保留，用于 resume 时校验共享树效果仍然存在。隔离树不会链接共享仓库的可写 `node_modules`；需要时请在隔离树中安装依赖，或在集成后执行最终测试。为保证补丁集成可预测，建议保持工作区干净。
 
 ## 执行边界
 
-工作流默认使用 `maxAgents: 128`，最多并发运行 16 个代理，并只允许一层嵌套工作流。累计代理上限会跨 resume 保留，缓存回放不会再次占用额度。
+工作流默认使用 `maxAgents: 128`，最多并发运行 16 个代理，并只允许一层嵌套工作流。嵌套 `workflow()` 只接受经过 trust-aware discovery 的已保存工作流名称，不接受显式路径。累计代理上限会跨 resume 保留，缓存回放不会再次占用额度。
 
-Workflow 子代理会保留项目上下文和普通 skills，但不会初始化环境中的 Pi 扩展，也不会暴露父级编排工具与 skill（`workflow`、`subagent`、`subagent_wait` 或 `pi-subagents`）。这样可把编排限制在父会话边界，同时允许 `pi-ultracode` 与 `pi-subagents` 在主会话中共存。
+Workflow 子代理会保留项目上下文和普通 skills，但不会初始化环境中的 Pi 扩展，也不会暴露父级编排工具与 skill（`workflow`、`subagent`、`subagent_wait` 或 `pi-subagents`）。这样可把编排限制在父会话边界，同时允许 `pi-ultracode` 与 `pi-subagents` 在主会话中共存。项目级代理和设置遵循 Pi 的项目信任结果；内置 Explore 与 Plan 角色使用封闭的只读工具列表，不包含 shell 或写入工具。
 
-Resume 刻意保持不可变：脚本、参数、代理定义、实际模型和调用结构都必须匹配。工作内容发生变化时，应启动新的 run。
+Resume 刻意保持不可变：规范化脚本、参数、规范仓库及仓内相对 cwd、项目信任上下文、代理定义、实际模型和调用结构都必须匹配。Worktree 交付会在修改共享仓库前先写入持久恢复意图；中断或冲突的交付会阻止自动回放，并报告恢复补丁。工作内容发生变化时，应启动新的 run。
 
 Token 和成本只用于可观测性，不作为执行预算。Worker 与 VM 限制用于确定性和存活性保护，不是安全沙箱。
 
