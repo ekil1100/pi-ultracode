@@ -22,6 +22,8 @@ import { resolveRepositoryContext } from "./repository-context.ts";
 const MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_GIT_TIMEOUT_MS = 25_000;
 const MAX_ROLLBACK_SNAPSHOT_BYTES = 256 * 1024 * 1024;
+/** Ownership cookie inside the private object store; survives path reuse, not directory replacement. */
+const RAW_OBJECT_OWNER_MARKER = ".ultracode-owned";
 
 type PatchInput = string | Uint8Array;
 
@@ -55,6 +57,8 @@ export interface Worktree {
   rawObjectDirectory: string;
   rawObjectDevice: number;
   rawObjectInode: number;
+  /** Secret written into the raw-object store; required before deleting that path. */
+  rawObjectToken: string;
   repositoryObjectDirectory: string;
   rawBaseTree: string;
   /** Synthetic checkout files absent from baseCommit, used to distinguish hook setup from agent changes. */
@@ -146,6 +150,8 @@ export function createWorktree(cwd: string, runId: string, index: number): Workt
     );
     fs.mkdirSync(rawObjectDirectory, { mode: 0o700 });
     rawCreated = true;
+    const rawObjectToken = randomBytes(16).toString("hex");
+    writeRawObjectOwnerMarker(rawObjectDirectory, rawObjectToken);
     const rawObjectStat = fs.lstatSync(rawObjectDirectory);
     if (!rawObjectStat.isDirectory() || rawObjectStat.isSymbolicLink()) {
       throw new Error("raw object store is not an owned directory");
@@ -191,6 +197,7 @@ export function createWorktree(cwd: string, runId: string, index: number): Workt
       rawObjectDirectory,
       rawObjectDevice: rawObjectStat.dev,
       rawObjectInode: rawObjectStat.ino,
+      rawObjectToken,
       repositoryObjectDirectory,
       rawBaseTree: rawBase.tree,
       rawBaselineExtras,
@@ -1300,6 +1307,7 @@ export function removeWorktree(worktree: Worktree): void {
     raw
     && raw.device === worktree.rawObjectDevice
     && raw.inode === worktree.rawObjectInode
+    && ownsRawObjectDirectory(worktree)
   ) {
     tryRemoveOwnedDirectory(worktree.rawObjectDirectory, raw);
   }
@@ -1520,8 +1528,28 @@ function ownsWorktree(
       || rawObjectStat.isSymbolicLink()
       || rawObjectStat.dev !== worktree.rawObjectDevice
       || rawObjectStat.ino !== worktree.rawObjectInode
+      || !ownsRawObjectDirectory(worktree)
     ) return false;
     return true;
+  } catch {
+    return false;
+  }
+}
+
+function writeRawObjectOwnerMarker(directory: string, token: string): void {
+  fs.writeFileSync(path.join(directory, RAW_OBJECT_OWNER_MARKER), `${token}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+    flag: "wx",
+  });
+}
+
+function ownsRawObjectDirectory(worktree: Worktree): boolean {
+  try {
+    const markerPath = path.join(worktree.rawObjectDirectory, RAW_OBJECT_OWNER_MARKER);
+    const stat = fs.lstatSync(markerPath);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 128) return false;
+    return fs.readFileSync(markerPath, "utf8").trim() === worktree.rawObjectToken;
   } catch {
     return false;
   }

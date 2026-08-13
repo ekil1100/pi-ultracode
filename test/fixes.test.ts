@@ -995,9 +995,13 @@ test("writeRescuePatch: sanitizes hostile run/label input", () => {
   }
 });
 
-/** Helper: run git in a temp repo. */
+/** Helper: run git in a temp repo with an explicit author (CI has no global identity). */
 function gitIn(cwd: string, args: string[]): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  return execFileSync(
+    "git",
+    ["-c", "user.email=t@t", "-c", "user.name=t", ...args],
+    { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  ).trim();
 }
 
 test("applyPatch: applies a clean patch and returns true", () => {
