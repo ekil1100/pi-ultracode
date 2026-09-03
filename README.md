@@ -4,7 +4,7 @@ Deterministic multi-agent workflows for [Pi](https://github.com/earendil-works/p
 
 **English** · [简体中文](https://github.com/ekil1100/pi-ultracode/blob/main/README.zh-CN.md)
 
-`pi-ultracode` adds an opt-in high-effort mode to Pi. When a task benefits from delegation, the main agent can run a bounded JavaScript workflow with parallel subagents, isolated worktrees, structured output, durable resume, and live progress.
+`pi-ultracode` adds opt-in semantic analysis-depth modes to Pi. It can route each task automatically or hold a fixed focused, standard, or deep policy. When delegation adds value, the main agent can run a bounded JavaScript workflow with parallel subagents, isolated worktrees, structured output, durable resume, and live progress.
 
 The project combines the terminal-first agentic experience of [Claude Code](https://github.com/anthropics/claude-code) with the explicit workflow and structural-control ideas found in [Grok Build](https://github.com/xai-org/grok-build), while keeping Pi as the runtime.
 
@@ -14,14 +14,14 @@ The project combines the terminal-first agentic experience of [Claude Code](http
 pi install npm:pi-ultracode
 ```
 
-Then reload Pi and toggle Ultracode on:
+Then reload Pi and enable adaptive Ultracode:
 
 ```text
 /reload
 /ultracode
 ```
 
-You can also enable it at startup:
+You can also start directly in `auto` mode:
 
 ```bash
 pi --ultracode
@@ -33,7 +33,7 @@ Current releases are tested with Pi 0.84.
 
 ## Core features
 
-- **Opt-in high-effort mode** — requests the highest thinking level supported by the current model and restores the previous level when disabled.
+- **Adaptive semantic depth** — choose `auto`, `focused`, `standard`, or `deep`; `auto` selects the smallest evidence-sufficient depth and `off` restores the previous thinking level.
 - **Explicit workflows** — compose work with `agent()`, `parallel()`, `pipeline()`, and nested `workflow()` calls.
 - **Independent subagents** — each agent gets its own Pi session, context, tools, model selection, and optional role.
 - **Parallel worktree isolation** — writing agents can work in temporary git worktrees before their patches are integrated.
@@ -44,7 +44,7 @@ Current releases are tested with Pi 0.84.
 
 ## Quick start
 
-Toggle Ultracode on and describe a substantial task:
+Enable adaptive Ultracode and describe a task:
 
 ```text
 /ultracode
@@ -59,15 +59,31 @@ Useful commands:
 
 | Command | Action |
 | --- | --- |
-| `/ultracode` | Toggle Ultracode on or off |
-| `/ultracode on` | Explicitly enable it (optional alias) |
+| `/ultracode` | Enable `auto` from off; disable any active mode |
+| `/ultracode auto` | Select adaptive semantic-depth routing |
+| `/ultracode focused` | Fix the lightweight, narrowly scoped policy |
+| `/ultracode standard` | Fix the balanced policy with conditional verification |
+| `/ultracode deep` | Fix the high-assurance policy with deep verification and max effort |
 | `/ultracode off` | Disable it and restore the previous thinking level |
-| `/ultracode status` | Show the current mode and effective thinking level |
+| `/ultracode status` | Show the configured mode and effective thinking level |
 | `/workflows` or `F6` | Open the workflow browser |
 | `/workflows <runId>` | Open a specific run |
 | `/workflows abort` | Abort active runs |
 
 Press `Esc` to cancel a running workflow. In Pi's fullscreen TUI, use `Ctrl+PageUp`, `Ctrl+PageDown`, and `Ctrl+End` inside workflow details.
+
+## Analysis depth
+
+Depth is semantic, not time-based:
+
+- **Focused** prefers the parent agent and one bounded line of inquiry. It does not run adversarial verification by default.
+- **Standard** covers the few independent dimensions that can change the answer and verifies only high-risk, conflicting, or weakly evidenced claims.
+- **Deep** uses bounded multi-perspective investigation and adversarial verification for high-risk or explicitly comprehensive work.
+- **Auto** routes to the smallest sufficient level from user intent, consequence risk, scope, ambiguity, available evidence, and conflicts. It escalates only when evidence requires it.
+
+Research stops when key claims have direct evidence, no material conflict or unresolved high-risk question remains, and another round would repeat known evidence. Wall-clock time, deadlines, and duration limits are never used to choose or stop analysis depth. `maxAgents` and `reserveAgents` remain structural admission limits.
+
+Focused defaults to medium effort, auto and standard to high, and deep to max; individual workflow agents can still override effort with a model suffix. A separate skeptic or synthesis agent is not automatic.
 
 ## Workflow example
 
@@ -133,7 +149,7 @@ Workflow agent sessions retain project context and ordinary skills, but do not i
 
 Resume is intentionally immutable: the normalized script, arguments, canonical repository/relative cwd, project-trust context, agent definitions, effective models, and call structure must still match. Worktree delivery writes a durable recovery intent before changing the shared repository; an interrupted or conflicted delivery blocks automatic replay and reports its recovery patch. Changed work starts a new run.
 
-Token and cost data are reported for observability, not enforced as a budget. Worker and VM restrictions are determinism and liveness guards, not a security sandbox.
+Token and cost data are reported for observability, not enforced as a budget. Worker and VM restrictions are determinism and liveness guards, not a security sandbox and not analysis-depth controls.
 
 ## Design inspiration
 

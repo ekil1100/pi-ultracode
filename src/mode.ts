@@ -1,16 +1,21 @@
 /**
  * Ultracode mode controller.
  *
- * Ultracode is a session-scoped effort mode. While on, it:
- *   - raises the thinking level to the model's maximum (remembering the previous level),
+ * Ultracode is a session-scoped semantic analysis-depth mode. While active, it:
+ *   - applies the configured mode's default thinking level while preserving the
+ *     user's previous level,
  *   - keeps the `workflow` tool active,
- *   - injects a standing "author and run a workflow by default" system block on
- *     every turn,
- *   - persists its on/off state in session custom entries so it survives
- *     reload, resume, fork, and compaction.
+ *   - injects the configured auto/focused/standard/deep policy on every turn,
+ *   - persists branch-local mode state across reload, resume, fork, and compaction.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  isActiveUltracodeMode,
+  thinkingLevelForMode,
+  type ActiveUltracodeMode,
+  type UltracodeModeName,
+} from "./depth.ts";
 import { ULTRACODE_ACTIVE_REMINDER, ULTRACODE_TAGLINE, ultracodeSystemBlock } from "./prompts.ts";
 import {
   LEGACY_ULTRACODE_THINKING_LEVEL,
@@ -24,7 +29,7 @@ export type { ThinkingLevel } from "./thinking.ts";
 export const MODE_ENTRY_TYPE = "ultracode-mode";
 
 interface PersistedModeState {
-  enabled: boolean;
+  mode: UltracodeModeName;
   previousThinking?: ThinkingLevel;
   /** `null` records that the setting was originally absent (Pi defaults to medium). */
   previousDefaultThinking?: ThinkingLevel | null;
@@ -47,13 +52,13 @@ export interface ThinkingPreferenceStore {
 }
 
 export class UltracodeMode {
-  private enabled = false;
+  private mode: UltracodeModeName = "off";
   private suspended = false;
   private previousThinking: ThinkingLevel | undefined;
   private previousDefaultThinking: ThinkingLevel | null | undefined;
   /** Restore a level later if the current non-reasoning model clamps it to off. */
   private pendingPreviousThinking: ThinkingLevel | undefined;
-  /** The level Pi actually applied after clamping the maximum request. */
+  /** The level Pi actually applied after clamping the configured request. */
   private appliedThinking: ThinkingLevel | undefined;
   /** Prevent mode-owned thinking changes from being mistaken for manual overrides. */
   private applyingThinking = false;
@@ -95,34 +100,43 @@ export class UltracodeMode {
     }
   }
 
-  /** Enable if off, disable if on. Returns the new enabled state. */
+  /** Enable auto if off, otherwise disable. Returns the new enabled state. */
   toggle(pi: ExtensionAPI): boolean {
-    if (this.enabled) {
+    if (this.isEnabled()) {
       this.disable(pi);
       return false;
     }
-    this.enable(pi);
+    this.enable(pi, "auto");
     return true;
   }
 
-  /** The thinking level Pi actually applied (`max`, or the model/runtime fallback). */
+  getMode(): UltracodeModeName {
+    return this.mode;
+  }
+
+  /** The thinking level Pi actually applied after model/runtime clamping. */
   getAppliedThinking(): ThinkingLevel | undefined {
     return this.appliedThinking;
   }
 
   /**
-   * Return the raw maximum request, not the parent's applied value, so every
-   * workflow subagent is clamped independently against its own model.
+   * Return the configured raw effort request so every workflow subagent is
+   * clamped independently against its own model.
    */
   getSubagentThinkingLevel(): ThinkingLevel | undefined {
-    return this.isEnforcing() ? ULTRACODE_THINKING_LEVEL : undefined;
+    return this.isEnforcing() ? thinkingLevelForMode(this.mode) : undefined;
   }
 
-  /** Reassert the maximum before a turn or after a model change. */
-  reapplyMaximumThinking(pi: ExtensionAPI): boolean {
+  /** Reassert the configured mode effort before a turn or after a model change. */
+  reapplyConfiguredThinking(pi: ExtensionAPI): boolean {
     if (!this.isEnforcing()) return false;
-    this.applyUltracodeThinking(pi);
+    this.applyConfiguredThinking(pi);
     return true;
+  }
+
+  /** @deprecated Use reapplyConfiguredThinking(). */
+  reapplyMaximumThinking(pi: ExtensionAPI): boolean {
+    return this.reapplyConfiguredThinking(pi);
   }
 
   /**
@@ -132,8 +146,8 @@ export class UltracodeMode {
   handleModelSelect(pi: ExtensionAPI): boolean {
     if (this.suspended) return false;
     this.pendingClearGeneration++;
-    if (this.enabled) {
-      this.applyUltracodeThinking(pi);
+    if (this.isEnabled()) {
+      this.applyConfiguredThinking(pi);
       return true;
     }
     if (this.pendingPreviousThinking) {
@@ -147,7 +161,7 @@ export class UltracodeMode {
 
   /** Restore the pre-mode effective effort without changing persisted mode state. */
   restorePreviousThinking(pi: ExtensionAPI): void {
-    if (this.enabled && this.previousThinking) this.applyCompatibleThinking(pi, this.previousThinking);
+    if (this.isEnabled() && this.previousThinking) this.applyCompatibleThinking(pi, this.previousThinking);
   }
 
   /** Stop enforcing synchronously, then restore effort before session teardown. */
@@ -162,33 +176,31 @@ export class UltracodeMode {
   }
 
   /**
-   * Enforce the mode after an external thinking-level selection. Stale events
-   * and events emitted by this mode are ignored to avoid recursive updates.
-   * Returns true when a manual selection was overridden.
+   * Enforce the configured effort after an external thinking-level selection.
+   * Stale events and events emitted by this mode are ignored to avoid recursion.
    */
   handleThinkingLevelSelect(pi: ExtensionAPI, level: ThinkingLevel): boolean {
     if (this.suspended || this.applyingThinking) return false;
     const current = safeGetThinking(pi);
     if (!current || current !== level) return false;
-    if (!this.enabled) {
+    if (!this.isEnabled()) {
       // Pi emits the same event for a user selection and an automatic model
       // re-clamp. Defer clearing until model_select has had a chance to consume it.
       if (this.pendingPreviousThinking) this.deferPendingClear(pi, level);
       return false;
     }
     if (current === this.appliedThinking) return false;
-    this.applyUltracodeThinking(pi);
+    this.applyConfiguredThinking(pi);
     return true;
   }
 
   isEnabled(): boolean {
-    return this.enabled;
+    return this.mode !== "off";
   }
 
   isSuspended(): boolean {
     return this.suspended;
   }
-
 
   /** Keep tool availability aligned with the current mode state. */
   syncWorkflowTool(pi: ExtensionAPI): void {
@@ -200,12 +212,16 @@ export class UltracodeMode {
     return ULTRACODE_TAGLINE;
   }
 
-  /** Turn ultracode on. Idempotent. */
-  enable(pi: ExtensionAPI): void {
+  /**
+   * Enable or switch modes without replacing the saved baseline. The no-argument
+   * form retains the pre-0.5 programmatic deep behavior; user commands pass an
+   * explicit mode and bare `/ultracode` uses toggle() to enter auto.
+   */
+  enable(pi: ExtensionAPI, mode: ActiveUltracodeMode = "deep"): void {
     this.suspended = false;
     this.pendingPreviousThinking = undefined;
     this.pendingClearGeneration++;
-    if (!this.enabled) {
+    if (!this.isEnabled()) {
       const current = safeGetThinking(pi);
       const preference = this.captureThinkingPreference();
       const effectivePreference = this.runtimeCompatibleThinking(preference.effective) as
@@ -222,16 +238,16 @@ export class UltracodeMode {
         : current;
       this.previousDefaultThinking = this.runtimeCompatibleThinking(preference.global);
       this.legacyDefaultMigrationPending = false;
-      this.enabled = true;
     }
-    this.applyUltracodeThinking(pi);
+    this.mode = mode;
+    this.applyConfiguredThinking(pi);
     this.syncWorkflowTool(pi);
     this.persist(pi);
   }
 
-  /** Turn ultracode off, restoring the previous thinking level. */
+  /** Turn Ultracode off, restoring the pre-mode thinking level. */
   disable(pi: ExtensionAPI): void {
-    if (!this.enabled) {
+    if (!this.isEnabled()) {
       this.syncWorkflowTool(pi);
       return;
     }
@@ -241,7 +257,7 @@ export class UltracodeMode {
       ? previous
       : undefined;
     this.pendingClearGeneration++;
-    this.enabled = false;
+    this.mode = "off";
     this.suspended = false;
     this.syncWorkflowTool(pi);
     this.persist(pi);
@@ -286,7 +302,7 @@ export class UltracodeMode {
           ?? (wasEnforcing ? this.previousThinking : undefined)
           ?? effectivePreference,
       ) as ThinkingLevel | undefined;
-      this.enabled = false;
+      this.mode = "off";
       this.suspended = false;
       this.pendingPreviousThinking = undefined;
       this.previousThinking = target;
@@ -306,7 +322,7 @@ export class UltracodeMode {
     }
 
     this.suspended = false;
-    this.enabled = latest.enabled;
+    this.mode = latest.mode;
     this.syncWorkflowTool(pi);
     const maxIsUnknownToRuntime = !this.runtimeSupportsMaxThinking
       && preference.effective === ULTRACODE_THINKING_LEVEL;
@@ -319,7 +335,7 @@ export class UltracodeMode {
     // Pre-preference-store releases persisted only previousThinking while their
     // active xhigh request polluted Pi's global default. Recover that baseline
     // once instead of treating the known Ultracode value as a user preference.
-    const migratesLegacyDefault = latest.enabled
+    const migratesLegacyDefault = latest.mode !== "off"
       && latest.previousDefaultThinking === undefined
       && latest.previousThinking !== undefined
       && (preference.global === LEGACY_ULTRACODE_THINKING_LEVEL
@@ -331,9 +347,9 @@ export class UltracodeMode {
         : this.runtimeCompatibleThinking(latest.previousDefaultThinking);
     this.legacyDefaultMigrationPending = migratesLegacyDefault;
 
-    this.pendingPreviousThinking = this.enabled ? undefined : latest.pendingPreviousThinking;
-    if (this.enabled) {
-      this.applyUltracodeThinking(pi);
+    this.pendingPreviousThinking = this.isEnabled() ? undefined : latest.pendingPreviousThinking;
+    if (this.isEnabled()) {
+      this.applyConfiguredThinking(pi);
       if (migratesLegacyDefault) {
         this.queueDefaultThinkingRestore(() => {
           this.legacyDefaultMigrationPending = false;
@@ -374,30 +390,29 @@ export class UltracodeMode {
     }
   }
 
-  /**
-   * Build the before_agent_start result: appends the ultracode system block to the
-   * turn's system prompt when enabled.
-   */
+  /** Append the configured semantic-depth policy to the turn's system prompt. */
   beforeAgentStart(event: { systemPrompt: string }): { systemPrompt: string } | undefined {
-    if (!this.isEnforcing()) return undefined;
-    const block = ultracodeSystemBlock();
+    if (!this.isEnforcing() || !isActiveUltracodeMode(this.mode)) return undefined;
+    const block = ultracodeSystemBlock(this.mode);
     return { systemPrompt: `${event.systemPrompt}\n\n${block}\n\n${ULTRACODE_ACTIVE_REMINDER}` };
   }
 
   statusLine(): string {
-    if (!this.enabled) return `ultracode: off`;
-    const parts = ["ultracode: on"];
+    if (!this.isEnabled()) return "ultracode: off";
+    const parts = [`ultracode: ${this.mode}`];
     // Show the level that actually applied, including compatibility/model fallback.
     if (this.appliedThinking) parts.push(this.appliedThinking);
     return parts.join(" · ");
   }
 
-  private applyUltracodeThinking(pi: ExtensionAPI): void {
+  private applyConfiguredThinking(pi: ExtensionAPI): void {
+    const target = thinkingLevelForMode(this.mode);
+    if (!target) return;
     const writeGeneration = this.preferenceWriteGeneration;
-    this.applyCompatibleThinking(pi, ULTRACODE_THINKING_LEVEL);
+    this.applyCompatibleThinking(pi, target);
     // Pi normally skips persistence when the effective level is unchanged, but
     // the extension API does not promise that. Defensively restore the raw
-    // baseline even after a stable max -> max request.
+    // baseline even after a stable mode-owned request.
     if (writeGeneration === this.preferenceWriteGeneration) {
       this.queueDefaultThinkingRestore();
     }
@@ -433,7 +448,7 @@ export class UltracodeMode {
   }
 
   isEnforcing(): boolean {
-    return this.enabled && !this.suspended;
+    return this.isEnabled() && !this.suspended;
   }
 
   private pendingRestoreSucceeded(pending: ThinkingLevel): boolean {
@@ -495,7 +510,7 @@ export class UltracodeMode {
     setImmediate(() => {
       if (
         generation !== this.pendingClearGeneration
-        || this.enabled
+        || this.isEnabled()
         || this.suspended
         || safeGetThinking(pi) !== level
       ) return;
@@ -528,7 +543,7 @@ export class UltracodeMode {
 
   private persist(pi: ExtensionAPI): void {
     const state: PersistedModeState = {
-      enabled: this.enabled,
+      mode: this.mode,
       previousThinking: this.previousThinking,
       previousDefaultThinking: this.legacyDefaultMigrationPending
         ? undefined
@@ -547,8 +562,17 @@ function parsePersistedModeState(data: unknown): PersistedModeState | undefined 
   if (!data || typeof data !== "object") return undefined;
   const value = data as Record<string, unknown>;
   const previousDefault = value.previousDefaultThinking;
+  // Sessions written before semantic-depth modes stored only enabled:boolean.
+  // Preserve their behavior by migrating enabled:true to the old deep mode.
+  const mode: UltracodeModeName = isActiveUltracodeMode(value.mode)
+    ? value.mode
+    : value.mode === "off"
+      ? "off"
+      : value.enabled === true
+        ? "deep"
+        : "off";
   return {
-    enabled: value.enabled === true,
+    mode,
     previousThinking: isThinkingLevel(value.previousThinking) ? value.previousThinking : undefined,
     previousDefaultThinking: previousDefault === null || isThinkingLevel(previousDefault)
       ? previousDefault

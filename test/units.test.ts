@@ -18,6 +18,8 @@ import {
   RunJournal,
 } from "../src/workflow/journal.ts";
 import { UltracodeMode } from "../src/mode.ts";
+import { isActiveUltracodeMode, thinkingLevelForMode } from "../src/depth.ts";
+import { ultracodeSystemBlock, WORKFLOW_GUIDELINES } from "../src/prompts.ts";
 import { piVersionSupportsMaxThinking } from "../src/thinking.ts";
 import { acquireWorkflowLease, activeWorkflowCount, clearWorkflowLeasesForTests } from "../src/workflow/leases.ts";
 import { writeArtifactFile } from "../src/workflow/run-artifacts.ts";
@@ -817,20 +819,69 @@ test("RunJournal fails closed on unsupported journal versions", () => {
   }
 });
 
-test("mode.toggle requests max and restores the prior thinking level", () => {
+test("semantic-depth modes have stable default effort", () => {
+  assert.equal(thinkingLevelForMode("off"), undefined);
+  assert.equal(thinkingLevelForMode("focused"), "medium");
+  assert.equal(thinkingLevelForMode("auto"), "high");
+  assert.equal(thinkingLevelForMode("standard"), "high");
+  assert.equal(thinkingLevelForMode("deep"), "max");
+  assert.equal(isActiveUltracodeMode("deep"), true);
+  assert.equal(isActiveUltracodeMode("on"), false);
+});
+
+test("semantic-depth prompts route by evidence without a time guard", () => {
+  const auto = ultracodeSystemBlock("auto");
+  assert.match(auto, /silently route this task to focused, standard, or deep/i);
+  assert.match(auto, /Do not spawn a router agent/i);
+  assert.match(auto, /never a wall-clock decision/i);
+  assert.match(auto, /direct evidence/i);
+  assert.match(auto, /analysis-depth: <level>/i);
+
+  assert.match(ultracodeSystemBlock("focused"), /fixed lightweight depth/i);
+  assert.match(ultracodeSystemBlock("standard"), /conditional verification/i);
+  assert.match(ultracodeSystemBlock("deep"), /high-assurance depth/i);
+  assert.ok(WORKFLOW_GUIDELINES.some((line) => /Do not automatically attach a skeptic/i.test(line)));
+  assert.ok(WORKFLOW_GUIDELINES.some((line) => /elapsed time must never determine depth/i.test(line)));
+});
+
+test("mode.toggle enters auto and restores the prior thinking level", () => {
   const m = new UltracodeMode("workflow");
   const { api, s } = miniPi();
   s.thinking = "low";
   s.active = ["read"];
   assert.equal(m.toggle(api), true);
   assert.equal(m.isEnabled(), true);
-  assert.equal(s.thinking, "max");
+  assert.equal(m.getMode(), "auto");
+  assert.equal(s.thinking, "high");
   assert.ok(s.active.includes("workflow"), "toggle on activates the workflow tool");
   s.active.push("grep");
   assert.equal(m.toggle(api), false);
+  assert.equal(m.getMode(), "off");
   assert.equal(m.isEnabled(), false);
   assert.equal(s.thinking, "low", "toggle off restores the prior level");
   assert.deepEqual(s.active, ["read", "grep"], "toggle off removes only the workflow tool");
+});
+
+test("mode switching preserves one baseline and applies semantic-depth effort", () => {
+  const m = new UltracodeMode("workflow");
+  const { api, s } = miniPi();
+  s.thinking = "low";
+
+  m.enable(api, "focused");
+  assert.equal(m.getMode(), "focused");
+  assert.equal(s.thinking, "medium");
+  assert.equal(m.getSubagentThinkingLevel(), "medium");
+
+  m.enable(api, "standard");
+  assert.equal(s.thinking, "high");
+  assert.equal(m.getSubagentThinkingLevel(), "high");
+
+  m.enable(api, "deep");
+  assert.equal(s.thinking, "max");
+  assert.equal(m.getSubagentThinkingLevel(), "max");
+
+  m.disable(api);
+  assert.equal(s.thinking, "low", "switching active modes must not replace the original baseline");
 });
 
 test("restore migrates an enabled entry that lacks a previous effort", () => {
@@ -842,9 +893,26 @@ test("restore migrates an enabled entry that lacks a previous effort", () => {
     customType: "ultracode-mode",
     data: { enabled: true },
   }]);
+  assert.equal(m.getMode(), "deep", "legacy enabled:true preserves the old deep behavior");
   assert.equal(s.thinking, "max");
   m.disable(api);
   assert.equal(s.thinking, "low", "missing legacy baseline is captured before max is applied");
+});
+
+test("restore applies a persisted semantic-depth mode", () => {
+  const m = new UltracodeMode("workflow");
+  const { api, s } = miniPi();
+  s.thinking = "low";
+  m.restore(api, [{
+    type: "custom",
+    customType: "ultracode-mode",
+    data: { mode: "standard", previousThinking: "low" },
+  }]);
+  assert.equal(m.getMode(), "standard");
+  assert.equal(s.thinking, "high");
+  assert.equal(m.getSubagentThinkingLevel(), "high");
+  m.disable(api);
+  assert.equal(s.thinking, "low");
 });
 
 test("an explicit off baseline is not rewritten by later thinking events", () => {
@@ -1210,28 +1278,28 @@ test("preference restoration runs after Pi's queued settings writes", async () =
 test("status reports max without a redundant thinking label", () => {
   const m = new UltracodeMode("workflow");
   m.enable(miniPi().api);
-  assert.equal(m.statusLine(), "ultracode: on · max");
+  assert.equal(m.statusLine(), "ultracode: deep · max");
 });
 
 test("status reports the real model-clamped level", () => {
   const m = new UltracodeMode("workflow");
   m.enable(miniPi({ max: "high", xhigh: "high" }).api);
   assert.equal(m.getAppliedThinking(), "high");
-  assert.equal(m.statusLine(), "ultracode: on · high");
+  assert.equal(m.statusLine(), "ultracode: deep · high");
 });
 
 test("status reports off for non-reasoning models", () => {
   const m = new UltracodeMode("workflow");
   m.enable(miniPi({ max: "off", xhigh: "off" }).api);
   assert.equal(m.getAppliedThinking(), "off");
-  assert.equal(m.statusLine(), "ultracode: on · off");
+  assert.equal(m.statusLine(), "ultracode: deep · off");
 });
 
 test("legacy Pi fallback retries xhigh when max is not recognized", () => {
   const m = new UltracodeMode("workflow");
   m.enable(miniPi({ max: "off" }).api);
   assert.equal(m.getAppliedThinking(), "xhigh");
-  assert.equal(m.statusLine(), "ultracode: on · xhigh");
+  assert.equal(m.statusLine(), "ultracode: deep · xhigh");
 });
 
 test("model changes reapply max and manual effort changes are overridden", () => {
@@ -1287,12 +1355,12 @@ test("Pi version detection gates max at 0.80.6", () => {
   assert.equal(piVersionSupportsMaxThinking("custom-build"), true);
 });
 
-test("UltracodeMode.getSubagentThinkingLevel: max when enabled, undefined when off", () => {
+test("UltracodeMode.getSubagentThinkingLevel follows the configured mode", () => {
   const m = new UltracodeMode("workflow");
   const { api } = miniPi();
   assert.equal(m.getSubagentThinkingLevel(), undefined, "off before enable");
   m.enable(api);
-  assert.equal(m.getSubagentThinkingLevel(), "max", "raw max request is forwarded when on");
+  assert.equal(m.getSubagentThinkingLevel(), "max", "deep forwards the raw max request");
   m.disable(api);
   assert.equal(m.getSubagentThinkingLevel(), undefined, "undefined again after disable");
 });

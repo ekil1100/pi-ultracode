@@ -2485,12 +2485,16 @@ test("executor waits for started host RPCs and panel finally before publishing f
   assert.ok(Date.now() - startedAt >= 70);
 });
 
-test("fatal draining preserves the first policy error past the ordinary stall deadline", async () => {
+test("fatal draining preserves the first policy error past the ordinary stall deadline", { timeout: 3_000 }, async () => {
   const controller = new AbortController();
+  const stallTimeoutMs = 500;
+  const slowRpcMs = 650;
+  let slowSettled = false;
   const host: any = {
     agent: async ({ prompt }: any) => {
       if (prompt === "fatal") throw new WorkflowPolicyError("first fatal policy");
-      await new Promise((resolve) => setTimeout(resolve, 120));
+      await new Promise((resolve) => setTimeout(resolve, slowRpcMs));
+      slowSettled = true;
       return "slow";
     },
     reservePanel: async () => ({
@@ -2505,7 +2509,6 @@ test("fatal draining preserves the first policy error past the ordinary stall de
     phase: () => {},
     abortChildren: () => {},
   };
-  const startedAt = Date.now();
   await assert.rejects(
     executeWorkflowScript(
       parseWorkflowScript(
@@ -2516,13 +2519,13 @@ test("fatal draining preserves the first policy error past the ordinary stall de
         cwd: process.cwd(),
         name: "fatal_over_stall",
         signal: controller.signal,
-        stallTimeoutMs: 40,
-        fatalDrainTimeoutMs: 500,
+        stallTimeoutMs,
+        fatalDrainTimeoutMs: 2_000,
       },
     ),
     /first fatal policy/i,
   );
-  assert.ok(Date.now() - startedAt >= 100);
+  assert.equal(slowSettled, true, "fatal draining outlives the ordinary stall window while a started RPC settles");
 });
 
 test("executor bounds fatal draining when a started host RPC never settles", async () => {
@@ -2648,7 +2651,7 @@ test("parallel over-reservation is fatal and policy errors are not swallowed by 
   );
 });
 
-test("parallel branch call identity is stable across opposite completion order on resume", async () => {
+test("parallel branch call identity is stable across opposite completion order on resume", { timeout: 2_000 }, async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-parallel-call-path-"));
   const runId = "wf_parallel_call_path";
   const script = `export const meta = { name: 'parallel_call_path', description: 'x' }
@@ -2658,6 +2661,8 @@ test("parallel branch call identity is stable across opposite completion order o
     ], { reserveAgents: 4 })`;
   try {
     const firstCalls: string[] = [];
+    let releaseA1!: () => void;
+    const a1CanFinish = new Promise<void>((resolve) => { releaseA1 = resolve; });
     const firstJournal = RunJournal.create(dir, runMeta({ runId, name: "parallel_call_path", scriptHash: "same", startedAt: 0, maxAgents: 4 }));
     await runWorkflow(script, { projectTrusted: false,
       journal: firstJournal,
@@ -2665,12 +2670,14 @@ test("parallel branch call identity is stable across opposite completion order o
       runner: {
         run: async (call: any) => {
           firstCalls.push(call.prompt);
-          await new Promise((resolve) => setTimeout(resolve, call.prompt === "A1" ? 60 : 1));
+          if (call.prompt === "A1") await a1CanFinish;
+          if (call.prompt === "B2") releaseA1();
           return { value: call.prompt, usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: process.cwd() };
         },
       },
     });
-    assert.deepEqual(firstCalls, ["A1", "B1", "B2", "A2"]);
+    assert.deepEqual([...firstCalls].sort(), ["A1", "A2", "B1", "B2"]);
+    assert.ok(firstCalls.indexOf("B2") < firstCalls.indexOf("A2"), "the gate forces branch B to finish first");
     firstJournal.close();
 
     const resumedCalls: string[] = [];

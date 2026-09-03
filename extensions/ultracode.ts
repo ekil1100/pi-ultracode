@@ -1,10 +1,8 @@
 /**
  * pi-ultracode extension entrypoint.
  *
- * Wires together the three pillars of Claude-Code-style "ultracode":
- *   1. The ultracode effort mode (max thinking + standing workflow opt-in).
- *   2. The full `workflow` orchestration tool.
- *   3. The `/ultracode` and `/workflows` commands.
+ * Wires together Ultracode's semantic analysis-depth modes, deterministic
+ * workflow orchestration, and the `/ultracode` / `/workflows` commands.
  */
 
 import {
@@ -53,7 +51,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   // Opt-in via CLI flag: `pi --ultracode`.
   pi.registerFlag("ultracode", {
     type: "boolean",
-    description: "Start the session in ultracode mode (max thinking + default workflow orchestration).",
+    description: "Start the session in adaptive Ultracode mode.",
   });
 
   // SDK-created sessions can prompt without emitting session_start. Sync during
@@ -68,7 +66,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     if (event.toolName === workflowTool.name && !mode.isEnforcing()) {
       return {
         block: true,
-        reason: "The workflow tool is disabled. Run /ultracode on before using it.",
+        reason: "The workflow tool is disabled. Run /ultracode or select an Ultracode depth before using it.",
       };
     }
   });
@@ -92,7 +90,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
       // ignore
     }
     if (!mode.isEnabled() && pi.getFlag?.("ultracode") === true) {
-      mode.enable(pi);
+      mode.enable(pi, "auto");
     }
     // Registration makes extension tools discoverable; activation remains opt-in.
     mode.syncWorkflowTool(pi);
@@ -128,7 +126,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
 
   pi.on("session_shutdown", async () => {
     // Quiesce first so late model/effort events cannot undo restoration. The
-    // persisted enabled state remains on for reload/resume/fork replacements.
+    // The persisted configured mode remains active for reload/resume/fork replacements.
     mode.suspend(pi);
     await mode.flushThinkingPreference();
   });
@@ -137,7 +135,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     // Reconcile the tool schema and always append the standing block on an
     // enforcing turn, even when another active-tool writer caused drift.
     mode.syncWorkflowTool(pi);
-    mode.reapplyMaximumThinking(pi);
+    mode.reapplyConfiguredThinking(pi);
     await mode.flushThinkingPreference();
     return mode.beforeAgentStart(event);
   });

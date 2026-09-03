@@ -4,7 +4,7 @@ export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhig
 
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-/** Ultracode always asks Pi for the strongest effort the selected model supports. */
+/** Deep mode asks Pi for the strongest effort the selected model supports. */
 export const ULTRACODE_THINKING_LEVEL: ThinkingLevel = "max";
 
 /** Compatibility retry for Pi versions released before the `max` level existed. */

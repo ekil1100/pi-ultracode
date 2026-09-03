@@ -1,7 +1,7 @@
 {
   "name": "pi-ultracode",
   "version": "0.4.0",
-  "description": "Claude-Code-style \"ultracode\" for Pi: an effort mode that defaults to deterministic multi-agent workflow orchestration, with worktree isolation, per-agent model overrides, custom agent types, nested workflows, resumable runs, and a /workflows manager.",
+  "description": "Adaptive semantic-depth workflow orchestration for Pi, with focused, standard, and deep modes, isolated subagents, worktree delivery, structured output, and durable resume.",
   "type": "module",
   "keywords": [
     "pi-package",

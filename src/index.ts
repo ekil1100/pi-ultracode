@@ -2,6 +2,14 @@
 
 export { default } from "../extensions/ultracode.ts";
 export { UltracodeMode, MODE_ENTRY_TYPE } from "./mode.ts";
+export {
+  ACTIVE_ULTRACODE_MODES,
+  isActiveUltracodeMode,
+  isUltracodeModeName,
+  thinkingLevelForMode,
+  type ActiveUltracodeMode,
+  type UltracodeModeName,
+} from "./depth.ts";
 export { registerCommands } from "./commands.ts";
 export {
   ULTRACODE_TAGLINE,

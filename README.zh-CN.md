@@ -4,7 +4,7 @@
 
 [English](README.md) · **简体中文**
 
-`pi-ultracode` 为 Pi 增加一个可选的高强度执行模式。当任务适合拆分时，主代理可以运行有边界的 JavaScript 工作流，使用并行子代理、隔离 worktree、结构化输出、持久恢复和实时进度。
+`pi-ultracode` 为 Pi 增加可选的语义化分析深度模式。它既可以自动判断任务需要的深度，也可以固定使用 focused、standard 或 deep 策略。当委派确有价值时，主代理可以运行有边界的 JavaScript 工作流，使用并行子代理、隔离 worktree、结构化输出、持久恢复和实时进度。
 
 项目结合了 [Claude Code](https://github.com/anthropics/claude-code) 的终端 Agentic 体验，以及 [Grok Build](https://github.com/xai-org/grok-build) 的显式工作流和结构控制思路，同时继续使用 Pi 作为运行时。
 
@@ -14,14 +14,14 @@
 pi install npm:pi-ultracode
 ```
 
-然后重新加载 Pi，并用主命令切换到 Ultracode：
+然后重新加载 Pi，并用主命令开启自适应 Ultracode：
 
 ```text
 /reload
 /ultracode
 ```
 
-也可以在启动时直接启用：
+也可以在启动时直接进入 `auto` 模式：
 
 ```bash
 pi --ultracode
@@ -33,7 +33,7 @@ pi --ultracode
 
 ## 核心特性
 
-- **可选高强度模式**：请求当前模型支持的最高思考强度，关闭时恢复之前的强度。
+- **自适应语义深度**：可选择 `auto`、`focused`、`standard` 或 `deep`；`auto` 使用证据充分的最小深度，关闭时恢复之前的思考强度。
 - **显式工作流**：通过 `agent()`、`parallel()`、`pipeline()` 和嵌套 `workflow()` 组合任务。
 - **独立子代理**：每个代理拥有独立的 Pi 会话、上下文、工具、模型选择和可选角色。
 - **并行 worktree 隔离**：写入型代理可在临时 git worktree 中工作，再集成补丁。
@@ -44,7 +44,7 @@ pi --ultracode
 
 ## 快速开始
 
-用主命令开启 Ultracode，然后描述一个较复杂的任务：
+用主命令开启自适应 Ultracode，然后描述任务：
 
 ```text
 /ultracode
@@ -59,15 +59,31 @@ Pi 会自行判断工作流是否有帮助。小任务仍可继续使用普通�
 
 | 命令 | 作用 |
 | --- | --- |
-| `/ultracode` | 切换 Ultracode 的开启或关闭状态 |
-| `/ultracode on` | 显式启用（可选别名） |
+| `/ultracode` | 关闭时开启 `auto`；任一模式已开启时关闭 |
+| `/ultracode auto` | 使用自适应语义深度路由 |
+| `/ultracode focused` | 固定使用轻量、聚焦的分析策略 |
+| `/ultracode standard` | 固定使用平衡策略和条件验证 |
+| `/ultracode deep` | 固定使用高保障深度验证和 max effort |
 | `/ultracode off` | 关闭并恢复之前的思考强度 |
-| `/ultracode status` | 查看当前模式和实际思考强度 |
+| `/ultracode status` | 查看配置模式和实际思考强度 |
 | `/workflows` 或 `F6` | 打开工作流浏览器 |
 | `/workflows <runId>` | 打开指定运行 |
 | `/workflows abort` | 中止活动运行 |
 
 按 `Esc` 可取消正在运行的工作流。在 Pi 的 fullscreen TUI 中，请在工作流详情内使用 `Ctrl+PageUp`、`Ctrl+PageDown` 和 `Ctrl+End`。
+
+## 分析深度
+
+深度是语义化质量决策，不按运行时间判断：
+
+- **Focused** 优先使用主代理和单一、边界明确的调查路径，默认不做对抗验证。
+- **Standard** 覆盖少量真正会改变结论的独立维度，只验证高风险、冲突或证据薄弱的结论。
+- **Deep** 面向高风险或用户明确要求全面分析的任务，使用有界的多视角调查和对抗验证。
+- **Auto** 根据用户意图、影响风险、范围、歧义、现有证据和结论冲突，选择足够完成任务的最小等级；仅在证据要求升级时加深。
+
+当关键结论已有直接证据、没有实质冲突或未解决的高风险问题，且下一轮只会重复已知证据时停止。墙钟时间、deadline 和 duration limit 不得用于选择或停止分析深度。`maxAgents` 与 `reserveAgents` 继续作为结构性准入限制。
+
+Focused 默认使用 medium effort，auto 和 standard 默认使用 high，deep 使用 max；单个 workflow agent 仍可通过模型后缀覆盖 effort。skeptic 和独立 synthesis agent 都不是默认步骤。
 
 ## 工作流示例
 
@@ -133,7 +149,7 @@ Workflow 子代理会保留项目上下文和普通 skills，但不会初始化�
 
 Resume 刻意保持不可变：规范化脚本、参数、规范仓库及仓内相对 cwd、项目信任上下文、代理定义、实际模型和调用结构都必须匹配。Worktree 交付会在修改共享仓库前先写入持久恢复意图；中断或冲突的交付会阻止自动回放，并报告恢复补丁。工作内容发生变化时，应启动新的 run。
 
-Token 和成本只用于可观测性，不作为执行预算。Worker 与 VM 限制用于确定性和存活性保护，不是安全沙箱。
+Token 和成本只用于可观测性，不作为执行预算。Worker 与 VM 限制用于确定性和存活性保护，不是安全沙箱，也不参与分析深度判断。
 
 ## 设计参考
 
