@@ -1,4 +1,4 @@
-/** Ultracode's configured analysis modes and their default reasoning effort. */
+/** Ultracode's configured semantic analysis-depth modes. */
 
 import type { ThinkingLevel } from "./thinking.ts";
 
@@ -18,10 +18,9 @@ export function isUltracodeModeName(value: unknown): value is UltracodeModeName 
 }
 
 /**
- * Default effort for the parent turn and for child agents that do not override
- * it explicitly. Auto starts from the balanced standard effort; its prompt
- * policy can route individual workflow agents lower or higher as evidence
- * requires. Pi still clamps each request to the selected model's capabilities.
+ * @deprecated Legacy mode-to-effort mapping retained for API compatibility.
+ * Ultracode no longer applies it to the parent or as a workflow child default;
+ * each child selects effort per task and Pi clamps it to model capabilities.
  */
 export function thinkingLevelForMode(mode: UltracodeModeName): ThinkingLevel | undefined {
   switch (mode) {

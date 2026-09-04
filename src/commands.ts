@@ -18,21 +18,22 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode, registry
         .map((value) => ({ value, label: value }));
     },
     handler: async (args: string, ctx) => {
-      mode.setCurrentModelSupportsThinking(ctx.model ? Boolean(ctx.model.reasoning) : undefined);
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "").toLowerCase();
 
       // Bare `/ultracode` enables auto from off and disables any active mode.
       if (sub === "") {
         const nowOn = mode.toggle(pi);
-        await mode.flushThinkingPreference();
         ctx.ui.notify(
           nowOn
             ? `Ultracode auto — ${mode.statusLine()}`
-            : "Ultracode off — thinking restored and workflow tool disabled.",
+            : "Ultracode off — workflow tool disabled; parent effort unchanged.",
           "info",
         );
-        ctx.ui.setStatus("ultracode", nowOn ? mode.statusLine() : undefined);
+        ctx.ui.setStatus(
+          "ultracode",
+          nowOn ? mode.statusLine((label) => ctx.ui.theme.fg("accent", label)) : undefined,
+        );
         return;
       }
 
@@ -48,8 +49,7 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode, registry
 
       if (sub === "off") {
         mode.disable(pi);
-        await mode.flushThinkingPreference();
-        ctx.ui.notify("Ultracode off — thinking restored and workflow tool disabled.", "info");
+        ctx.ui.notify("Ultracode off — workflow tool disabled; parent effort unchanged.", "info");
         ctx.ui.setStatus("ultracode", undefined);
         return;
       }
@@ -60,9 +60,11 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode, registry
       }
 
       mode.enable(pi, sub);
-      await mode.flushThinkingPreference();
       ctx.ui.notify(`Ultracode ${sub} — ${mode.statusLine()}`, "info");
-      ctx.ui.setStatus("ultracode", mode.statusLine());
+      ctx.ui.setStatus(
+        "ultracode",
+        mode.statusLine((label) => ctx.ui.theme.fg("accent", label)),
+      );
     },
   });
 

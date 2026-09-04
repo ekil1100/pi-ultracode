@@ -33,7 +33,7 @@ pi --ultracode
 
 ## 核心特性
 
-- **自适应语义深度**：可选择 `auto`、`focused`、`standard` 或 `deep`；`auto` 使用证据充分的最小深度，关闭时恢复之前的思考强度。
+- **自适应语义深度**：可选择 `auto`、`focused`、`standard` 或 `deep`；`auto` 使用证据充分的最小深度，父代理 effort 始终由用户控制。
 - **显式工作流**：通过 `agent()`、`parallel()`、`pipeline()` 和嵌套 `workflow()` 组合任务。
 - **独立子代理**：每个代理拥有独立的 Pi 会话、上下文、工具、模型选择和可选角色。
 - **并行 worktree 隔离**：写入型代理可在临时 git worktree 中工作，再集成补丁。
@@ -63,9 +63,9 @@ Pi 会自行判断工作流是否有帮助。小任务仍可继续使用普通�
 | `/ultracode auto` | 使用自适应语义深度路由 |
 | `/ultracode focused` | 固定使用轻量、聚焦的分析策略 |
 | `/ultracode standard` | 固定使用平衡策略和条件验证 |
-| `/ultracode deep` | 固定使用高保障深度验证和 max effort |
-| `/ultracode off` | 关闭并恢复之前的思考强度 |
-| `/ultracode status` | 查看配置模式和实际思考强度 |
+| `/ultracode deep` | 固定使用高保障深度验证 |
+| `/ultracode off` | 关闭且不改变父代理 effort |
+| `/ultracode status` | 查看配置的语义深度模式 |
 | `/workflows` 或 `F6` | 打开工作流浏览器 |
 | `/workflows <runId>` | 打开指定运行 |
 | `/workflows abort` | 中止活动运行 |
@@ -83,7 +83,7 @@ Pi 会自行判断工作流是否有帮助。小任务仍可继续使用普通�
 
 当关键结论已有直接证据、没有实质冲突或未解决的高风险问题，且下一轮只会重复已知证据时停止。墙钟时间、deadline 和 duration limit 不得用于选择或停止分析深度。`maxAgents` 与 `reserveAgents` 继续作为结构性准入限制。
 
-Focused 默认使用 medium effort，auto 和 standard 默认使用 high，deep 使用 max；单个 workflow agent 仍可通过模型后缀覆盖 effort。skeptic 和独立 synthesis agent 都不是默认步骤。
+Ultracode 不会修改父会话的 effort。对于 workflow 子代理，父代理会按具体任务通过模型后缀选择 effort：边界明确的搜索或汇总通常使用 `:medium`，实质分析或实现使用 `:high`，只有深度调查或决定性的高风险验证才使用 `:max`。Workflow UI 会展示每个子代理经模型裁剪后实际生效的 effort；未指定后缀时，子会话使用正常的用户/模型配置。skeptic 和独立 synthesis agent 都不是默认步骤。
 
 ## 工作流示例
 

@@ -33,7 +33,7 @@ Current releases are tested with Pi 0.84.
 
 ## Core features
 
-- **Adaptive semantic depth** — choose `auto`, `focused`, `standard`, or `deep`; `auto` selects the smallest evidence-sufficient depth and `off` restores the previous thinking level.
+- **Adaptive semantic depth** — choose `auto`, `focused`, `standard`, or `deep`; `auto` selects the smallest evidence-sufficient depth while the parent effort remains under user control.
 - **Explicit workflows** — compose work with `agent()`, `parallel()`, `pipeline()`, and nested `workflow()` calls.
 - **Independent subagents** — each agent gets its own Pi session, context, tools, model selection, and optional role.
 - **Parallel worktree isolation** — writing agents can work in temporary git worktrees before their patches are integrated.
@@ -63,9 +63,9 @@ Useful commands:
 | `/ultracode auto` | Select adaptive semantic-depth routing |
 | `/ultracode focused` | Fix the lightweight, narrowly scoped policy |
 | `/ultracode standard` | Fix the balanced policy with conditional verification |
-| `/ultracode deep` | Fix the high-assurance policy with deep verification and max effort |
-| `/ultracode off` | Disable it and restore the previous thinking level |
-| `/ultracode status` | Show the configured mode and effective thinking level |
+| `/ultracode deep` | Fix the high-assurance policy with deep verification |
+| `/ultracode off` | Disable it without changing the parent effort |
+| `/ultracode status` | Show the configured semantic-depth mode |
 | `/workflows` or `F6` | Open the workflow browser |
 | `/workflows <runId>` | Open a specific run |
 | `/workflows abort` | Abort active runs |
@@ -83,7 +83,7 @@ Depth is semantic, not time-based:
 
 Research stops when key claims have direct evidence, no material conflict or unresolved high-risk question remains, and another round would repeat known evidence. Wall-clock time, deadlines, and duration limits are never used to choose or stop analysis depth. `maxAgents` and `reserveAgents` remain structural admission limits.
 
-Focused defaults to medium effort, auto and standard to high, and deep to max; individual workflow agents can still override effort with a model suffix. A separate skeptic or synthesis agent is not automatic.
+Ultracode never changes the parent session's effort. For workflow children, the parent selects effort per assigned task with a model suffix: typically `:medium` for bounded discovery or synthesis, `:high` for substantive analysis or implementation, and `:max` only for deep or decisive high-risk verification. The workflow UI reports each child's actual model-clamped effort. If no suffix is supplied, the child uses its normal user/model configuration. A separate skeptic or synthesis agent is not automatic.
 
 ## Workflow example
 

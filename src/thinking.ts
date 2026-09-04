@@ -4,10 +4,10 @@ export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhig
 
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-/** Deep mode asks Pi for the strongest effort the selected model supports. */
+/** Strongest child-agent effort request supported by current Pi releases. */
 export const ULTRACODE_THINKING_LEVEL: ThinkingLevel = "max";
 
-/** Compatibility retry for Pi versions released before the `max` level existed. */
+/** Child-session compatibility retry for Pi versions released before `max`. */
 export const LEGACY_ULTRACODE_THINKING_LEVEL: ThinkingLevel = "xhigh";
 
 const THINKING_LEVEL_SET = new Set<string>(THINKING_LEVELS);

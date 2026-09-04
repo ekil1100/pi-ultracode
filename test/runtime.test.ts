@@ -21,6 +21,33 @@ test("WorkflowAgentRunner is a real constructor with a run() method", () => {
   assert.equal(typeof runner.run, "function");
 });
 
+test("per-call effort selection reports the request and actual child effort separately", async () => {
+  let requestedEffort: unknown;
+  let actualEffort: unknown;
+  await runWorkflow(
+    `export const meta = { name: 'effort_visibility', description: 'x' }\nreturn await agent('verify', { label: 'verify', model: ':max' })`,
+    {
+      thinkingLevel: "low",
+      runner: {
+        run: async () => ({
+          value: "ok",
+          effort: "high",
+          usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+          cwd: process.cwd(),
+        }),
+      },
+      onAgentStart: (event) => {
+        requestedEffort = event.requestedEffort;
+      },
+      onAgentEnd: (event) => {
+        actualEffort = event.effort;
+      },
+    },
+  );
+  assert.equal(requestedEffort, "max", "the per-call suffix wins over the child fallback");
+  assert.equal(actualEffort, "high", "observers receive the model-clamped child effort");
+});
+
 interface MockCall {
   prompt: string;
   label: string;

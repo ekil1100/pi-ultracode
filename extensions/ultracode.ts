@@ -5,15 +5,9 @@
  * workflow orchestration, and the `/ultracode` / `/workflows` commands.
  */
 
-import {
-  getAgentDir,
-  SettingsManager,
-  VERSION as PI_VERSION,
-  type ExtensionAPI,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createWorkflowTool, type WorkflowToolDeps } from "../src/workflow/tool.ts";
 import { UltracodeMode, type ThinkingPreferenceStore } from "../src/mode.ts";
-import { isThinkingLevel, piVersionSupportsMaxThinking } from "../src/thinking.ts";
 import { registerCommands } from "../src/commands.ts";
 import { WorkflowRegistry } from "../src/workflow/registry.ts";
 
@@ -23,7 +17,7 @@ export interface ThinkingPreferenceContext {
 }
 
 export interface UltracodeExtensionDeps extends Partial<WorkflowToolDeps> {
-  /** SDK-host seam when the active profile differs from Pi's ambient agent dir. */
+  /** @deprecated Parent effort is user-owned; retained for source compatibility. */
   createThinkingPreferenceStore?: (
     context: ThinkingPreferenceContext,
   ) => ThinkingPreferenceStore | undefined;
@@ -31,15 +25,13 @@ export interface UltracodeExtensionDeps extends Partial<WorkflowToolDeps> {
 
 export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensionDeps = {}): void {
   const mode = new UltracodeMode("workflow");
-  mode.setRuntimeSupportsMaxThinking(piVersionSupportsMaxThinking(PI_VERSION));
   const {
-    createThinkingPreferenceStore = createPiThinkingPreferenceStore,
+    createThinkingPreferenceStore: _unusedThinkingPreferenceStore,
     ...workflowDeps
   } = extraDeps;
 
   const registry = workflowDeps.registry ?? new WorkflowRegistry();
   const workflowTool = createWorkflowTool({
-    getThinkingLevel: () => mode.getSubagentThinkingLevel(),
     ...workflowDeps,
     registry,
     isExecutionAllowed: () => mode.isEnforcing(),
@@ -72,16 +64,6 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    await mode.flushThinkingPreference();
-    mode.setCurrentModelSupportsThinking(ctx.model ? Boolean(ctx.model.reasoning) : undefined);
-    try {
-      mode.bindThinkingPreferenceStore(createThinkingPreferenceStore({
-        cwd: ctx.cwd,
-        projectTrusted: ctx.isProjectTrusted(),
-      }));
-    } catch {
-      mode.bindThinkingPreferenceStore(undefined);
-    }
     // Restore persisted mode state across reload / resume / fork.
     try {
       // Mode entries are branch-local; discarded future branches must not win.
@@ -94,81 +76,34 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     }
     // Registration makes extension tools discoverable; activation remains opt-in.
     mode.syncWorkflowTool(pi);
-    await mode.flushThinkingPreference();
     if (ctx.hasUI) {
-      ctx.ui.setStatus("ultracode", mode.isEnabled() ? mode.statusLine() : undefined);
+      ctx.ui.setStatus(
+        "ultracode",
+        mode.isEnabled() ? mode.statusLine((label) => ctx.ui.theme.fg("accent", label)) : undefined,
+      );
     }
   });
 
   pi.on("session_tree", async (_event, ctx) => {
-    await mode.flushThinkingPreference();
     if (mode.isSuspended()) return;
-    mode.setCurrentModelSupportsThinking(ctx.model ? Boolean(ctx.model.reasoning) : undefined);
     mode.restore(pi, ctx.sessionManager.getBranch() as any);
-    await mode.flushThinkingPreference();
     if (ctx.hasUI) {
-      ctx.ui.setStatus("ultracode", mode.isEnabled() ? mode.statusLine() : undefined);
+      ctx.ui.setStatus(
+        "ultracode",
+        mode.isEnabled() ? mode.statusLine((label) => ctx.ui.theme.fg("accent", label)) : undefined,
+      );
     }
   });
 
-  pi.on("model_select", async (event, ctx) => {
-    mode.setCurrentModelSupportsThinking(Boolean(event.model.reasoning));
-    const refreshStatus = mode.handleModelSelect(pi);
-    await mode.flushThinkingPreference();
-    if (refreshStatus && ctx.hasUI) ctx.ui.setStatus("ultracode", mode.statusLine());
-  });
-
-  pi.on("thinking_level_select", async (event, ctx) => {
-    if (!mode.handleThinkingLevelSelect(pi, event.level)) return;
-    await mode.flushThinkingPreference();
-    if (ctx.hasUI) ctx.ui.setStatus("ultracode", mode.statusLine());
-  });
-
   pi.on("session_shutdown", async () => {
-    // Quiesce first so late model/effort events cannot undo restoration. The
     // The persisted configured mode remains active for reload/resume/fork replacements.
     mode.suspend(pi);
-    await mode.flushThinkingPreference();
   });
 
   pi.on("before_agent_start", async (event) => {
-    // Reconcile the tool schema and always append the standing block on an
+    // Reconcile tool availability and append the standing policy on every
     // enforcing turn, even when another active-tool writer caused drift.
     mode.syncWorkflowTool(pi);
-    mode.reapplyConfiguredThinking(pi);
-    await mode.flushThinkingPreference();
     return mode.beforeAgentStart(event);
   });
-}
-
-function createPiThinkingPreferenceStore(
-  context: ThinkingPreferenceContext,
-): ThinkingPreferenceStore {
-  const createSettings = () => SettingsManager.create(
-    context.cwd,
-    getAgentDir(),
-    { projectTrusted: context.projectTrusted },
-  );
-  return {
-    getThinkingPreference() {
-      // Use a fresh manager so a selection made after session_start is visible;
-      // SettingsManager instances intentionally keep their own cached snapshot.
-      const settings = createSettings();
-      const global = settings.getGlobalSettings().defaultThinkingLevel;
-      const effective = settings.getDefaultThinkingLevel();
-      return {
-        global: isThinkingLevel(global) ? global : undefined,
-        effective: isThinkingLevel(effective) ? effective : "medium",
-      };
-    },
-    async setDefaultThinkingLevel(level) {
-      // Use a fresh queue after the mode's macrotask barrier. This serializes
-      // behind Pi's already-enqueued writes instead of racing a long-lived peer.
-      const settings = createSettings();
-      // An absent setting is semantically Pi's `medium` default. SettingsManager
-      // has no unset operation, so restore that equivalent value explicitly.
-      settings.setDefaultThinkingLevel((level ?? "medium") as any);
-      await settings.flush();
-    },
-  };
 }

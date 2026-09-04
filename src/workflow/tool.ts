@@ -93,9 +93,9 @@ export interface WorkflowToolDeps {
   registry?: WorkflowRegistry;
   /** Canonical runtime supplied by an SDK host; shared by all child sessions. */
   modelRuntime?: ModelRuntimeLike;
-  /** The configured Ultracode mode's raw default effort for workflow subagents.
-   *  Each child session clamps it independently; undefined when off. A per-call
-   *  `model: "X:level"` suffix or agentType `thinking:` override still wins. */
+  /** Optional host-provided fallback effort for workflow subagents.
+   *  Each child session clamps it independently. A per-call `model: "X:level"`
+   *  suffix or agentType `thinking:` override still wins. */
   getThinkingLevel?: () => ThinkingLevel | undefined;
   /** Optional execution gate for mode-scoped registrations. Omit for standalone use. */
   isExecutionAllowed?: () => boolean;
@@ -163,8 +163,8 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       if (resuming && !RunJournal.exists(runsDir, runId)) {
         throw new Error(`workflow: resumeFromRunId ${runId} was not found in this session`);
       }
-      // Forward the mode's raw effort request so each subagent session clamps it
-      // against that subagent's model. Undefined when Ultracode is off.
+      // Forward an optional host fallback. Per-call and agent-role effort
+      // selection is resolved later for each child and clamped by its model.
       const thinkingLevel = deps.getThinkingLevel?.();
       if (controller.signal.aborted) throw new Error("Workflow was aborted before it started");
       const run = deps.runWorkflowFn ?? runWorkflow;
