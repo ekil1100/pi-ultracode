@@ -1,6 +1,6 @@
 {
   "name": "pi-ultracode",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Adaptive semantic-depth workflow orchestration for Pi, with focused, standard, and deep modes, isolated subagents, worktree delivery, structured output, and durable resume.",
   "type": "module",
   "keywords": [
