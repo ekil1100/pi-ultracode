@@ -366,7 +366,7 @@ test("--ultracode flag enables auto mode at session_start", async () => {
   assert.equal(state.activeTools.includes("workflow"), true);
 });
 
-test("/ultracode default persists across extension instances without changing the current mode", async (t) => {
+test("/ultracode default on enables the current session and persists across extension instances", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-default-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, "agent", "ultracode.json");
@@ -378,10 +378,13 @@ test("/ultracode default persists across extension instances without changing th
   assert.match(notifications.at(-1)!.m, /default off/);
   assert.equal(fs.existsSync(file), false, "query does not create preferences");
   await command.handler("default on", ctx);
-  assert.match(notifications.at(-1)!.m, /default on \(auto\)/);
-  assert.deepEqual(state.entries, []);
-  assert.equal(state.activeTools.includes("workflow"), false);
+  assert.match(notifications.at(-1)!.m, /default on \(auto\).*current session: auto/);
+  assert.deepEqual(state.entries.at(-1).data, { mode: "auto" });
+  assert.equal(state.activeTools.includes("workflow"), true);
+  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · auto");
   assert.equal(state.thinking, "medium");
+  const currentTurn = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }, ctx);
+  assert.match(currentTurn.systemPrompt, /Configured mode: auto/);
 
   const next = makeMockPi();
   extension(next.pi, { preferences: new UltracodePreferences(file) });
@@ -418,15 +421,43 @@ test("startup defaults respect saved modes across reload, resume, and fork", asy
   }
 });
 
-test("explicit off while already disabled remains off when the startup default is enabled", async () => {
+test("default on overrides explicit off immediately, but later off survives reload", async () => {
   const { pi, state } = makeMockPi();
   extension(pi);
   const { ctx } = makeCtx(state);
-  await state.commands.get("ultracode").handler("off", ctx);
-  await state.commands.get("ultracode").handler("default on", ctx);
+  const command = state.commands.get("ultracode");
+  await command.handler("off", ctx);
+  await command.handler("default on", ctx);
+  assert.equal(state.activeTools.includes("workflow"), true);
+  assert.deepEqual(state.entries.at(-1).data, { mode: "auto" });
+  await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
+  assert.equal(state.activeTools.includes("workflow"), true);
+
+  await command.handler("off", ctx);
+  await command.handler("default", ctx);
+  assert.equal(state.activeTools.includes("workflow"), false, "querying the default must not enable the session");
   await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
   assert.equal(state.activeTools.includes("workflow"), false);
   assert.deepEqual(state.entries.at(-1).data, { mode: "off" });
+});
+
+test("default on preserves the current active depth and parent effort", async () => {
+  for (const selected of ["auto", "focused", "standard", "deep"]) {
+    const { pi, state } = makeMockPi();
+    extension(pi);
+    const { ctx, notifications } = makeCtx(state);
+    const command = state.commands.get("ultracode");
+    await command.handler(selected, ctx);
+    state.thinking = "high";
+    const entryCount = state.entries.length;
+    await command.handler("default on", ctx);
+    await command.handler("default on", ctx);
+    assert.equal(state.activeTools.includes("workflow"), true);
+    assert.equal(state.statuses.ultracode, `<accent>ultracode</accent> · ${selected}`);
+    assert.equal(state.thinking, "high");
+    assert.equal(state.entries.length, entryCount, "repeated default on does not rewrite an active mode");
+    assert.ok(notifications.at(-1)!.m.includes(`current session: ${selected}`));
+  }
 });
 
 test("/ultracode default rejects invalid arguments and reports preference failures", async () => {

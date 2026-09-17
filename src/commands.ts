@@ -52,8 +52,13 @@ export function registerCommands(
         try {
           if (value !== undefined) preferences.setDefaultEnabled(value === "on");
           const enabled = preferences.getDefaultEnabled();
+          if (value === "on") {
+            if (!mode.isEnabled()) mode.enable(pi, "auto");
+            ctx.ui.setStatus("ultracode", mode.statusLine((label) => ctx.ui.theme.fg("accent", label)));
+          }
+          const sessionStatus = value === "on" ? `current session: ${mode.getMode()}` : "current session unchanged";
           ctx.ui.notify(
-            `Ultracode default ${enabled ? "on (auto)" : "off"} — global startup preference; current session unchanged.`,
+            `Ultracode default ${enabled ? "on (auto)" : "off"} — global startup preference; ${sessionStatus}.`,
             "info",
           );
         } catch (error) {
