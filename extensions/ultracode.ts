@@ -9,6 +9,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createWorkflowTool, type WorkflowToolDeps } from "../src/workflow/tool.ts";
 import { UltracodeMode, type ThinkingPreferenceStore } from "../src/mode.ts";
 import { registerCommands } from "../src/commands.ts";
+import { UltracodePreferences, type UltracodePreferenceStore } from "../src/preferences.ts";
 import { WorkflowRegistry } from "../src/workflow/registry.ts";
 
 export interface ThinkingPreferenceContext {
@@ -17,6 +18,7 @@ export interface ThinkingPreferenceContext {
 }
 
 export interface UltracodeExtensionDeps extends Partial<WorkflowToolDeps> {
+  preferences?: UltracodePreferenceStore;
   /** @deprecated Parent effort is user-owned; retained for source compatibility. */
   createThinkingPreferenceStore?: (
     context: ThinkingPreferenceContext,
@@ -27,6 +29,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   const mode = new UltracodeMode("workflow");
   const {
     createThinkingPreferenceStore: _unusedThinkingPreferenceStore,
+    preferences = new UltracodePreferences(),
     ...workflowDeps
   } = extraDeps;
 
@@ -38,7 +41,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   });
   pi.registerTool(workflowTool);
 
-  registerCommands(pi, mode, registry);
+  registerCommands(pi, mode, registry, preferences);
 
   // Opt-in via CLI flag: `pi --ultracode`.
   pi.registerFlag("ultracode", {
@@ -65,16 +68,23 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
 
   pi.on("session_start", async (_event, ctx) => {
     // Restore persisted mode state across reload / resume / fork.
+    let hasSavedMode = true;
     try {
       // Mode entries are branch-local; discarded future branches must not win.
-      mode.restore(pi, ctx.sessionManager.getBranch() as any);
+      hasSavedMode = mode.restore(pi, ctx.sessionManager.getBranch() as any);
     } catch {
-      // ignore
+      // Do not apply a startup default when branch restoration failed.
     }
     if (!mode.isEnabled() && pi.getFlag?.("ultracode") === true) {
       mode.enable(pi, "auto");
+    } else if (!hasSavedMode && !mode.isEnabled()) {
+      try {
+        if (preferences.getDefaultEnabled()) mode.enable(pi, "auto");
+      } catch (error) {
+        ctx.ui.notify(`Failed to read Ultracode default: ${String(error)}`, "warning");
+      }
     }
-    // Registration makes extension tools discoverable; activation remains opt-in.
+    // Registration makes tools discoverable; activation follows the chosen mode.
     mode.syncWorkflowTool(pi);
     if (ctx.hasUI) {
       ctx.ui.setStatus(

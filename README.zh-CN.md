@@ -66,9 +66,14 @@ Pi 会自行判断工作流是否有帮助。小任务仍可继续使用普通�
 | `/ultracode deep` | 固定使用高保障深度验证 |
 | `/ultracode off` | 关闭且不改变父代理 effort |
 | `/ultracode status` | 查看配置的语义深度模式 |
+| `/ultracode default on` | 全局默认开启，新会话使用 `auto` |
+| `/ultracode default off` | 取消默认开启 |
+| `/ultracode default` | 查看全局启动默认值 |
 | `/workflows` 或 `F6` | 打开工作流浏览器 |
 | `/workflows <runId>` | 打开指定运行 |
 | `/workflows abort` | 中止活动运行 |
+
+`/ultracode default on|off` 只修改启动默认值，不切换当前会话的模式，也不改变 effort。设置保存在 `~/.pi/agent/ultracode.json`（遵循 `PI_CODING_AGENT_DIR`），跨项目和重启生效；未设置时默认关闭。启动时，只有当前分支没有保存 Ultracode 模式才应用默认值，已有的 `off` 或深度选择在 reload、resume、fork 后继续保留。显式 `pi --ultracode` 仍可启用 `auto`。如需立即开启当前会话，执行 `/ultracode auto`。
 
 按 `Esc` 可取消正在运行的工作流。在 Pi 的 fullscreen TUI 中，请在工作流详情内使用 `Ctrl+PageUp`、`Ctrl+PageDown` 和 `Ctrl+End`。
 

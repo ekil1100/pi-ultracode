@@ -10,9 +10,15 @@ import { WorkflowRegistry } from "../src/workflow/registry.ts";
 import { createSnapshot } from "../src/workflow/display.ts";
 import { activeWorkflowCount, clearWorkflowLeasesForTests } from "../src/workflow/leases.ts";
 import { MAX_WORKFLOW_ARGS_BYTES } from "../src/workflow/value-limits.ts";
+import { UltracodePreferences } from "../src/preferences.ts";
 
 function extension(pi: any, extraDeps: Record<string, unknown> = {}): void {
+  let defaultEnabled = false;
   ultracodeExtension(pi, {
+    preferences: {
+      getDefaultEnabled: () => defaultEnabled,
+      setDefaultEnabled: (enabled: boolean) => { defaultEnabled = enabled; },
+    },
     createThinkingPreferenceStore: () => undefined,
     ...extraDeps,
   });
@@ -112,7 +118,11 @@ test("extension registers the workflow tool, commands, and flag", () => {
   assert.equal(state.tools[0].parameters.properties.maxAgents?.maximum, 1024);
   assert.ok(state.commands.has("ultracode"));
   const depthCompletions = state.commands.get("ultracode").getArgumentCompletions("").map((item: any) => item.value);
-  assert.deepEqual(depthCompletions, ["auto", "focused", "standard", "deep", "off", "status"]);
+  assert.deepEqual(depthCompletions, ["auto", "focused", "standard", "deep", "off", "status", "default", "default on", "default off"]);
+  assert.deepEqual(
+    state.commands.get("ultracode").getArgumentCompletions("default o").map((item: any) => item.value),
+    ["default on", "default off"],
+  );
   assert.equal(depthCompletions.includes("on"), false);
   assert.ok(state.commands.has("workflows"));
   assert.ok(state.flags.has("ultracode"));
@@ -354,6 +364,98 @@ test("--ultracode flag enables auto mode at session_start", async () => {
   assert.equal(state.thinking, "medium");
   assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · auto");
   assert.equal(state.activeTools.includes("workflow"), true);
+});
+
+test("/ultracode default persists across extension instances without changing the current mode", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-default-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, "agent", "ultracode.json");
+  const { pi, state } = makeMockPi();
+  extension(pi, { preferences: new UltracodePreferences(file) });
+  const { ctx, notifications } = makeCtx(state);
+  const command = state.commands.get("ultracode");
+  await command.handler("default", ctx);
+  assert.match(notifications.at(-1)!.m, /default off/);
+  assert.equal(fs.existsSync(file), false, "query does not create preferences");
+  await command.handler("default on", ctx);
+  assert.match(notifications.at(-1)!.m, /default on \(auto\)/);
+  assert.deepEqual(state.entries, []);
+  assert.equal(state.activeTools.includes("workflow"), false);
+  assert.equal(state.thinking, "medium");
+
+  const next = makeMockPi();
+  extension(next.pi, { preferences: new UltracodePreferences(file) });
+  const nextCtx = makeCtx(next.state).ctx;
+  nextCtx.cwd = dir;
+  await next.state.events.get("session_start")![0]({ reason: "new" }, nextCtx);
+  assert.equal(next.state.statuses.ultracode, "<accent>ultracode</accent> · auto");
+  assert.equal(next.state.activeTools.includes("workflow"), true);
+  assert.equal(next.state.thinking, "medium");
+  assert.deepEqual(next.state.entries.at(-1).data, { mode: "auto" });
+  const turn = await next.state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }, nextCtx);
+  assert.match(turn.systemPrompt, /Configured mode: auto/);
+
+  await next.state.commands.get("ultracode").handler("default off", nextCtx);
+  assert.equal(next.state.activeTools.includes("workflow"), true, "changing the default does not disable this session");
+  const third = makeMockPi();
+  extension(third.pi, { preferences: new UltracodePreferences(file) });
+  await third.state.events.get("session_start")![0]({ reason: "startup" }, makeCtx(third.state).ctx);
+  assert.equal(third.state.activeTools.includes("workflow"), false);
+});
+
+test("startup defaults respect saved modes across reload, resume, and fork", async () => {
+  for (const reason of ["reload", "resume", "fork"]) {
+    for (const mode of ["off", "focused", "standard", "deep", "auto"]) {
+      const { pi, state } = makeMockPi();
+      extension(pi, { preferences: { getDefaultEnabled: () => true } });
+      state.entries.push({ type: "custom", customType: "ultracode-mode", data: { mode } });
+      const { ctx } = makeCtx(state);
+      await state.events.get("session_start")![0]({ reason }, ctx);
+      assert.equal(state.activeTools.includes("workflow"), mode !== "off");
+      assert.equal(state.statuses.ultracode, mode === "off" ? undefined : `<accent>ultracode</accent> · ${mode}`);
+      assert.equal(state.entries.length, 1, "restoration must not replace a saved choice");
+    }
+  }
+});
+
+test("explicit off while already disabled remains off when the startup default is enabled", async () => {
+  const { pi, state } = makeMockPi();
+  extension(pi);
+  const { ctx } = makeCtx(state);
+  await state.commands.get("ultracode").handler("off", ctx);
+  await state.commands.get("ultracode").handler("default on", ctx);
+  await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
+  assert.equal(state.activeTools.includes("workflow"), false);
+  assert.deepEqual(state.entries.at(-1).data, { mode: "off" });
+});
+
+test("/ultracode default rejects invalid arguments and reports preference failures", async () => {
+  const { pi, state } = makeMockPi();
+  let writes = 0;
+  extension(pi, {
+    preferences: {
+      getDefaultEnabled: () => { throw new Error("read failed"); },
+      setDefaultEnabled: () => { writes++; throw new Error("write failed"); },
+    },
+  });
+  const { ctx, notifications } = makeCtx(state);
+  const command = state.commands.get("ultracode");
+  for (const invalid of ["default auto", "default yes", "default on extra"]) {
+    await command.handler(invalid, ctx);
+    assert.equal(notifications.at(-1)!.l, "error");
+    assert.match(notifications.at(-1)!.m, /Usage:/);
+  }
+  assert.equal(writes, 0);
+  await command.handler("default on", ctx);
+  assert.equal(writes, 1);
+  assert.equal(notifications.at(-1)!.l, "error");
+  assert.match(notifications.at(-1)!.m, /Failed to save.*write failed/);
+  await command.handler("default", ctx);
+  assert.match(notifications.at(-1)!.m, /Failed to read.*read failed/);
+  await state.events.get("session_start")![0]({ reason: "startup" }, ctx);
+  assert.equal(notifications.at(-1)!.l, "warning");
+  assert.equal(state.activeTools.includes("workflow"), false);
+  assert.deepEqual(state.entries, []);
 });
 
 test("manual parent effort changes are not intercepted or rendered in status", async () => {

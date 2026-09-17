@@ -5,15 +5,21 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { ACTIVE_ULTRACODE_MODES, isActiveUltracodeMode } from "./depth.ts";
 import type { UltracodeMode } from "./mode.ts";
+import type { UltracodePreferenceStore } from "./preferences.ts";
 import type { WorkflowRegistry } from "./workflow/registry.ts";
 import { workflowRunsDir } from "./workflow/tool.ts";
 import { openWorkflowOverlay } from "./workflow/workflow-overlay.ts";
 
-export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode, registry: WorkflowRegistry): void {
+export function registerCommands(
+  pi: ExtensionAPI,
+  mode: UltracodeMode,
+  registry: WorkflowRegistry,
+  preferences: UltracodePreferenceStore,
+): void {
   pi.registerCommand("ultracode", {
-    description: "Toggle adaptive Ultracode, or select a fixed semantic depth: auto|focused|standard|deep|off|status",
+    description: "Toggle Ultracode, select auto|focused|standard|deep|off|status, or set default on|off",
     getArgumentCompletions(prefix: string) {
-      return [...ACTIVE_ULTRACODE_MODES, "off", "status"]
+      return [...ACTIVE_ULTRACODE_MODES, "off", "status", "default", "default on", "default off"]
         .filter((value) => value.startsWith(prefix))
         .map((value) => ({ value, label: value }));
     },
@@ -34,6 +40,25 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode, registry
           "ultracode",
           nowOn ? mode.statusLine((label) => ctx.ui.theme.fg("accent", label)) : undefined,
         );
+        return;
+      }
+
+      if (sub === "default") {
+        const value = parts[1]?.toLowerCase();
+        if (parts.length > 2 || (value !== undefined && value !== "on" && value !== "off")) {
+          ctx.ui.notify("Usage: /ultracode default [on|off]", "error");
+          return;
+        }
+        try {
+          if (value !== undefined) preferences.setDefaultEnabled(value === "on");
+          const enabled = preferences.getDefaultEnabled();
+          ctx.ui.notify(
+            `Ultracode default ${enabled ? "on (auto)" : "off"} — global startup preference; current session unchanged.`,
+            "info",
+          );
+        } catch (error) {
+          ctx.ui.notify(`Failed to ${value === undefined ? "read" : "save"} Ultracode default: ${String(error)}`, "error");
+        }
         return;
       }
 
@@ -102,5 +127,5 @@ export function registerCommands(pi: ExtensionAPI, mode: UltracodeMode, registry
 }
 
 function ultracodeUsage(): string {
-  return "Usage: /ultracode [auto|focused|standard|deep|off|status]";
+  return "Usage: /ultracode [auto|focused|standard|deep|off|status] or /ultracode default [on|off]";
 }

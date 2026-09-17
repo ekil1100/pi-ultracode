@@ -152,17 +152,15 @@ export class UltracodeMode {
 
   /** Turn Ultracode off without changing the parent thinking level. */
   disable(pi: ExtensionAPI): void {
-    if (!this.isEnabled()) {
-      this.syncWorkflowTool(pi);
-      return;
-    }
+    // Persist an explicit off even when already disabled, so startup defaults
+    // cannot override this session's choice on reload or resume.
     this.mode = "off";
     this.suspended = false;
     this.syncWorkflowTool(pi);
     this.persist(pi);
   }
 
-  /** Restore mode state from the active session branch without touching effort. */
+  /** Restore branch-local state; return whether a saved mode was found. */
   restore(
     pi: ExtensionAPI,
     entries: Array<{
@@ -171,7 +169,7 @@ export class UltracodeMode {
       data?: unknown;
       thinkingLevel?: unknown;
     }>,
-  ): void {
+  ): boolean {
     let latestData: unknown;
     for (const entry of entries) {
       if (entry.type === "custom" && entry.customType === MODE_ENTRY_TYPE && entry.data) {
@@ -179,9 +177,11 @@ export class UltracodeMode {
       }
     }
 
-    this.mode = parsePersistedModeState(latestData)?.mode ?? "off";
+    const state = parsePersistedModeState(latestData);
+    this.mode = state?.mode ?? "off";
     this.suspended = false;
     this.syncWorkflowTool(pi);
+    return state !== undefined;
   }
 
   /** Append the configured semantic-depth policy to the turn's system prompt. */
