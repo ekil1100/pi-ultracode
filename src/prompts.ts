@@ -6,13 +6,12 @@ import type { ActiveUltracodeMode } from "./depth.ts";
 export const ULTRACODE_TAGLINE = "semantic-depth workflow orchestration";
 
 /**
- * The standing system-prompt block injected on every turn while Ultracode is
- * active. The parent model performs the semantic routing itself; starting a
+ * The standing system-prompt section body (Pi adds the XML wrapper). Injected
+ * on every active turn. The parent model performs semantic routing; starting a
  * separate agent merely to classify depth would defeat the focused path.
  */
 export function ultracodeSystemBlock(mode: ActiveUltracodeMode = "deep"): string {
   return [
-    "<ultracode>",
     `Configured mode: ${mode}.`,
     "Analysis depth is a semantic quality decision, never a wall-clock decision. Do not use elapsed time, deadlines, or duration limits to choose, lower, or stop analysis depth.",
     "Use the smallest depth that can establish a correct answer. Depth is controlled by research rounds, independent perspectives, verification strength, evidence requirements, skeptic count, and per-agent reasoning effort.",
@@ -34,7 +33,6 @@ export function ultracodeSystemBlock(mode: ActiveUltracodeMode = "deep"): string
     "- Avoid a separate synthesis agent when deterministic merging or parent synthesis is enough. Use an adjudicator only when a material conflict remains.",
     "- Select each workflow agent's effort from its task: use a per-call model suffix such as :medium for bounded discovery/synthesis, :high for substantive analysis or implementation, and :max only for deep or decisive high-risk verification. If omitted, the child session uses its normal user/model configuration.",
     "- When a workflow runs, log `analysis-depth: <level> — <reason>` before launching agents, `analysis-escalation: ...` for each semantic escalation, and `analysis-stop: ...` for the final evidence-based stop reason. Never use time as an escalation or stop reason.",
-    "</ultracode>",
   ].join("\n");
 }
 

@@ -966,7 +966,9 @@ test("suspend quiesces tools and prompts without changing parent effort", () => 
   s.active.push("workflow");
   m.suspend(api);
   assert.deepEqual(s.active, ["read"], "repeated suspend removes externally restored workflow");
-  assert.equal(m.beforeAgentStart({ systemPrompt: "BASE" }), undefined);
+  const event = { systemPromptOptions: { sections: { ultracode: "stale", other: "keep" } } };
+  assert.equal(m.beforeAgentStart(event), undefined);
+  assert.deepEqual(event.systemPromptOptions.sections, { other: "keep" });
 });
 
 test("workflow leases cap top-level active runs per runsDir, isolate directories, and release idempotently", () => {

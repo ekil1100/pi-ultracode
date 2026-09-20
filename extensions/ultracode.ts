@@ -111,9 +111,9 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   });
 
   pi.on("before_agent_start", async (event) => {
-    // Reconcile tool availability and append the standing policy on every
-    // enforcing turn, even when another active-tool writer caused drift.
+    // Reconcile tool availability and update our prompt section on every turn,
+    // including removal when the mode is off or suspended.
     mode.syncWorkflowTool(pi);
-    return mode.beforeAgentStart(event);
+    mode.beforeAgentStart(event);
   });
 }

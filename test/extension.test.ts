@@ -4,6 +4,13 @@ import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
+import {
+  createExtensionRuntime,
+  ExtensionRunner,
+  SessionManager,
+  type BeforeAgentStartEvent,
+  type ModelRegistry,
+} from "@earendil-works/pi-coding-agent";
 import ultracodeExtension from "../extensions/ultracode.ts";
 import { createWorkflowTool, workflowRunsDir } from "../src/workflow/tool.ts";
 import { WorkflowRegistry } from "../src/workflow/registry.ts";
@@ -60,6 +67,39 @@ function makeMockPi(flagValues: Record<string, unknown> = {}) {
     sendUserMessage: () => {},
   };
   return { pi, state };
+}
+
+async function runPromptHooks(
+  state: ReturnType<typeof makeMockPi>["state"],
+  base = "BASE",
+  sections: Record<string, string> = {},
+) {
+  let systemPrompt = "";
+  const handlers = new Map(state.events);
+  handlers.set("before_agent_start", [
+    ...(handlers.get("before_agent_start") ?? []),
+    (event: BeforeAgentStartEvent) => { systemPrompt = event.systemPrompt; },
+  ]);
+  const runner = new ExtensionRunner([{
+    path: "test-ultracode",
+    resolvedPath: "test-ultracode",
+    sourceInfo: { path: "test-ultracode", source: "test", scope: "temporary", origin: "top-level" },
+    handlers,
+    tools: new Map(),
+    messageRenderers: new Map(),
+    commands: new Map(),
+    flags: new Map(),
+    shortcuts: new Map(),
+  }], createExtensionRuntime(), process.cwd(), SessionManager.inMemory(), {} as ModelRegistry);
+  const errors: unknown[] = [];
+  runner.onError((error) => errors.push(error));
+  const result = await runner.emitBeforeAgentStart("test", undefined, {
+    cwd: process.cwd(), customPrompt: base, sections,
+  });
+  assert.deepEqual(errors, [], "Pi must dispatch the prompt hooks without errors");
+  assert.equal(result.systemPromptOptions.forceSystemPrompt, undefined, "the extension must not force a full prompt replacement");
+  assert.equal(result.systemPromptOptions.customPrompt, base, "the base prompt must remain unchanged");
+  return { ...result, systemPrompt };
 }
 
 function deferred<T>() {
@@ -156,8 +196,8 @@ test("SDK-style prompt barriers keep workflow disabled without session_start", a
 
   // Simulate a later input handler restoring a stale active-tools snapshot.
   state.activeTools = ["read", "grep", "workflow"];
-  const turn = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" });
-  assert.equal(turn, undefined, "a disabled turn injects no Ultracode prompt");
+  const turn = await runPromptHooks(state);
+  assert.equal(turn.systemPromptOptions.sections.ultracode, undefined, "a disabled turn injects no Ultracode prompt");
   assert.deepEqual(state.activeTools, ["read", "grep"], "the final barrier removes only workflow");
 
   const blocked = await state.events.get("tool_call")![0]({
@@ -188,7 +228,7 @@ test("before_agent_start restores workflow and the standing block in the same en
 
   // Simulate another active-tool writer removing workflow after activation.
   state.activeTools = ["read", "grep"];
-  const driftTurn = await state.events.get("before_agent_start")![0]({ systemPrompt: "CURRENT BASE" });
+  const driftTurn = await runPromptHooks(state, "CURRENT BASE");
   assert.deepEqual(state.activeTools, ["read", "grep", "workflow"]);
   assert.ok(driftTurn?.systemPrompt.includes("CURRENT BASE"));
   assert.ok(driftTurn?.systemPrompt.includes("<ultracode>"));
@@ -202,6 +242,39 @@ test("before_agent_start restores workflow and the standing block in the same en
     undefined,
     "enabled workflow calls are allowed",
   );
+});
+
+test("prompt sections replace modes without duplicating wrappers and clear on off or shutdown", async () => {
+  const { pi, state } = makeMockPi();
+  extension(pi);
+  const { ctx } = makeCtx(state);
+  let sections: Record<string, string> = { other_extension: "Keep this instruction." };
+
+  for (const selected of ["auto", "auto", "focused", "standard", "deep"] as const) {
+    await state.commands.get("ultracode").handler(selected, ctx);
+    const turn = await runPromptHooks(state, "BASE", sections);
+    sections = turn.systemPromptOptions.sections;
+    assert.equal(sections.other_extension, "Keep this instruction.");
+    assert.match(sections.ultracode, new RegExp(`Configured mode: ${selected}\\.`));
+    assert.equal((turn.systemPrompt.match(/Configured mode:/g) ?? []).length, 1);
+    assert.equal((turn.systemPrompt.match(/<ultracode>/g) ?? []).length, 1);
+    assert.equal((turn.systemPrompt.match(/<\/ultracode>/g) ?? []).length, 1);
+    assert.equal((turn.systemPrompt.match(/Reminder: Ultracode is active/g) ?? []).length, 1);
+    assert.doesNotMatch(sections.ultracode, /<\/?ultracode>/, "Pi owns the XML wrapper");
+  }
+
+  await state.commands.get("ultracode").handler("off", ctx);
+  const off = await runPromptHooks(state, "BASE", sections);
+  assert.deepEqual(off.systemPromptOptions.sections, { other_extension: "Keep this instruction." });
+  assert.doesNotMatch(off.systemPrompt, /Configured mode:|Ultracode is active|<ultracode>/);
+
+  await state.commands.get("ultracode").handler("deep", ctx);
+  await state.events.get("session_shutdown")![0]({ reason: "reload" }, ctx);
+  const suspended = await runPromptHooks(state, "BASE", sections);
+  assert.deepEqual(suspended.systemPromptOptions.sections, { other_extension: "Keep this instruction." });
+  await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
+  const restored = await runPromptHooks(state, "BASE", suspended.systemPromptOptions.sections);
+  assert.match(restored.systemPromptOptions.sections.ultracode, /Configured mode: deep\./);
 });
 
 test("/ultracode modes leave parent effort user-controlled and inject their policy", async () => {
@@ -226,7 +299,7 @@ test("/ultracode modes leave parent effort user-controlled and inject their poli
 
   const last = state.entries.filter((e) => e.customType === "ultracode-mode").pop();
   assert.deepEqual(last.data, { mode: "deep" });
-  const result = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE PROMPT" });
+  const result = await runPromptHooks(state, "BASE PROMPT");
   assert.ok(result?.systemPrompt.includes("Configured mode: deep."));
   assert.match(result.systemPrompt, /parent session's effort.*user control/i);
   assert.match(result.systemPrompt, /Select each workflow agent's effort/i);
@@ -245,7 +318,7 @@ test("/ultracode off and session shutdown never change parent effort", async () 
   assert.equal(state.thinking, "low");
   assert.deepEqual(state.activeTools, ["read"]);
   assert.match(notifications.at(-1)?.m ?? "", /parent effort unchanged/i);
-  assert.equal(await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }), undefined);
+  assert.equal((await runPromptHooks(state)).systemPromptOptions.sections.ultracode, undefined);
 
   await state.commands.get("ultracode").handler("deep", ctx);
   state.thinking = "max";
@@ -294,7 +367,7 @@ test("mode state is restored from persisted entries on a fresh load", async () =
   assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · deep");
   assert.doesNotMatch(String(state.statuses.ultracode), /budgetTotal|250000|250_000/i);
   // before_agent_start injects the migrated deep policy without the legacy token budget.
-  const result = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" });
+  const result = await runPromptHooks(state);
   assert.ok(result?.systemPrompt.includes("<ultracode>"));
   assert.ok(result?.systemPrompt.includes("Configured mode: deep."));
   assert.doesNotMatch(result?.systemPrompt ?? "", /budgetTotal|250000|250_000/i);
@@ -342,7 +415,7 @@ test("session_tree rehydrates branch-local Ultracode state", async () => {
   assert.equal(state.activeTools.includes("workflow"), false);
   assert.equal(state.statuses.ultracode, undefined);
   assert.equal(
-    await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }, ctx),
+    (await runPromptHooks(state)).systemPromptOptions.sections.ultracode,
     undefined,
     "a branch before the mode entry must not inject Ultracode",
   );
@@ -352,7 +425,7 @@ test("session_tree rehydrates branch-local Ultracode state", async () => {
   assert.equal(state.thinking, "medium");
   assert.equal(state.activeTools.includes("workflow"), true);
   assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · deep");
-  const restored = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }, ctx);
+  const restored = await runPromptHooks(state);
   assert.ok(restored?.systemPrompt.includes("<ultracode>"));
 });
 
@@ -383,7 +456,7 @@ test("/ultracode default on enables the current session and persists across exte
   assert.equal(state.activeTools.includes("workflow"), true);
   assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · auto");
   assert.equal(state.thinking, "medium");
-  const currentTurn = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }, ctx);
+  const currentTurn = await runPromptHooks(state);
   assert.match(currentTurn.systemPrompt, /Configured mode: auto/);
 
   const next = makeMockPi();
@@ -395,7 +468,7 @@ test("/ultracode default on enables the current session and persists across exte
   assert.equal(next.state.activeTools.includes("workflow"), true);
   assert.equal(next.state.thinking, "medium");
   assert.deepEqual(next.state.entries.at(-1).data, { mode: "auto" });
-  const turn = await next.state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }, nextCtx);
+  const turn = await runPromptHooks(next.state);
   assert.match(turn.systemPrompt, /Configured mode: auto/);
 
   await next.state.commands.get("ultracode").handler("default off", nextCtx);
@@ -496,7 +569,7 @@ test("manual parent effort changes are not intercepted or rendered in status", a
   await state.commands.get("ultracode").handler("deep", ctx);
 
   state.thinking = "low";
-  const turn = await state.events.get("before_agent_start")![0]({ systemPrompt: "BASE" }, ctx);
+  const turn = await runPromptHooks(state);
   assert.equal(state.thinking, "low");
   assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · deep");
   assert.ok(turn?.systemPrompt.includes("<ultracode>"));

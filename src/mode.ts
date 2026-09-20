@@ -184,11 +184,14 @@ export class UltracodeMode {
     return state !== undefined;
   }
 
-  /** Append the configured semantic-depth policy to the turn's system prompt. */
-  beforeAgentStart(event: { systemPrompt: string }): { systemPrompt: string } | undefined {
-    if (!this.isEnforcing() || !isActiveUltracodeMode(this.mode)) return undefined;
-    const block = ultracodeSystemBlock(this.mode);
-    return { systemPrompt: `${event.systemPrompt}\n\n${block}\n\n${ULTRACODE_ACTIVE_REMINDER}` };
+  /** Update only our prompt section so Pi can persist and diff it across turns. */
+  beforeAgentStart(event: { systemPromptOptions: { sections: Record<string, string> } }): void {
+    const { sections } = event.systemPromptOptions;
+    if (!this.isEnforcing() || !isActiveUltracodeMode(this.mode)) {
+      delete sections.ultracode;
+      return;
+    }
+    sections.ultracode = `${ultracodeSystemBlock(this.mode)}\n\n${ULTRACODE_ACTIVE_REMINDER}`;
   }
 
   statusLine(styleLabel: (label: string) => string = (label) => label): string {

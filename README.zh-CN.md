@@ -29,7 +29,7 @@ pi --ultracode
 
 > `pi-ultracode` 会注册名为 `workflow` 的工具。如果已安装 `pi-dynamic-workflows`，请先运行 `pi remove npm:pi-dynamic-workflows`。
 
-当前版本已在 Pi 0.84 上验证。
+需要 Pi 0.86.0 或更高版本。模式提示词通过独立分区更新，不再替换整段系统提示词。
 
 ## 核心特性
 
