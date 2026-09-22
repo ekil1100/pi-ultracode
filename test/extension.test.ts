@@ -18,6 +18,7 @@ import { createSnapshot } from "../src/workflow/display.ts";
 import { activeWorkflowCount, clearWorkflowLeasesForTests } from "../src/workflow/leases.ts";
 import { MAX_WORKFLOW_ARGS_BYTES } from "../src/workflow/value-limits.ts";
 import { UltracodePreferences } from "../src/preferences.ts";
+import { WORKFLOW_EFFORT_GUIDELINES } from "../src/effort-policy.ts";
 
 function extension(pi: any, extraDeps: Record<string, unknown> = {}): void {
   let defaultEnabled = false;
@@ -303,6 +304,9 @@ test("/ultracode modes leave parent effort user-controlled and inject their poli
   assert.ok(result?.systemPrompt.includes("Configured mode: deep."));
   assert.match(result.systemPrompt, /parent session's effort.*user control/i);
   assert.match(result.systemPrompt, /Select each workflow agent's effort/i);
+  for (const guideline of WORKFLOW_EFFORT_GUIDELINES) {
+    assert.ok(result.systemPrompt.includes(guideline), "Pi must receive the shared effort policy");
+  }
 });
 
 test("/ultracode off and session shutdown never change parent effort", async () => {

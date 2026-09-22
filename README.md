@@ -83,7 +83,23 @@ Depth is semantic, not time-based:
 
 Research stops when key claims have direct evidence, no material conflict or unresolved high-risk question remains, and another round would repeat known evidence. Wall-clock time, deadlines, and duration limits are never used to choose or stop analysis depth. `maxAgents` and `reserveAgents` remain structural admission limits.
 
-Ultracode never changes the parent session's effort. For workflow children, the parent selects effort per assigned task with a model suffix: typically `:medium` for bounded discovery or synthesis, `:high` for substantive analysis or implementation, and `:max` only for deep or decisive high-risk verification. The workflow UI reports each child's actual model-clamped effort. If no suffix is supplied, the child uses its normal user/model configuration. A separate skeptic or synthesis agent is not automatic.
+### Child-agent effort
+
+Ultracode never changes the parent session's effort. The parent selects the most appropriate supported effort with a model suffix for **each assigned subtask**, with no fixed `medium` or `high` default and no blind preference for the minimum or maximum.
+
+| Suffix | Criteria and exclusions | Example |
+|---|---|---|
+| `:off` | Fully specified mechanical work; no locating changes, interpreting meaning, or hidden-impact reasoning | Fix a typo at an exact location using a supplied replacement |
+| `:minimal` | One clear local judgment; no cross-file tracing or multi-step implementation | Explain a short self-contained expression |
+| `:low` | Small implementation or question with a known approach and straightforward checks; not an unknown-root-cause fault | Add a specified validation rule and its test |
+| `:medium` | Bounded multi-step work coordinating known constraints; not interacting unresolved hypotheses | Wire a configuration option through loading, usage, and tests |
+| `:high` | Test competing hypotheses, trace cross-module effects, or reason about critical correctness constraints; security/architecture keywords alone do not qualify | Diagnose cross-module state desynchronization by comparing plausible causes |
+| `:xhigh` | Interacting hard problems requiring comparison of approaches and validation of cross-module invariants; file count or vague complexity claims do not qualify | Investigate an intermittent lifecycle, cache, and cancellation interaction |
+| `:max` | Exceptionally difficult synthesis requiring rigorous argument and adversarial validation, or concrete evidence of insufficient lower-effort reasoning; risk keywords alone do not qualify | Prove and repair system-wide concurrency, memory-safety, and low-level invariants |
+
+Implementation, review, input length, file count, risk keywords, and depth mode are not sufficient reasons for high effort. Missing information does not automatically imply `medium/high`; do not invent complexity. For `high/xhigh/max`, briefly identify the concrete reasoning difficulty. The highest supported effort requires neither a failed lower-level attempt nor an available intermediate level. Risk determines what needs verification, not a uniform high effort for every child.
+
+These are task-selection heuristics, not a universal provider capability scale. The workflow UI reports actual model-clamped effort; an omitted suffix retains normal child user/model configuration. The system prompt and workflow guidelines share `src/effort-policy.ts`; no router changes the parent's effort. A separate skeptic or synthesis agent is not automatic.
 
 ## Workflow example
 

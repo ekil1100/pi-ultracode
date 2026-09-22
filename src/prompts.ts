@@ -1,6 +1,7 @@
 /** Prompt text for Ultracode's adaptive analysis-depth modes. */
 
 import type { ActiveUltracodeMode } from "./depth.ts";
+import { WORKFLOW_EFFORT_GUIDELINES } from "./effort-policy.ts";
 
 /** One-line description shown by `/ultracode status` and the footer. */
 export const ULTRACODE_TAGLINE = "semantic-depth workflow orchestration";
@@ -31,7 +32,7 @@ export function ultracodeSystemBlock(mode: ActiveUltracodeMode = "deep"): string
     "- Use a workflow only when independent decomposition, verification, isolation, or context scale provides real value. Otherwise solve directly in the parent session.",
     "- Make skeptics conditional: verify high-risk, conflicting, weakly evidenced, or low-confidence claims instead of automatically verifying every branch.",
     "- Avoid a separate synthesis agent when deterministic merging or parent synthesis is enough. Use an adjudicator only when a material conflict remains.",
-    "- Select each workflow agent's effort from its task: use a per-call model suffix such as :medium for bounded discovery/synthesis, :high for substantive analysis or implementation, and :max only for deep or decisive high-risk verification. If omitted, the child session uses its normal user/model configuration.",
+    ...WORKFLOW_EFFORT_GUIDELINES.map((line) => `- ${line}`),
     "- When a workflow runs, log `analysis-depth: <level> — <reason>` before launching agents, `analysis-escalation: ...` for each semantic escalation, and `analysis-stop: ...` for the final evidence-based stop reason. Never use time as an escalation or stop reason.",
   ].join("\n");
 }
@@ -85,7 +86,7 @@ export const WORKFLOW_GUIDELINES: string[] = [
   "For an auto-depth workflow, log `analysis-depth: <level> — <reason>` before launching agents, `analysis-escalation: ...` when evidence requires more depth, and `analysis-stop: ...` when evidence is sufficient. Elapsed time must never determine depth.",
   "For workflow verification, run skeptics only for high-risk, conflicting, low-confidence, or weakly evidenced claims. Do not automatically attach a skeptic to every branch.",
   "For workflow synthesis, prefer structured results plus deterministic or parent-session merging. Start a synthesis/adjudication agent only for a material unresolved conflict, and normally give pure synthesis lower effort and no broad source-search mandate.",
-  "For every substantive workflow agent, select effort from the assigned task with a model suffix such as `:medium`, `:high`, or `:max`: use medium for bounded discovery/synthesis, high for substantive analysis or implementation, and reserve max for deep or decisive high-risk verification. Ultracode never changes the parent session's effort; an omitted child suffix uses the child session's normal user/model configuration.",
+  ...WORKFLOW_EFFORT_GUIDELINES,
   "For the workflow tool, provide workflow source with `script`, `scriptPath`, or `name`. Inline `script` must be one raw JavaScript string: no Markdown fences, no prose around the script.",
   "For the workflow tool, the script's first statement must be `export const meta = { name: 'short_snake_case', description: 'non-empty human description' }`. meta must be a pure literal: no variables, function calls, spreads, or template interpolation. meta.phases is optional and should mirror your phase() titles.",
   "For the workflow tool, write plain JavaScript after the meta export. No TypeScript syntax, imports, require(), fs, network, Date/Intl/Temporal, Math.random(), binary memory constructors, WebAssembly, or dynamic method calls such as value[key](...) (they bypass deterministic checks or resource bounds). Stamp timestamps after the workflow returns; vary randomness by agent index.",
