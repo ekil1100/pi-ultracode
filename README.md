@@ -85,7 +85,7 @@ Research stops when key claims have direct evidence, no material conflict or unr
 
 ### Child-agent effort
 
-Ultracode 不会修改父会话的 effort；以下父代理选择作为默认和 Jev 失败时的回退。
+Ultracode never changes the parent session's effort. The parent selection below remains the default and the fallback when Jev fails.
 
 The parent selects the most appropriate supported effort with a model suffix for **each assigned subtask**, with no fixed `medium` or `high` default and no blind preference for the minimum or maximum.
 
@@ -101,17 +101,17 @@ The parent selects the most appropriate supported effort with a model suffix for
 
 Implementation, review, input length, file count, risk keywords, and depth mode are not sufficient reasons for high effort. Missing information does not automatically imply `medium/high`; do not invent complexity. For `high/xhigh/max`, briefly identify the concrete reasoning difficulty. The highest supported effort requires neither a failed lower-level attempt nor an available intermediate level. Risk determines what needs verification, not a uniform high effort for every child.
 
-这些分档是任务选择标准，不是跨提供商统一的能力刻度。Workflow UI 展示实际生效的 effort；未指定后缀且 Jev 未覆盖时，子会话使用正常的用户/模型配置。系统提示词、workflow 指南和 Jev 共用 `src/effort-policy.ts` 的分档标准，均不改变父会话 effort。skeptic 和独立 synthesis agent 都不是默认步骤。
+These are task-selection heuristics, not a universal provider capability scale. The workflow UI reports actual effort; an omitted suffix retains normal child user/model configuration unless Jev overrides it. The system prompt, workflow guidelines, and Jev share the criteria in `src/effort-policy.ts`; none changes the parent's effort. A separate skeptic or synthesis agent is not automatic.
 
-#### 可选 Jev 自动选择
+#### Optional Jev selection
 
-在启动 Pi 的环境中设置非空白的 `TYPESAFE_API_KEY` 即启用；未设置或仅含空白时，完全保留现有父代理后缀及用户/模型默认行为。
+Set a nonblank `TYPESAFE_API_KEY` in the environment used to launch Pi to enable Jev. If the key is absent or blank, existing parent-selected suffixes and user/model defaults remain unchanged.
 
-- 每个子任务在子会话创建后、执行前，通过 `@typesafe-ai/sdk` 请求 `jev-1.13.0`，仅从**实际子模型**支持的 effort 中选择；成功后覆盖父代理为该子任务选择的 effort，不更换执行模型，也不修改父会话或全局默认值。
-- 选择标准复用 `src/effort-policy.ts`。请求发送至 `https://api.typesafe.ai`，包含该子任务提示词（角色、额外指令、标签及输出要求）、子模型标识和支持档位；不会额外读取仓库或发送完整父会话历史。启用前请确认这些任务内容可以发送给 TypeSafe。
-- 请求超时为 **10 秒，不重试**。网络、服务、响应格式错误或返回不受支持的档位时，保留已经解析好的父代理选择/默认 effort；**回退不会额外请求模型重新判断**。
-- 用户取消会中止选择并终止子任务，不会执行回退任务。模型仅支持一个档位时无需请求 Jev；无法确定实际模型时保留原行为。
-- UI 展示实际生效的 effort。Jev SDK 日志关闭，不记录密钥、原始响应或服务错误正文；Jev 的选择请求用量不计入子代理执行用量。
+- After each child session is created and before execution, `@typesafe-ai/sdk` requests a selection from `jev-1.13.0`, limited to effort levels supported by the **actual child model**. A successful selection overrides the parent-selected effort without changing the execution model, parent session, or global defaults.
+- Selection reuses the criteria in `src/effort-policy.ts`. Requests go to `https://api.typesafe.ai` and include the subtask prompt (role, additional instructions, label, and output requirements), child model identity, and supported levels. No additional repository reads or complete parent conversation history are sent. Enable this only if these task contents may be shared with TypeSafe.
+- Requests have a **10-second timeout and no retries**. Network, service, response-format errors, or unsupported effort selections retain the already-resolved parent selection or default effort. **Fallback does not make an additional model request to reconsider the selection.**
+- User cancellation aborts selection and terminates the subtask rather than executing a fallback task. Models supporting only one level need no Jev request; if the actual model cannot be determined, existing behavior is preserved.
+- The UI reports actual effort. Jev SDK logging is disabled; keys, raw responses, and service error bodies are not logged. Jev selection usage is not included in child execution usage.
 
 ## Workflow example
 
