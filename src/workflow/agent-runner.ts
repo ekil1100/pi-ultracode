@@ -91,6 +91,8 @@ export interface ModelLike {
   provider: string;
   id: string;
   name?: string;
+  /** Omitted only by structural hosts without capability metadata. */
+  reasoning?: boolean;
   /** Extended levels are supported only when Pi exposes a non-null mapping. */
   thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
 }

@@ -11,6 +11,7 @@ import { UltracodeMode, type ThinkingPreferenceStore } from "../src/mode.ts";
 import { registerCommands } from "../src/commands.ts";
 import { UltracodePreferences, type UltracodePreferenceStore } from "../src/preferences.ts";
 import { WorkflowRegistry } from "../src/workflow/registry.ts";
+import { workflowEffortContext } from "../src/workflow/effort-context.ts";
 
 export interface ThinkingPreferenceContext {
   cwd: string;
@@ -110,10 +111,18 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     mode.suspend(pi);
   });
 
-  pi.on("before_agent_start", async (event) => {
+  pi.on("before_agent_start", async (event, ctx) => {
     // Reconcile tool availability and update our prompt section on every turn,
     // including removal when the mode is off or suspended.
     mode.syncWorkflowTool(pi);
     mode.beforeAgentStart(event);
+    // Read fresh capabilities, not startup state: /model and registry updates
+    // must be reflected before the parent chooses child effort suffixes.
+    const { sections } = event.systemPromptOptions;
+    if (mode.isEnforcing()) {
+      sections.ultracode_effort = workflowEffortContext(ctx, workflowDeps.modelRuntime);
+    } else {
+      delete sections.ultracode_effort;
+    }
   });
 }

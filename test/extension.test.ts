@@ -19,6 +19,7 @@ import { activeWorkflowCount, clearWorkflowLeasesForTests } from "../src/workflo
 import { MAX_WORKFLOW_ARGS_BYTES } from "../src/workflow/value-limits.ts";
 import { UltracodePreferences } from "../src/preferences.ts";
 import { WORKFLOW_EFFORT_GUIDELINES } from "../src/effort-policy.ts";
+import type { ModelLike } from "../src/workflow/agent-runner.ts";
 
 function extension(pi: any, extraDeps: Record<string, unknown> = {}): void {
   let defaultEnabled = false;
@@ -74,6 +75,7 @@ async function runPromptHooks(
   state: ReturnType<typeof makeMockPi>["state"],
   base = "BASE",
   sections: Record<string, string> = {},
+  modelContext: { model?: ModelLike; models?: ModelLike[] } = {},
 ) {
   let systemPrompt = "";
   const handlers = new Map(state.events);
@@ -91,7 +93,12 @@ async function runPromptHooks(
     commands: new Map(),
     flags: new Map(),
     shortcuts: new Map(),
-  }], createExtensionRuntime(), process.cwd(), SessionManager.inMemory(), {} as ModelRegistry);
+  }], createExtensionRuntime(), process.cwd(), SessionManager.inMemory(), {
+    getAvailable: () => modelContext.models ?? [],
+  } as unknown as ModelRegistry);
+  runner.bindCore({ getThinkingLevel: () => state.thinking } as any, {
+    getModel: () => modelContext.model,
+  } as any);
   const errors: unknown[] = [];
   runner.onError((error) => errors.push(error));
   const result = await runner.emitBeforeAgentStart("test", undefined, {
@@ -276,6 +283,51 @@ test("prompt sections replace modes without duplicating wrappers and clear on of
   await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
   const restored = await runPromptHooks(state, "BASE", suspended.systemPromptOptions.sections);
   assert.match(restored.systemPromptOptions.sections.ultracode, /Configured mode: deep\./);
+});
+
+test("parent capability context follows model switches on the next prompt without changing parent effort", async () => {
+  const { pi, state } = makeMockPi();
+  extension(pi);
+  const { ctx } = makeCtx(state);
+  await state.commands.get("ultracode").handler("auto", ctx);
+  state.thinking = "low";
+  const modelContext = {
+    model: {
+      provider: "test", id: "three", reasoning: true,
+      thinkingLevelMap: { off: null, minimal: null, xhigh: null, max: null },
+    } as ModelLike,
+    models: [] as ModelLike[],
+  };
+  const first = await runPromptHooks(state, "BASE", {}, modelContext);
+  assert.match(first.systemPrompt, /<ultracode_effort>/);
+  assert.match(first.systemPromptOptions.sections.ultracode_effort, /Default child: .*"model":"test\/three","supportedEfforts":\["low","medium","high"\]/);
+
+  modelContext.model = { provider: "test", id: "no-thinking", reasoning: false };
+  modelContext.models = [{ provider: "override", id: "seven", reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" } }];
+  const next = await runPromptHooks(state, "BASE", first.systemPromptOptions.sections, modelContext);
+  const capabilities = next.systemPromptOptions.sections.ultracode_effort;
+  assert.match(capabilities, /Default child: .*"model":"test\/no-thinking","supportedEfforts":\["off"\]/);
+  assert.match(capabilities, /"model":"override\/seven","supportedEfforts":\["off","minimal","low","medium","high","xhigh","max"\]/);
+  assert.doesNotMatch(capabilities, /test\/three/);
+  assert.equal((next.systemPrompt.match(/<ultracode_effort>/g) ?? []).length, 1);
+  assert.equal(state.thinking, "low");
+
+  await state.commands.get("ultracode").handler("off", ctx);
+  const off = await runPromptHooks(state, "BASE", next.systemPromptOptions.sections, modelContext);
+  assert.equal(off.systemPromptOptions.sections.ultracode_effort, undefined);
+  assert.equal(state.thinking, "low");
+});
+
+test("extension capability context uses an injected execution runtime", async () => {
+  const { pi, state } = makeMockPi();
+  const resolved: ModelLike = { provider: "test", id: "model", reasoning: false };
+  extension(pi, { modelRuntime: { getModel: () => resolved } });
+  const { ctx } = makeCtx(state);
+  await state.commands.get("ultracode").handler("auto", ctx);
+  const turn = await runPromptHooks(state, "BASE", {}, {
+    model: { ...resolved, reasoning: true, thinkingLevelMap: { max: "max" } },
+  });
+  assert.match(turn.systemPromptOptions.sections.ultracode_effort, /"supportedEfforts":\["off"\]/);
 });
 
 test("/ultracode modes leave parent effort user-controlled and inject their policy", async () => {

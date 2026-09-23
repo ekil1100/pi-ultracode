@@ -113,6 +113,26 @@ test("Jev overrides each assigned subtask using shared criteria and the actual c
   assert.deepEqual(h.counts(), { creates: 2, disposes: 2, aborts: 0 });
 });
 
+test("Jev keeps the actual child's three-level subset and failure fallback", async (t) => {
+  setKey(t);
+  const requests: any[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: string, init: RequestInit) => {
+    requests.push(JSON.parse(init.body as string));
+    return decision(requests.length === 1 ? "medium" : "max");
+  });
+  const h = harness(["low", "medium", "high"]);
+  assert.equal((await h.run({ modelPattern: ":high" })).effort, "medium");
+  assert.equal((await h.run({ modelPattern: ":low" })).effort, "low");
+  for (const request of requests) {
+    assert.deepEqual(request.state.supportedEfforts, ["low", "medium", "high"]);
+    assert.deepEqual(Object.keys(request.questions.effort.criteria), ["low", "medium", "high"]);
+    assert.deepEqual(request.state.model, h.actualModel);
+  }
+  assert.equal(requests.length, 2);
+  assert.deepEqual(h.changes, [{ effort: "medium", persist: false }]);
+  assert.deepEqual(h.prompts.map((entry) => entry.effort), ["medium", "low"]);
+});
+
 for (const [name, response] of [
   ["HTTP failure", () => new Response("test-key-not-for-logs raw-private-response", { status: 503 })],
   ["transport failure", () => { throw new Error("test-key-not-for-logs raw-private-response"); }],

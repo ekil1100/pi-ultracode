@@ -89,6 +89,10 @@ Ultracode never changes the parent session's effort. The parent selection below 
 
 The parent selects the most appropriate supported effort with a model suffix for **each assigned subtask**, with no fixed `medium` or `high` default and no blind preference for the minimum or maximum.
 
+Before each parent run, the extension supplies a local Pi capability snapshot: the current default child model (`ctx.model`) and available registered model overrides, each with its supported effort levels from Pi's capability API. Model switches and registry changes are reflected on the next run. A bare suffix such as `:low` uses the default child model; an explicit model or agent-role model uses its own capabilities. Prefer exact `provider/model` identifiers for overrides. A model supporting only `low/medium/high` offers exactly those three choices—not all seven followed by clamping. Unknown capabilities remain unknown; the parent should omit an automatic suffix rather than guess. No extra model request is needed.
+
+The snapshot describes local registered capabilities, not a live provider probe, and may become stale during a run. Runtime clamping remains a safety net for explicit requests or stale metadata. Standalone SDK use of `createWorkflowTool()` without the extension does not inject this section; the host must supply capability context to enable informed automatic suffix selection. Neither the snapshot nor its absence rewrites explicit user effort choices or no-suffix defaults.
+
 | Suffix | Criteria and exclusions | Example |
 |---|---|---|
 | `:off` | Fully specified mechanical work; no locating changes, interpreting meaning, or hidden-impact reasoning | Fix a typo at an exact location using a supplied replacement |
