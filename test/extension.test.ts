@@ -98,6 +98,7 @@ async function runPromptHooks(
   } as unknown as ModelRegistry);
   runner.bindCore({ getThinkingLevel: () => state.thinking } as any, {
     getModel: () => modelContext.model,
+    getSignal: () => undefined,
   } as any);
   const errors: unknown[] = [];
   runner.onError((error) => errors.push(error));
@@ -177,7 +178,7 @@ test("extension registers the workflow tool, commands, and flag", () => {
   assert.ok(state.shortcuts.has("f6"));
   assert.ok(state.events.has("session_start"));
   assert.ok(state.events.has("session_tree"));
-  assert.equal(state.events.has("model_select"), false, "parent model changes need no interception");
+  assert.equal(state.events.has("model_select"), true, "model changes invalidate pending depth selection only");
   assert.equal(state.events.has("thinking_level_select"), false, "parent effort remains user-controlled");
   assert.ok(state.events.has("session_shutdown"));
   assert.ok(state.events.has("input"));
@@ -1834,4 +1835,28 @@ test("workflow tool rejects invalid maxAgents before artifacts", async () => {
   } finally {
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
+});
+
+
+test("Pi ExtensionRunner injects Jev depth as a structured section without replacing the base prompt", async (t) => {
+  const previous = process.env.TYPESAFE_API_KEY;
+  process.env.TYPESAFE_API_KEY = "test-depth-key";
+  t.after(() => {
+    if (previous === undefined) delete process.env.TYPESAFE_API_KEY;
+    else process.env.TYPESAFE_API_KEY = previous;
+  });
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({
+    answers: { depth: { type: "choice", choice: "standard" } },
+  }));
+  const { pi, state } = makeMockPi();
+  extension(pi);
+  const { ctx } = makeCtx(state);
+  await state.commands.get("ultracode").handler("auto", ctx);
+  const result = await runPromptHooks(state, "BASE PROMPT", { other_extension: "Keep this instruction." });
+  assert.match(result.systemPromptOptions.sections.ultracode, /Initial analysis depth: standard \(Jev\)/);
+  assert.match(result.systemPrompt, /Configured mode: auto/);
+  assert.equal(result.systemPromptOptions.sections.other_extension, "Keep this instruction.");
+  assert.equal(result.systemPrompt.split("<ultracode>").length - 1, 1);
+  assert.equal(state.thinking, "medium");
+  assert.equal(fetch.mock.callCount(), 1);
 });

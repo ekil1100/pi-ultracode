@@ -59,7 +59,7 @@ test("all depth modes and workflow guidelines inject the same effort policy", ()
       assert.equal(lines.filter((entry) => entry === `- ${line}`).length, 1, mode);
     }
   }
-  for (const prompt of [WORKFLOW_GUIDELINES.join("\n"), ...ACTIVE_ULTRACODE_MODES.map(ultracodeSystemBlock)]) {
+  for (const prompt of [WORKFLOW_GUIDELINES.join("\n"), ...ACTIVE_ULTRACODE_MODES.map((mode) => ultracodeSystemBlock(mode))]) {
     assert.doesNotMatch(prompt, /high for substantive analysis or implementation/);
     assert.doesNotMatch(prompt, /max only for deep or decisive high-risk verification/);
   }

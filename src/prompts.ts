@@ -1,6 +1,6 @@
 /** Prompt text for Ultracode's adaptive analysis-depth modes. */
 
-import type { ActiveUltracodeMode } from "./depth.ts";
+import { ANALYSIS_DEPTHS, DEPTH_CRITERIA, DEPTH_SELECTION_RULES, type ActiveUltracodeMode, type AnalysisDepth } from "./depth.ts";
 import { WORKFLOW_EFFORT_GUIDELINES } from "./effort-policy.ts";
 
 /** One-line description shown by `/ultracode status` and the footer. */
@@ -8,22 +8,25 @@ export const ULTRACODE_TAGLINE = "semantic-depth workflow orchestration";
 
 /**
  * The standing system-prompt section body (Pi adds the XML wrapper). Injected
- * on every active turn. The parent model performs semantic routing; starting a
- * separate agent merely to classify depth would defeat the focused path.
+ * on every active turn. Auto uses Jev when available, otherwise the parent
+ * routes in its normal turn; neither path needs a separate router agent.
  */
-export function ultracodeSystemBlock(mode: ActiveUltracodeMode = "deep"): string {
+export function ultracodeSystemBlock(mode: ActiveUltracodeMode = "deep", initialDepth?: AnalysisDepth): string {
   return [
     `Configured mode: ${mode}.`,
     "Analysis depth is a semantic quality decision, never a wall-clock decision. Do not use elapsed time, deadlines, or duration limits to choose, lower, or stop analysis depth.",
-    "Use the smallest depth that can establish a correct answer. Depth is controlled by research rounds, independent perspectives, verification strength, evidence requirements, skeptic count, and per-agent reasoning effort.",
+    DEPTH_SELECTION_RULES,
     "Existing maxAgents/reserveAgents limits are structural admission bounds, not evidence that every available slot should be used.",
     "Ultracode does not change the parent session's effort; that remains under user control.",
     "",
-    ...modeInstructions(mode),
+    "Depth applicability and required verification:",
+    ...ANALYSIS_DEPTHS.map((depth) => `- ${depth}: ${DEPTH_CRITERIA[depth]}`),
+    "",
+    ...modeInstructions(mode, initialDepth),
     "",
     "Evidence-driven escalation and stopping:",
     "- Escalate only for material correctness risk, missing direct evidence, conflicting findings, or an unresolved question that can change the answer.",
-    "- Treat security, GC, ABI, deoptimization, concurrency, data-loss, irreversible operations, and critical architecture semantics as high-risk unless bounded evidence proves otherwise.",
+    "- Identify concrete failure consequences and the evidence needed to rule them out; a risk keyword alone is not an escalation trigger.",
     "- Stop when key claims have direct evidence, no material conflict or unresolved high-risk question remains, and another round would only repeat known evidence.",
     "- Model-reported confidence alone is not sufficient. Prefer concrete citations, reproduction, tests, and independent agreement.",
     "- If fixed focused/standard is insufficient, report the remaining uncertainty and recommend a deeper mode; in deep, report any irreducible uncertainty. Never silently exceed a fixed mode.",
@@ -37,31 +40,26 @@ export function ultracodeSystemBlock(mode: ActiveUltracodeMode = "deep"): string
   ].join("\n");
 }
 
-function modeInstructions(mode: ActiveUltracodeMode): string[] {
-  switch (mode) {
-    case "auto":
-      return [
-        "Before acting, silently route this task to focused, standard, or deep. Do not spawn a router agent.",
-        "Choose from user intent, consequence risk, scope, ambiguity, available evidence, cross-module or cross-repository breadth, and whether independent verification is necessary.",
-        "Begin at the shallowest sufficient depth and escalate only when evidence triggers an escalation condition below.",
-      ];
-    case "focused":
-      return [
-        "Focused is a fixed lightweight depth: prefer one bounded line of inquiry and the normal parent-agent loop.",
-        "Do not run adversarial verification by default. Use at most a small, narrowly scoped delegation only when it clearly reduces duplicated exploration.",
-      ];
-    case "standard":
-      return [
-        "Standard is a fixed balanced depth: cover the few independent dimensions that can materially change the answer.",
-        "Prefer one discovery round and conditional verification of only disputed, high-risk, or weakly evidenced claims.",
-      ];
-    case "deep":
-      return [
-        "Deep is a fixed high-assurance depth: default to a bounded workflow for substantive tasks unless the work is conversational, trivial, or already verified.",
-        "Use multi-perspective investigation and adversarial verification where the task supports it. Choose fan-out and round limits before launch.",
-        "Use at most two discovery rounds by default; add a third only when the user explicitly requests exhaustive coverage and fresh evidence is still appearing.",
-      ];
+function modeInstructions(mode: ActiveUltracodeMode, initialDepth?: AnalysisDepth): string[] {
+  if (mode === "auto") {
+    return [
+      ...(initialDepth
+        ? [`Initial analysis depth: ${initialDepth} (Jev). Start with its evidence requirements; this is not a fixed mode. Do not repeat initial classification or spawn a router agent.`]
+        : ["Before acting, silently route this task to focused, standard, or deep using the criteria above. Do not spawn a router agent or make an extra model request for classification."]),
+      "Begin at the shallowest sufficient depth and escalate only when evidence triggers an escalation condition below. Relevant conversation or repository evidence unavailable to the initial selector can justify immediate escalation.",
+    ];
   }
+  return [
+    `Fixed analysis depth: ${mode}. Apply its criteria and verification requirements; do not silently switch to another depth.`,
+    ...(mode === "focused"
+      ? ["Prefer the normal parent-agent loop. Delegate only narrowly scoped work when it adds clear value."]
+      : mode === "standard"
+        ? ["Cover the material independent dimensions and use conditional verification, not an automatic adversarial panel."]
+        : [
+          "Independent evidence can come from a distinct test, reproduction, proof, or source; a second agent is neither necessary nor sufficient.",
+          "Use multi-perspective or adversarial investigation only where it adds evidence. Choose bounded fan-out and round limits if a workflow is needed; stop as soon as the evidence is sufficient, even in one round.",
+        ]),
+  ];
 }
 
 /** Short reminder appended after the standing block. */

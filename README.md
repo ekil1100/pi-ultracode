@@ -60,12 +60,12 @@ Useful commands:
 | Command | Action |
 | --- | --- |
 | `/ultracode` | Enable `auto` from off; disable any active mode |
-| `/ultracode auto` | Select adaptive semantic-depth routing |
-| `/ultracode focused` | Fix the lightweight, narrowly scoped policy |
-| `/ultracode standard` | Fix the balanced policy with conditional verification |
-| `/ultracode deep` | Fix the high-assurance policy with deep verification |
+| `/ultracode auto` | Select initial depth via Jev when configured, otherwise the parent |
+| `/ultracode focused` | Use fixed depth for bounded work with direct local verification |
+| `/ultracode standard` | Use fixed depth for independent dimensions or competing hypotheses, with targeted verification |
+| `/ultracode deep` | Use fixed depth for interacting constraints or critical invariants, with independent evidence and counterexample checks |
 | `/ultracode off` | Disable it without changing the parent effort |
-| `/ultracode status` | Show the configured semantic-depth mode |
+| `/ultracode status` | Show the configured mode and its applicability / verification requirements |
 | `/workflows` or `F6` | Open the workflow browser |
 | `/workflows <runId>` | Open a specific run |
 | `/workflows abort` | Abort active runs |
@@ -74,14 +74,30 @@ Press `Esc` to cancel a running workflow. In Pi's fullscreen TUI, use `Ctrl+Page
 
 ## Analysis depth
 
-Depth is semantic, not time-based:
+Depth defines **what must be investigated and verified**, not model effort or a quota of agents and rounds:
 
-- **Focused** prefers the parent agent and one bounded line of inquiry. It does not run adversarial verification by default.
-- **Standard** covers the few independent dimensions that can change the answer and verifies only high-risk, conflicting, or weakly evidenced claims.
-- **Deep** uses bounded multi-perspective investigation and adversarial verification for high-risk or explicitly comprehensive work.
-- **Auto** routes to the smallest sufficient level from user intent, consequence risk, scope, ambiguity, available evidence, and conflicts. It escalates only when evidence requires it.
+| Depth | Applicable conditions | Required verification |
+|---|---|---|
+| **Focused** | Bounded work with a known approach and locally verifiable results; e.g. a specified validation rule | Directly check the changed behavior or key claim, usually in the parent loop. No broad investigation or adversarial panel by default; verification is not skipped. |
+| **Standard** | Multiple independent dimensions or unresolved hypotheses can materially change the answer; e.g. a fault with several plausible causes | Investigate those dimensions or compare causes, then target disputed or weakly evidenced claims. Known multi-step work alone is not enough to require standard. |
+| **Deep** | Tightly interacting hard constraints or critical invariants need independent evidence and counterexamples; e.g. cancellation racing a durable commit | Trace interactions, test boundary/failure cases, and challenge key claims with a distinct test, reproduction, proof, or source. A second agent is neither necessary nor sufficient. |
+| **Auto** | Choose the smallest depth sufficient for the current task | Apply the selected depth's evidence requirements; escalate only when material new evidence or unresolved conflicts justify it. |
 
-Research stops when key claims have direct evidence, no material conflict or unresolved high-risk question remains, and another round would repeat known evidence. Wall-clock time, deadlines, and duration limits are never used to choose or stop analysis depth. `maxAgents` and `reserveAgents` remain structural admission limits.
+Risk determines **which claims need verification**. Security, concurrency, data loss, file count, or a request for review alone never mandates `deep`; missing information does not prove hidden complexity. Deep does not automatically mean a workflow, more agents, or repeated rounds. Explicit `focused` / `standard` / `deep` modes remain fixed: if insufficient, report the uncertainty and recommend a deeper mode rather than silently exceeding the boundary.
+
+Research stops when key claims have direct evidence, no material conflict or unresolved high-risk question remains, and another round would repeat known evidence. Wall-clock time, deadlines, and duration limits are never used to choose or stop analysis depth. `maxAgents` and `reserveAgents` remain structural admission limits. Parent effort stays user-owned, and child effort remains a separate per-subtask decision.
+
+### Optional Jev initial depth in auto
+
+With a nonblank `TYPESAFE_API_KEY`, each `before_agent_start` in `auto` makes one selection request through the existing TypeSafe SDK to **`jev-1.13.0`** at `https://api.typesafe.ai`. It chooses only `focused`, `standard`, or `deep`, using the same canonical criteria as the parent prompt (`src/depth.ts`). No router agent or extra parent-model request is created. Successful selection is injected as the **initial** depth, not a fixed mode; the parent can escalate based on relevant conversation or repository evidence unavailable to Jev.
+
+- The request sends only the **current expanded user prompt** and attached-image count. It does not read the repository or send conversation history, system prompts, or image contents. Enable the key only if this prompt content may be shared with TypeSafe. Short follow-ups and image-dependent tasks may lack enough context for an accurate initial choice; the parent still has its normal context and evidence-driven escalation policy. Empty text skips selection.
+- Absent/blank key, network/service errors, malformed responses, unsupported choices, and **10-second transport timeout** all retain the original parent semantic routing in its normal turn. There are **no retries** or additional fallback classification requests. This timeout bounds transport, not analysis depth.
+- Fixed modes and `off` never request Jev depth selection. Pending selections are invalidated and aborted on mode changes, model changes, branch restoration, session shutdown, or a superseding prompt; stale results are never applied.
+- Pi's `ctx.signal` is forwarded when available. Pi may provide no operation signal during `before_agent_start`, so immediate user cancellation of that preflight request is not guaranteed; lifecycle cancellation and the 10-second timeout still apply.
+- SDK logging is disabled; keys, raw responses, and service error bodies are not logged. Selection usage is not added to Pi execution usage. `/ultracode status` and the footer describe the **configured mode**, not a live estimate of the parent's evidence-driven depth.
+
+The same key also enables the existing child-effort selector below, including in fixed depth modes; its behavior is unchanged.
 
 ### Child-agent effort
 

@@ -3,7 +3,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { ACTIVE_ULTRACODE_MODES, isActiveUltracodeMode } from "./depth.ts";
+import { ACTIVE_ULTRACODE_MODES, MODE_DESCRIPTIONS, isActiveUltracodeMode, isUltracodeModeName } from "./depth.ts";
 import type { UltracodeMode } from "./mode.ts";
 import type { UltracodePreferenceStore } from "./preferences.ts";
 import type { WorkflowRegistry } from "./workflow/registry.ts";
@@ -17,11 +17,11 @@ export function registerCommands(
   preferences: UltracodePreferenceStore,
 ): void {
   pi.registerCommand("ultracode", {
-    description: "Toggle Ultracode, select auto|focused|standard|deep|off|status, or set default on|off",
+    description: "Analysis depth: auto routing, focused local checks, standard targeted verification, deep invariant/counterexample checks; off|status|default on|off",
     getArgumentCompletions(prefix: string) {
       return [...ACTIVE_ULTRACODE_MODES, "off", "status", "default", "default on", "default off"]
         .filter((value) => value.startsWith(prefix))
-        .map((value) => ({ value, label: value }));
+        .map((value) => ({ value, label: value, description: isUltracodeModeName(value) ? MODE_DESCRIPTIONS[value] : undefined }));
     },
     handler: async (args: string, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
@@ -32,7 +32,7 @@ export function registerCommands(
         const nowOn = mode.toggle(pi);
         ctx.ui.notify(
           nowOn
-            ? `Ultracode auto — ${mode.statusLine()}`
+            ? `Ultracode auto — ${MODE_DESCRIPTIONS.auto}`
             : "Ultracode off — workflow tool disabled; parent effort unchanged.",
           "info",
         );
@@ -73,7 +73,7 @@ export function registerCommands(
       }
 
       if (sub === "status") {
-        ctx.ui.notify(mode.statusLine(), "info");
+        ctx.ui.notify(`${mode.statusLine()} — ${MODE_DESCRIPTIONS[mode.getMode()]} Depth is independent of model effort.`, "info");
         return;
       }
 
@@ -90,7 +90,7 @@ export function registerCommands(
       }
 
       mode.enable(pi, sub);
-      ctx.ui.notify(`Ultracode ${sub} — ${mode.statusLine()}`, "info");
+      ctx.ui.notify(`Ultracode ${sub} — ${MODE_DESCRIPTIONS[sub]}`, "info");
       ctx.ui.setStatus(
         "ultracode",
         mode.statusLine((label) => ctx.ui.theme.fg("accent", label)),
@@ -132,5 +132,9 @@ export function registerCommands(
 }
 
 function ultracodeUsage(): string {
-  return "Usage: /ultracode [auto|focused|standard|deep|off|status] or /ultracode default [on|off]";
+  return [
+    "Usage: /ultracode [auto|focused|standard|deep|off|status] or /ultracode default [on|off]",
+    ...ACTIVE_ULTRACODE_MODES.map((mode) => `${mode}: ${MODE_DESCRIPTIONS[mode]}`),
+    "Depth is independent of model effort. Fixed modes are never overridden by Jev.",
+  ].join("\n");
 }

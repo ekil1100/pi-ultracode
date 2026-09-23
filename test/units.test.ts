@@ -839,9 +839,9 @@ test("semantic-depth prompts route by evidence without a time guard", () => {
   assert.match(auto, /parent session's effort.*user control/i);
   assert.match(auto, /Select each workflow agent's effort/i);
 
-  assert.match(ultracodeSystemBlock("focused"), /fixed lightweight depth/i);
+  assert.match(ultracodeSystemBlock("focused"), /Fixed analysis depth: focused/i);
   assert.match(ultracodeSystemBlock("standard"), /conditional verification/i);
-  assert.match(ultracodeSystemBlock("deep"), /high-assurance depth/i);
+  assert.match(ultracodeSystemBlock("deep"), /Fixed analysis depth: deep/i);
   assert.ok(WORKFLOW_GUIDELINES.some((line) => /Do not automatically attach a skeptic/i.test(line)));
   assert.ok(WORKFLOW_GUIDELINES.some((line) => /elapsed time must never determine depth/i.test(line)));
 });
@@ -954,7 +954,7 @@ test("Pi version detection gates child-session max compatibility at 0.80.6", () 
   assert.equal(piVersionSupportsMaxThinking("custom-build"), true);
 });
 
-test("suspend quiesces tools and prompts without changing parent effort", () => {
+test("suspend quiesces tools and prompts without changing parent effort", async () => {
   const m = new UltracodeMode("workflow");
   const { api, s } = miniPi();
   s.active = ["read"];
@@ -967,7 +967,7 @@ test("suspend quiesces tools and prompts without changing parent effort", () => 
   m.suspend(api);
   assert.deepEqual(s.active, ["read"], "repeated suspend removes externally restored workflow");
   const event = { systemPromptOptions: { sections: { ultracode: "stale", other: "keep" } } };
-  assert.equal(m.beforeAgentStart(event), undefined);
+  assert.equal(await m.beforeAgentStart(event), undefined);
   assert.deepEqual(event.systemPromptOptions.sections, { other: "keep" });
 });
 
