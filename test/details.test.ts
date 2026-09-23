@@ -26,6 +26,8 @@ function fakeSession(overrides: Partial<AgentSessionLike> = {}): AgentSessionLik
   return {
     thinkingLevel: "medium",
     supportsThinking: () => true,
+    getAvailableThinkingLevels: () => ["medium"],
+    setThinkingLevel(level) { this.thinkingLevel = level; },
     prompt: async () => {},
     abort: async () => {},
     subscribe: () => () => {},

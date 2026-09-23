@@ -50,6 +50,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@typesafe-ai/sdk": "^0.6.0",
     "acorn": "^8.11.0"
   },
   "devDependencies": {

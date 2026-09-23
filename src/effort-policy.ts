@@ -1,6 +1,6 @@
 import { THINKING_LEVELS, type ThinkingLevel } from "./thinking.ts";
 
-/** Task-based effort criteria shared by both workflow prompt surfaces. */
+/** Task-based effort criteria shared by workflow prompts and Jev selection. */
 const EFFORT_CRITERIA: Record<ThinkingLevel, string> = {
   off: "Fully specified mechanical work with no implementation decision or hidden-impact reasoning. Excludes finding where to change something or checking its meaning. Example: fix a typo at an exact location using a supplied replacement.",
   minimal: "One clear local judgment in a single scope with no unresolved dependencies. Excludes cross-file tracing or multi-step implementation. Example: explain a short self-contained expression by checking its direct condition.",
@@ -11,8 +11,13 @@ const EFFORT_CRITERIA: Record<ThinkingLevel, string> = {
   max: "Exceptionally difficult synthesis requiring sustained rigorous argument and adversarial validation, or concrete evidence that lower-effort reasoning is insufficient. Excludes escalation from risk keywords alone; prior lower-level failure is not required. Example: prove and repair system-wide invariants involving concurrency, memory safety, and low-level semantics.",
 };
 
+export function getEffortCriteria(efforts: readonly ThinkingLevel[]): Record<string, string> {
+  return Object.fromEntries(efforts.map((effort) => [effort, EFFORT_CRITERIA[effort]]));
+}
+
 export const WORKFLOW_EFFORT_GUIDELINES: readonly string[] = [
   "Select each workflow agent's effort from its assigned subtask using a per-call model suffix (for example, :low or :medium). Choose the most appropriate supported effort for reliable completion, not blindly the minimum or maximum; there is no fixed medium/high default. Ultracode never changes the parent session's effort; an omitted child suffix uses its normal user/model configuration.",
+  "When TYPESAFE_API_KEY is configured, Jev may override each child's effort using the same task criteria and the actual child model's supported levels. Still provide the parent-selected suffix: it is retained if Jev fails; no additional model request is made for fallback.",
   "Base effort on known complexity, interacting constraints, verification burden, and missing information. Do not invent hidden complexity; uncertainty alone does not mandate medium or high. Judge the assigned subtask, not the whole project or an earlier difficult task.",
   "Implementation, review, input length, file count, risk keywords, and the configured depth are not sufficient reasons for high/max. Discussing or looking up a risky mechanism differs from changing it. Workflow risk determines verification needs, not a uniform effort for every child. For high, xhigh, or max, briefly name the concrete reasoning difficulty rather than merely calling the task complex.",
   ...THINKING_LEVELS.map((level) => `Effort :${level} — ${EFFORT_CRITERIA[level]}`),

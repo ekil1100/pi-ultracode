@@ -43,6 +43,7 @@ import {
   type ThinkingLevel,
 } from "../thinking.ts";
 import type { AgentTypeDef } from "./agent-types.ts";
+import { selectJevEffort } from "../jev.ts";
 
 export type { ThinkingLevel } from "../thinking.ts";
 
@@ -196,6 +197,8 @@ export interface AgentSessionLike {
   thinkingLevel: ThinkingLevel;
   model?: ModelLike;
   supportsThinking(): boolean;
+  getAvailableThinkingLevels(): ThinkingLevel[];
+  setThinkingLevel(level: ThinkingLevel, options?: { persist?: boolean }): void;
   prompt(
     prompt: string,
     options?: { preflightResult?: (success: boolean) => void },
@@ -426,13 +429,8 @@ export class WorkflowAgentRunner {
     }
     const { session } = created;
     const actualModelId = session.model?.id ?? model?.id;
-    const actualEffort = session.thinkingLevel;
+    let actualEffort = session.thinkingLevel;
     const telemetryCounters = { retries: 0, compactions: 0, turns: 0, toolUses: 0, observing: false };
-    safeEmitTelemetry(call.onTelemetry, {
-      kind: "model_resolved",
-      modelId: actualModelId,
-      effort: actualEffort,
-    });
 
     let removeAbort: (() => void) | undefined;
     let unsubscribe: (() => void) | undefined;
@@ -456,6 +454,30 @@ export class WorkflowAgentRunner {
         }
       }
 
+      const prompt = this.buildPrompt(call, Boolean(call.schema));
+      const jevApiKey = process.env.TYPESAFE_API_KEY?.trim();
+      if (jevApiKey && session.model) {
+        const supportedEfforts = session.getAvailableThinkingLevels();
+        // A single supported level leaves no decision to make.
+        if (supportedEfforts.length > 1) {
+          const effort = await selectJevEffort({
+            apiKey: jevApiKey,
+            task: prompt,
+            model: session.model,
+            supportedEfforts,
+            signal: call.signal,
+          });
+          if (call.signal?.aborted) throw abortedError();
+          if (effort !== undefined) session.setThinkingLevel(effort, { persist: false });
+        }
+      }
+      actualEffort = session.thinkingLevel;
+      safeEmitTelemetry(call.onTelemetry, {
+        kind: "model_resolved",
+        modelId: actualModelId,
+        effort: actualEffort,
+      });
+
       // One subscription feeds both compact status and the private transcript
       // stream. Telemetry callbacks are isolated so observability can never
       // change the child run's outcome.
@@ -473,7 +495,7 @@ export class WorkflowAgentRunner {
         });
       }
 
-      await session.prompt(this.buildPrompt(call, Boolean(call.schema)), {
+      await session.prompt(prompt, {
         // Pi invokes this after async input/before_agent_start preflight and
         // immediately before _runAgentPrompt(). Throwing here closes the window
         // where abort() sees an idle session and therefore cannot stop streaming.
