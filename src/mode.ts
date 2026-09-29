@@ -12,12 +12,10 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   isActiveUltracodeMode,
   type ActiveUltracodeMode,
-  type AnalysisDepth,
   type UltracodeModeName,
 } from "./depth.ts";
 import { ULTRACODE_ACTIVE_REMINDER, ULTRACODE_TAGLINE, ultracodeSystemBlock } from "./prompts.ts";
 import type { ThinkingLevel } from "./thinking.ts";
-import { selectJevDepth } from "./jev.ts";
 
 export type { ThinkingLevel } from "./thinking.ts";
 
@@ -43,7 +41,6 @@ export interface ThinkingPreferenceStore {
 export class UltracodeMode {
   private mode: UltracodeModeName = "off";
   private suspended = false;
-  private pendingDepth?: AbortController;
   private readonly workflowToolName: string;
 
   constructor(workflowToolName: string) {
@@ -110,7 +107,6 @@ export class UltracodeMode {
 
   /** Quiesce tool and prompt enforcement before session teardown. */
   suspend(pi: ExtensionAPI): void {
-    this.cancelDepthRouting();
     if (this.suspended) {
       this.syncWorkflowTool(pi);
       return;
@@ -148,7 +144,6 @@ export class UltracodeMode {
    * `/ultracode` uses toggle() to enter auto.
    */
   enable(pi: ExtensionAPI, mode: ActiveUltracodeMode = "deep"): void {
-    this.cancelDepthRouting();
     this.suspended = false;
     this.mode = mode;
     this.syncWorkflowTool(pi);
@@ -157,7 +152,6 @@ export class UltracodeMode {
 
   /** Turn Ultracode off without changing the parent thinking level. */
   disable(pi: ExtensionAPI): void {
-    this.cancelDepthRouting();
     // Persist an explicit off even when already disabled, so startup defaults
     // cannot override this session's choice on reload or resume.
     this.mode = "off";
@@ -176,7 +170,6 @@ export class UltracodeMode {
       thinkingLevel?: unknown;
     }>,
   ): boolean {
-    this.cancelDepthRouting();
     let latestData: unknown;
     for (const entry of entries) {
       if (entry.type === "custom" && entry.customType === MODE_ENTRY_TYPE && entry.data) {
@@ -191,39 +184,10 @@ export class UltracodeMode {
     return state !== undefined;
   }
 
-  /** Invalidate even auto -> fixed -> auto changes while a request is pending. */
-  cancelDepthRouting(): void {
-    this.pendingDepth?.abort();
-    this.pendingDepth = undefined;
-  }
-
   /** Update only our prompt section so Pi can persist and diff it across turns. */
-  async beforeAgentStart(event: {
-    prompt?: string;
-    images?: readonly unknown[];
+  beforeAgentStart(event: {
     systemPromptOptions: { sections: Record<string, string> };
-  }, signal?: AbortSignal): Promise<void> {
-    this.cancelDepthRouting();
-    let initialDepth: AnalysisDepth | undefined;
-    const apiKey = process.env.TYPESAFE_API_KEY?.trim();
-    if (this.isEnforcing() && this.mode === "auto" && apiKey && event.prompt?.trim() && !signal?.aborted) {
-      const controller = new AbortController();
-      this.pendingDepth = controller;
-      const abort = () => controller.abort();
-      signal?.addEventListener("abort", abort, { once: true });
-      try {
-        const choice = await selectJevDepth({
-          apiKey,
-          task: event.prompt,
-          imageCount: event.images?.length ?? 0,
-          signal: controller.signal,
-        });
-        if (!controller.signal.aborted) initialDepth = choice;
-      } finally {
-        signal?.removeEventListener("abort", abort);
-        if (this.pendingDepth === controller) this.pendingDepth = undefined;
-      }
-    }
+  }, signal?: AbortSignal): void {
     const { sections } = event.systemPromptOptions;
     if (signal?.aborted) {
       delete sections.ultracode;
@@ -233,7 +197,7 @@ export class UltracodeMode {
       delete sections.ultracode;
       return;
     }
-    sections.ultracode = `${ultracodeSystemBlock(this.mode, initialDepth)}\n\n${ULTRACODE_ACTIVE_REMINDER}`;
+    sections.ultracode = `${ultracodeSystemBlock(this.mode)}\n\n${ULTRACODE_ACTIVE_REMINDER}`;
   }
 
   statusLine(styleLabel: (label: string) => string = (label) => label): string {

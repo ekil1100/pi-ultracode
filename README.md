@@ -60,7 +60,7 @@ Useful commands:
 | Command | Action |
 | --- | --- |
 | `/ultracode` | Enable `auto` from off; disable any active mode |
-| `/ultracode auto` | Select initial depth via Jev when configured, otherwise the parent |
+| `/ultracode auto` | Let the parent choose depth using the task and context |
 | `/ultracode focused` | Use fixed depth for bounded work with direct local verification |
 | `/ultracode standard` | Use fixed depth for independent dimensions or competing hypotheses, with targeted verification |
 | `/ultracode deep` | Use fixed depth for interacting constraints or critical invariants, with independent evidence and counterexample checks |
@@ -87,17 +87,11 @@ Risk determines **which claims need verification**. Security, concurrency, data 
 
 Research stops when key claims have direct evidence, no material conflict or unresolved high-risk question remains, and another round would repeat known evidence. Wall-clock time, deadlines, and duration limits are never used to choose or stop analysis depth. `maxAgents` and `reserveAgents` remain structural admission limits. Parent effort stays user-owned, and child effort remains a separate per-subtask decision.
 
-### Optional Jev initial depth in auto
+### Parent-selected depth in auto
 
-With a nonblank `TYPESAFE_API_KEY`, each `before_agent_start` in `auto` makes one selection request through the existing TypeSafe SDK to **`jev-1.13.0`** at `https://api.typesafe.ai`. It chooses only `focused`, `standard`, or `deep`, using the same canonical criteria as the parent prompt (`src/depth.ts`). No router agent or extra parent-model request is created. Successful selection is injected as the **initial** depth, not a fixed mode; the parent can escalate based on relevant conversation or repository evidence unavailable to Jev.
+In `auto`, the parent always chooses `focused`, `standard`, or `deep` in its normal turn using the current task, conversation, and repository evidence, following the shared criteria in `src/depth.ts`. It starts at the shallowest sufficient depth and escalates only when evidence warrants it. No router agent or extra classification request is created, even when `TYPESAFE_API_KEY` is configured.
 
-- The request sends only the **current expanded user prompt** and attached-image count. It does not read the repository or send conversation history, system prompts, or image contents. Enable the key only if this prompt content may be shared with TypeSafe. Short follow-ups and image-dependent tasks may lack enough context for an accurate initial choice; the parent still has its normal context and evidence-driven escalation policy. Empty text skips selection.
-- Absent/blank key, network/service errors, malformed responses, unsupported choices, and **10-second transport timeout** all retain the original parent semantic routing in its normal turn. There are **no retries** or additional fallback classification requests. This timeout bounds transport, not analysis depth.
-- Fixed modes and `off` never request Jev depth selection. Pending selections are invalidated and aborted on mode changes, model changes, branch restoration, session shutdown, or a superseding prompt; stale results are never applied.
-- Pi's `ctx.signal` is forwarded when available. Pi may provide no operation signal during `before_agent_start`, so immediate user cancellation of that preflight request is not guaranteed; lifecycle cancellation and the 10-second timeout still apply.
-- SDK logging is disabled; keys, raw responses, and service error bodies are not logged. Selection usage is not added to Pi execution usage. `/ultracode status` and the footer describe the **configured mode**, not a live estimate of the parent's evidence-driven depth.
-
-The same key also enables the existing child-effort selector below, including in fixed depth modes; its behavior is unchanged.
+`TYPESAFE_API_KEY` enables only the child-effort selector below, including in fixed depth modes. `/ultracode status` and the footer describe the **configured mode**, not a live estimate of the parent's evidence-driven depth.
 
 ### Child-agent effort
 

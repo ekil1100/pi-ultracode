@@ -1,6 +1,6 @@
 /** Prompt text for Ultracode's adaptive analysis-depth modes. */
 
-import { ANALYSIS_DEPTHS, DEPTH_CRITERIA, DEPTH_SELECTION_RULES, type ActiveUltracodeMode, type AnalysisDepth } from "./depth.ts";
+import { ANALYSIS_DEPTHS, DEPTH_CRITERIA, DEPTH_SELECTION_RULES, type ActiveUltracodeMode } from "./depth.ts";
 import { WORKFLOW_EFFORT_GUIDELINES } from "./effort-policy.ts";
 
 /** One-line description shown by `/ultracode status` and the footer. */
@@ -8,10 +8,10 @@ export const ULTRACODE_TAGLINE = "semantic-depth workflow orchestration";
 
 /**
  * The standing system-prompt section body (Pi adds the XML wrapper). Injected
- * on every active turn. Auto uses Jev when available, otherwise the parent
- * routes in its normal turn; neither path needs a separate router agent.
+ * on every active turn. In auto, the parent routes using its full context
+ * in its normal turn without a separate router agent.
  */
-export function ultracodeSystemBlock(mode: ActiveUltracodeMode = "deep", initialDepth?: AnalysisDepth): string {
+export function ultracodeSystemBlock(mode: ActiveUltracodeMode = "deep"): string {
   return [
     `Configured mode: ${mode}.`,
     "Analysis depth is a semantic quality decision, never a wall-clock decision. Do not use elapsed time, deadlines, or duration limits to choose, lower, or stop analysis depth.",
@@ -22,7 +22,7 @@ export function ultracodeSystemBlock(mode: ActiveUltracodeMode = "deep", initial
     "Depth applicability and required verification:",
     ...ANALYSIS_DEPTHS.map((depth) => `- ${depth}: ${DEPTH_CRITERIA[depth]}`),
     "",
-    ...modeInstructions(mode, initialDepth),
+    ...modeInstructions(mode),
     "",
     "Evidence-driven escalation and stopping:",
     "- Escalate only for material correctness risk, missing direct evidence, conflicting findings, or an unresolved question that can change the answer.",
@@ -40,13 +40,11 @@ export function ultracodeSystemBlock(mode: ActiveUltracodeMode = "deep", initial
   ].join("\n");
 }
 
-function modeInstructions(mode: ActiveUltracodeMode, initialDepth?: AnalysisDepth): string[] {
+function modeInstructions(mode: ActiveUltracodeMode): string[] {
   if (mode === "auto") {
     return [
-      ...(initialDepth
-        ? [`Initial analysis depth: ${initialDepth} (Jev). Start with its evidence requirements; this is not a fixed mode. Do not repeat initial classification or spawn a router agent.`]
-        : ["Before acting, silently route this task to focused, standard, or deep using the criteria above. Do not spawn a router agent or make an extra model request for classification."]),
-      "Begin at the shallowest sufficient depth and escalate only when evidence triggers an escalation condition below. Relevant conversation or repository evidence unavailable to the initial selector can justify immediate escalation.",
+      "Before acting, silently route this task to focused, standard, or deep using the criteria above and relevant conversation and repository context. Do not spawn a router agent or make an extra model request for classification.",
+      "Begin at the shallowest sufficient depth and escalate only when evidence triggers an escalation condition below.",
     ];
   }
   return [

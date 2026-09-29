@@ -68,7 +68,6 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    mode.cancelDepthRouting();
     // Restore persisted mode state across reload / resume / fork.
     let hasSavedMode = true;
     try {
@@ -97,7 +96,6 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   });
 
   pi.on("session_tree", async (_event, ctx) => {
-    mode.cancelDepthRouting();
     if (mode.isSuspended()) return;
     mode.restore(pi, ctx.sessionManager.getBranch() as any);
     if (ctx.hasUI) {
@@ -108,25 +106,17 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     }
   });
 
-  pi.on("model_select", () => {
-    // A result selected before a model/lifecycle change must not reach a later run.
-    // This does not change the configured mode or the parent's effort.
-    mode.cancelDepthRouting();
-  });
-
   pi.on("session_shutdown", async () => {
     // The persisted configured mode remains active for reload/resume/fork replacements.
     mode.suspend(pi);
   });
 
-  pi.on("before_agent_start", async (event, ctx) => {
+  pi.on("before_agent_start", (event, ctx) => {
     // Reconcile tool availability and update our prompt section on every turn,
     // including removal when the mode is off or suspended.
     mode.syncWorkflowTool(pi);
-    // Pi may have no operation signal during preflight. Forward it when present;
-    // the SDK timeout and mode-owned lifecycle controller also bound the request.
     const signal = ctx.signal;
-    await mode.beforeAgentStart(event, signal);
+    mode.beforeAgentStart(event, signal);
     // Read fresh capabilities, not startup state: /model and registry updates
     // must be reflected before the parent chooses child effort suffixes.
     const { sections } = event.systemPromptOptions;

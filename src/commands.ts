@@ -135,6 +135,6 @@ function ultracodeUsage(): string {
   return [
     "Usage: /ultracode [auto|focused|standard|deep|off|status] or /ultracode default [on|off]",
     ...ACTIVE_ULTRACODE_MODES.map((mode) => `${mode}: ${MODE_DESCRIPTIONS[mode]}`),
-    "Depth is independent of model effort. Fixed modes are never overridden by Jev.",
+    "Depth is independent of model effort. Fixed modes never switch depth automatically.",
   ].join("\n");
 }
