@@ -6,8 +6,9 @@
 
 import * as crypto from "node:crypto";
 import * as path from "node:path";
-import { defineTool, highlightCode, type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { defineTool, highlightCode, type Theme, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import beautify from "js-beautify";
 import { Type } from "typebox";
 import {
   WORKFLOW_GUIDELINES,
@@ -122,7 +123,10 @@ function nextRunId(): string {
 
 export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<typeof workflowToolSchema, any> {
   const registry = deps.registry ?? new WorkflowRegistry();
+  // Status updates rerender the call; format each completed display source only once.
+  let formattedSource: { input: string; output: string } | undefined;
   return defineTool({
+    renderShell: "self",
     name: "workflow",
     exposure: "model-only",
     annotations: {
@@ -603,31 +607,66 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         signal?.removeEventListener("abort", onOuterAbort);
       }
     },
-    renderCall(args, theme) {
+    renderCall(args, theme, { argsComplete }) {
       const title = theme.fg("toolTitle", theme.bold("workflow"));
-      // Arguments arrive incrementally; display source without parsing incomplete JavaScript.
       if (typeof args.script === "string" && args.script.length > 0) {
-        const source = safeTranscriptText(args.script, DISPLAY_INPUT_LIMIT);
-        const heading = theme.fg("muted", "Script · JavaScript");
-        return new Text(`${title}\n\n${heading}\n${highlightCode(source, "javascript").join("\n")}`, 0, 0);
+        let source = safeTranscriptText(args.script, DISPLAY_INPUT_LIMIT);
+        // Never format an incomplete stream or change the script used for execution.
+        if (argsComplete) {
+          if (formattedSource?.input !== source) {
+            let output = source;
+            try {
+              output = beautify.js(source, { indent_size: 2, preserve_newlines: true, wrap_line_length: 100 });
+            } catch {
+              // A malformed or truncated display source can still be shown verbatim.
+            }
+            formattedSource = { input: source, output: safeTranscriptText(output, DISPLAY_INPUT_LIMIT) };
+          }
+          source = formattedSource.output;
+        }
+        const call = new Container();
+        call.addChild(new Text(title, 0, 0));
+        call.addChild(new Spacer(1));
+        call.addChild(workflowSection("Script · JavaScript", highlightCode(source, "javascript").join("\n"), theme, "toolPendingBg"));
+        return call;
       }
       const source = args.scriptPath || args.name;
       return new Text(source ? `${title} ${theme.fg("muted", safeDisplayText(source, 240))}` : title, 0, 0);
     },
-    renderResult(result, { isPartial, expanded }, theme) {
+    renderResult(result, { isPartial, expanded }, theme, context) {
       const snapshot = result.details as WorkflowSnapshot | undefined;
+      const output = new Container();
+      output.addChild(new Spacer(1));
+      // Pi owns the pending/success/error background of the surrounding tool by
+      // default. With self framing, keep these states on the result panel only.
+      const background = isPartial ? "toolPendingBg"
+        : context.isError || snapshot?.status === "failed" || snapshot?.status === "aborted" ? "toolErrorBg" : "toolSuccessBg";
       if (snapshot?.name) {
-        return new Text(`\n${theme.fg("toolTitle", theme.bold("Status"))}\n${renderWorkflowText(snapshot, {
+        output.addChild(workflowSection("Status", renderWorkflowText(snapshot, {
           maxAgentRows: expanded ? Number.MAX_SAFE_INTEGER : undefined,
           maxLogs: expanded ? 12 : undefined,
           showResultPreviews: expanded && !isPartial,
-        })}`, 0, 0);
+        }), theme, background));
+      } else {
+        const text = result.content?.[0];
+        output.addChild(workflowSection("Result", text?.type === "text" ? text.text : "workflow", theme, background));
       }
-      const text = result.content?.[0];
-      const heading = theme.fg("toolTitle", theme.bold("Result"));
-      return new Text(`\n${heading}\n${text?.type === "text" ? text.text : theme.fg("muted", "workflow")}`, 0, 0);
+      return output;
     },
   });
+}
+
+function workflowSection(
+  heading: string,
+  content: string,
+  theme: Theme,
+  background: "toolPendingBg" | "toolSuccessBg" | "toolErrorBg",
+): Box {
+  const panel = new Box(1, 1, (text) => theme.bg(background, text));
+  panel.addChild(new Text(theme.fg("toolTitle", theme.bold(heading)), 0, 0));
+  panel.addChild(new Spacer(1));
+  panel.addChild(new Text(content, 0, 0));
+  return panel;
 }
 
 function resolveScript(

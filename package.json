@@ -50,13 +50,15 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "acorn": "^8.11.0"
+    "acorn": "^8.11.0",
+    "js-beautify": "^2.0.3"
   },
   "devDependencies": {
     "@earendil-works/pi-agent-core": "^0.99.1",
     "@earendil-works/pi-ai": "^0.99.1",
     "@earendil-works/pi-coding-agent": "^0.99.1",
     "@earendil-works/pi-tui": "^0.99.1",
+    "@types/js-beautify": "^1.14.3",
     "@types/node": "^24.12.4",
     "typebox": "1.3.7",
     "typescript": "^5.9.3"
