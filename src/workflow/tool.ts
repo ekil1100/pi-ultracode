@@ -6,7 +6,7 @@
 
 import * as crypto from "node:crypto";
 import * as path from "node:path";
-import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { defineTool, highlightCode, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
@@ -607,7 +607,9 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
       const title = theme.fg("toolTitle", theme.bold("workflow"));
       // Arguments arrive incrementally; display source without parsing incomplete JavaScript.
       if (typeof args.script === "string" && args.script.length > 0) {
-        return new Text(`${title}\n${theme.fg("toolOutput", safeTranscriptText(args.script, DISPLAY_INPUT_LIMIT))}`, 0, 0);
+        const source = safeTranscriptText(args.script, DISPLAY_INPUT_LIMIT);
+        const heading = theme.fg("muted", "Script · JavaScript");
+        return new Text(`${title}\n\n${heading}\n${highlightCode(source, "javascript").join("\n")}`, 0, 0);
       }
       const source = args.scriptPath || args.name;
       return new Text(source ? `${title} ${theme.fg("muted", safeDisplayText(source, 240))}` : title, 0, 0);
@@ -615,14 +617,15 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
     renderResult(result, { isPartial, expanded }, theme) {
       const snapshot = result.details as WorkflowSnapshot | undefined;
       if (snapshot?.name) {
-        return new Text(renderWorkflowText(snapshot, {
+        return new Text(`\n${theme.fg("toolTitle", theme.bold("Status"))}\n${renderWorkflowText(snapshot, {
           maxAgentRows: expanded ? Number.MAX_SAFE_INTEGER : undefined,
           maxLogs: expanded ? 12 : undefined,
           showResultPreviews: expanded && !isPartial,
-        }), 0, 0);
+        })}`, 0, 0);
       }
       const text = result.content?.[0];
-      return new Text(text?.type === "text" ? text.text : theme.fg("muted", "workflow"), 0, 0);
+      const heading = theme.fg("toolTitle", theme.bold("Result"));
+      return new Text(`\n${heading}\n${text?.type === "text" ? text.text : theme.fg("muted", "workflow")}`, 0, 0);
     },
   });
 }
