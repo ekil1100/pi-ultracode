@@ -332,6 +332,27 @@ test("workflow children load configured safety extensions while ambient extensio
   }
 });
 
+test("WorkflowAgentRunner fails a child whose final turn errored or was aborted by an extension", async () => {
+  for (const [stopReason, errorMessage, pattern] of [
+    ["error", "500 dummy provider", /500 dummy provider/],
+    ["aborted", undefined, /aborted before it finished/],
+  ] as const) {
+    const messages: unknown[] = [];
+    const runner = new WorkflowAgentRunner({
+      cwd: process.cwd(),
+      createSession: async () => ({
+        session: fakeSession({
+          messages,
+          prompt: async () => {
+            messages.push({ role: "assistant", content: [], stopReason, errorMessage });
+          },
+        }),
+      }),
+    });
+    await assert.rejects(runner.run({ prompt: "inspect", label: stopReason }), pattern);
+  }
+});
+
 test("WorkflowAgentRunner separates execution cwd from project resource discovery", async () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), "uc-resource-project-"));
   const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "uc-resource-isolated-"));

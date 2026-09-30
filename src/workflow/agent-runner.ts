@@ -547,6 +547,10 @@ export class WorkflowAgentRunner implements AgentRunner {
         await aborting;
         throw abortedError();
       }
+      // A provider error or an extension abort (e.g. a guard blocking the
+      // request) otherwise reads as a successful empty answer.
+      const finalTurnFailure = failedFinalTurn(session.messages as unknown[]);
+      if (finalTurnFailure) throw new Error(finalTurnFailure);
 
       let value: unknown;
       if (call.schema) {
@@ -1085,6 +1089,19 @@ function readUsage(
   usage.retries = counters.retries ?? 0;
   usage.compactions = counters.compactions ?? 0;
   return usage;
+}
+
+function failedFinalTurn(messages: unknown[]): string | undefined {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i] as Partial<AssistantMessage> | undefined;
+    if (message?.role !== "assistant") continue;
+    if (message.stopReason === "error") {
+      return `Subagent failed: ${safeDisplayText(message.errorMessage ?? "provider error", 512)}`;
+    }
+    if (message.stopReason === "aborted") return "Subagent was aborted before it finished";
+    return undefined;
+  }
+  return undefined;
 }
 
 function lastAssistantText(messages: unknown[]): string {

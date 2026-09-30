@@ -202,7 +202,7 @@ A parent's guard extensions therefore do not see child tool calls or provider re
 { "childExtensions": ["/absolute/path/to/guard.ts"] }
 ```
 
-Every child loads those extensions and nothing else from the ambient set. A child does not start if one fails to load or the setting is not an array of absolute paths. Project-scoped agents and settings follow Pi's project-trust decision. The built-in Explore and Plan roles have a sealed read-only tool list without shell or write tools.
+Every child loads those extensions and nothing else from the ambient set. A child does not start if one fails to load or the setting is not an array of absolute paths. A child whose final model turn ends in a provider error or an extension abort (a guard blocking the request) fails with that reason instead of returning an empty answer. Project-scoped agents and settings follow Pi's project-trust decision. The built-in Explore and Plan roles have a sealed read-only tool list without shell or write tools.
 
 Resume is intentionally immutable: the normalized script, arguments, canonical repository/relative cwd, project-trust context, agent definitions, effective models, and call structure must still match. Worktree delivery writes a durable recovery intent before changing the shared repository; an interrupted or conflicted delivery blocks automatic replay and reports its recovery patch. Changed work starts a new run.
 
