@@ -14,6 +14,7 @@ import * as PiCodingAgent from "@earendil-works/pi-coding-agent";
 import {
   createAgentSession,
   createCodingTools,
+  createCodemodeExtension,
   DefaultResourceLoader,
   getAgentDir,
   SessionManager,
@@ -43,7 +44,7 @@ import {
   type ThinkingLevel,
 } from "../thinking.ts";
 import type { AgentTypeDef } from "./agent-types.ts";
-import { selectJevEffort } from "../jev.ts";
+import { selectJevEfforts, type JevRuntime, type JevSelection } from "../jev.ts";
 
 export type { ThinkingLevel } from "../thinking.ts";
 
@@ -77,12 +78,16 @@ export async function createWorkflowChildResourceLoader(
     agentDir: options.agentDir,
     settingsManager,
     noExtensions: true,
+    extensionFactories: [createCodemodeExtension({ mode: "on", models: false })],
     skillsOverride: ({ skills, diagnostics }) => ({
       skills: skills.filter((skill) => !PARENT_ONLY_CHILD_SKILLS.has(skill.name)),
       diagnostics,
     }),
   });
   await loader.reload();
+  settingsManager.applyOverrides({
+    defaultTools: [...(settingsManager.getDefaultTools() ?? []), "+codemode"],
+  });
   return loader;
 }
 
@@ -97,7 +102,7 @@ export interface ModelLike {
   thinkingLevelMap?: Partial<Record<ThinkingLevel, string | null>>;
 }
 
-export interface ModelRegistryLike {
+export interface ModelRegistryLike extends Partial<JevRuntime> {
   getAvailable(): ModelLike[];
   /** Legacy public projection retained for consumers of this structural type. */
   getAll?(): ModelLike[];
@@ -112,8 +117,8 @@ export interface ModelRegistryLike {
   getApiKeyForProvider?(provider: string): Promise<string | undefined>;
 }
 
-/** Structural ModelRuntime seam that remains loadable on pre-0.80.8 Pi. */
-export interface ModelRuntimeLike {
+/** Structural ModelRuntime seam for SDK hosts and test doubles. */
+export interface ModelRuntimeLike extends Partial<JevRuntime> {
   getModel?(provider: string, modelId: string): ModelLike | undefined;
   registerProvider?(provider: string, config: any): void;
   /** Pi 0.81+ complete provider registration. */
@@ -231,7 +236,7 @@ export interface WorkflowAgentRunnerOptions {
   cwd: string;
   /** Parent session's immutable project-trust decision. */
   projectTrusted?: boolean;
-  /** Synchronous extension facade used only for model selection and state replay. */
+  /** Host registry for model selection, state replay and native classification/auth. */
   modelRegistry?: ModelRegistryLike;
   /** Canonical runtime to share across child sessions when supplied by an SDK host. */
   modelRuntime?: ModelRuntimeLike;
@@ -280,13 +285,30 @@ export interface AgentRunCall {
   agentTypeDef?: AgentTypeDef;
   /** Override cwd (worktree). */
   cwd?: string;
+  /** Scheduling hooks supplied only to runners declaring supportsSchedulingHooks. */
+  selectEffort?: (task?: JevSelection) => Promise<ThinkingLevel | undefined>;
+  /** Await after selectEffort and before execution; repeated calls share one permit. */
+  acquireExecution?: () => Promise<void>;
   /** Safe compact activity stream used by the inline workflow status. */
   onActivity?: (event: AgentActivityInput) => void;
   /** Private detailed stream used by the task transcript store. */
   onTelemetry?: (event: AgentTelemetryEvent) => void;
 }
 
-export class WorkflowAgentRunner {
+export interface AgentRunner {
+  /**
+   * Opt in to preparation outside the execution limit. Before executing, run()
+   * must await selectEffort exactly once (undefined skips classification), then
+   * await acquireExecution. Forwarding wrappers must declare this capability
+   * and forward both hooks. A runner without it receives no scheduling hooks;
+   * the runtime admits its entire run() and excludes it from classification.
+   */
+  readonly supportsSchedulingHooks?: boolean;
+  run(call: AgentRunCall): Promise<AgentRunResult>;
+}
+
+export class WorkflowAgentRunner implements AgentRunner {
+  readonly supportsSchedulingHooks = true;
   private readonly baseCwd: string;
   private readonly projectTrusted: boolean;
   private readonly modelRegistry?: ModelRegistryLike;
@@ -457,22 +479,24 @@ export class WorkflowAgentRunner {
       }
 
       const prompt = this.buildPrompt(call, Boolean(call.schema));
-      const jevApiKey = process.env.TYPESAFE_API_KEY?.trim();
-      if (jevApiKey && session.model) {
-        const supportedEfforts = session.getAvailableThinkingLevels();
-        // A single supported level leaves no decision to make.
-        if (supportedEfforts.length > 1) {
-          const effort = await selectJevEffort({
-            apiKey: jevApiKey,
-            task: prompt,
-            model: session.model,
-            supportedEfforts,
-            signal: call.signal,
-          });
-          if (call.signal?.aborted) throw abortedError();
-          if (effort !== undefined) session.setThinkingLevel(effort, { persist: false });
-        }
-      }
+      const supportedEfforts = session.model ? session.getAvailableThinkingLevels() : [];
+      // Classifier-only runtime keys belong to the host, not the child runtime's
+      // chat-provider replay. An explicit SDK runtime remains authoritative.
+      const classifierRuntime = this.providedModelRuntime ?? this.modelRegistry ?? modelRuntime;
+      const selectionTask: JevSelection | undefined = session.model && supportedEfforts.length > 1
+        ? { runtime: classifierRuntime, task: prompt, model: session.model, supportedEfforts }
+        : undefined;
+      const effort = call.selectEffort
+        ? await call.selectEffort(selectionTask)
+        : selectionTask
+          ? (await selectJevEfforts({ ...selectionTask, tasks: [selectionTask], signal: call.signal }))[0]
+          : undefined;
+      if (call.signal?.aborted) throw abortedError();
+      if (effort !== undefined) session.setThinkingLevel(effort, { persist: false });
+      // Idle session preparation and classification never hold an execution slot.
+      // The runtime retains the permit through result publication/worktree delivery.
+      await call.acquireExecution?.();
+      if (call.signal?.aborted) throw abortedError();
       actualEffort = session.thinkingLevel;
       safeEmitTelemetry(call.onTelemetry, {
         kind: "model_resolved",
@@ -497,6 +521,8 @@ export class WorkflowAgentRunner {
         });
       }
 
+      // Observers can cancel synchronously; do not enter Pi's auth preflight afterward.
+      if (call.signal?.aborted) throw abortedError();
       await session.prompt(prompt, {
         // Pi invokes this after async input/before_agent_start preflight and
         // immediately before _runAgentPrompt(). Throwing here closes the window

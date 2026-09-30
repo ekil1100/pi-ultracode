@@ -20,6 +20,8 @@ declare global {
     description: string;
     whenToUse?: string;
     phases?: Array<{ title: string; detail?: string; model?: string }>;
+    /** Optional literal task background (e.g. actual goals/acceptance/dependencies), shared with Jev. */
+    [key: string]: unknown;
   }
 
   interface JsonSchema {
@@ -89,6 +91,8 @@ declare global {
    * Run independent tasks concurrently; infer values from thunks and represent a
    * branch throw as null. Workflow-wide cancellation/policy failures propagate and are
    * not downgraded to null. The whole panel reserves agent slots before any branch starts.
+   * Agent calls issued during synchronous thunk launch share a Jev effort batch;
+   * calls after an await are classified when ready, without waiting for future work.
    */
   function parallel<T = string>(thunks: Array<() => T | Promise<T>>, options?: WorkflowParallelOptions): Promise<Array<Awaited<T> | null>>;
 
@@ -96,6 +100,8 @@ declare global {
    * Fan items through sequential stages. A stage input can be null when a prior
    * stage (including agent()) returned null; an ordinary throwing item branch ends as null.
    * Workflow-wide cancellation and policy failures propagate and are not downgraded to null.
+   * Synchronously launched agent calls share a Jev effort batch. Later stages stay
+   * independent: a ready item never waits for a slow sibling to enter its stage.
    */
   function pipeline<TItem = unknown, TResult = string>(
     items: TItem[],

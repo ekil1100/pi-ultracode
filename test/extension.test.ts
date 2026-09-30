@@ -95,6 +95,8 @@ async function runPromptHooks(
     shortcuts: new Map(),
   }], createExtensionRuntime(), process.cwd(), SessionManager.inMemory(), {
     getAvailable: () => modelContext.models ?? [],
+    getAvailableOfType: () => { throw new Error("Prompt hooks must not check classifiers"); },
+    classify: () => { throw new Error("Prompt hooks must not classify"); },
   } as unknown as ModelRegistry);
   runner.bindCore({ getThinkingLevel: () => state.thinking } as any, {
     getModel: () => modelContext.model,
@@ -161,6 +163,11 @@ test("extension registers the workflow tool, commands, and flag", () => {
   assert.equal(state.tools.length, 1);
   assert.equal(state.tools[0].name, "workflow");
   const removedParameter = "bud" + "get";
+  assert.equal(state.tools[0].exposure, "model-only");
+  assert.deepEqual(state.tools[0].annotations, {
+    readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true,
+  });
+  assert.equal(state.tools[0].outputSchema, undefined);
   assert.equal(state.tools[0].parameters.additionalProperties, false, "workflow tool schema rejects removed and unknown parameters");
   assert.equal(removedParameter in state.tools[0].parameters.properties, false, "workflow tool schema no longer exposes the removed parameter");
   assert.equal(state.tools[0].parameters.properties.maxAgents?.minimum, 1);
@@ -1839,12 +1846,6 @@ test("workflow tool rejects invalid maxAgents before artifacts", async () => {
 
 
 test("Pi ExtensionRunner always injects parent depth routing without network requests", async (t) => {
-  const previous = process.env.TYPESAFE_API_KEY;
-  process.env.TYPESAFE_API_KEY = "test-depth-key";
-  t.after(() => {
-    if (previous === undefined) delete process.env.TYPESAFE_API_KEY;
-    else process.env.TYPESAFE_API_KEY = previous;
-  });
   const fetch = t.mock.method(globalThis, "fetch", async () => {
     throw new Error("Depth selection must not use the network");
   });

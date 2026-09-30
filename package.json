@@ -50,23 +50,22 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@typesafe-ai/sdk": "^0.6.0",
     "acorn": "^8.11.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "^0.86.0",
-    "@earendil-works/pi-ai": "^0.86.0",
-    "@earendil-works/pi-coding-agent": "^0.86.0",
-    "@earendil-works/pi-tui": "^0.86.0",
+    "@earendil-works/pi-agent-core": "^0.99.1",
+    "@earendil-works/pi-ai": "^0.99.1",
+    "@earendil-works/pi-coding-agent": "^0.99.1",
+    "@earendil-works/pi-tui": "^0.99.1",
     "@types/node": "^24.12.4",
     "typebox": "1.3.7",
     "typescript": "^5.9.3"
   },
   "peerDependencies": {
-    "@earendil-works/pi-agent-core": "*",
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": ">=0.86.0",
-    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-agent-core": ">=0.99.1",
+    "@earendil-works/pi-ai": ">=0.99.1",
+    "@earendil-works/pi-coding-agent": ">=0.99.1",
+    "@earendil-works/pi-tui": ">=0.99.1",
     "typebox": "*"
   },
   "peerDependenciesMeta": {

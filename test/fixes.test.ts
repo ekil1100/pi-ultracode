@@ -6,6 +6,8 @@ import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createAgentSession, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
   WorkflowAgentRunner,
   createWorkflowChildResourceLoader,
@@ -224,14 +226,48 @@ test("workflow child resources exclude ambient orchestrators without dropping or
     fs.writeFileSync(path.join(cwd, ".pi", "SYSTEM.md"), "UNTRUSTED PROJECT SYSTEM\n");
     delete (globalThis as Record<string, unknown>)[marker];
 
-    const loader = await createWorkflowChildResourceLoader({ cwd, agentDir, projectTrusted: false });
+    const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+    const loader = await createWorkflowChildResourceLoader({ cwd, agentDir, projectTrusted: false, settingsManager });
 
     assert.equal(
       (globalThis as Record<string, unknown>)[marker],
       undefined,
       "ambient extension factories must never run in workflow children",
     );
-    assert.deepEqual(loader.getExtensions().extensions, []);
+    assert.equal(loader.getExtensions().extensions.length, 1, "only the explicit codemode extension loads");
+    assert.deepEqual(loader.getExtensions().errors, []);
+    const modelRuntime = await ModelRuntime.create({
+      credentials: new InMemoryCredentialStore(), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false,
+    });
+    for (const tools of [undefined, ["read"]]) {
+      const { session } = await createAgentSession({
+        cwd, agentDir, resourceLoader: loader, settingsManager, modelRuntime,
+        sessionManager: SessionManager.inMemory(cwd), tools,
+        excludeTools: ["workflow", "subagent", "subagent_wait"],
+      });
+      try {
+        const active = session.getActiveToolNames();
+        assert.equal(active.includes("codemode"), tools === undefined, "explicit tool allowlists remain authoritative");
+        assert.ok(active.includes("read"));
+        for (const name of ["workflow", "subagent", "subagent_wait"]) assert.equal(active.includes(name), false);
+        if (!tools) {
+          const codemode = session.agent.state.tools.find((tool) => tool.name === "codemode")!;
+          const args = { code: 'console.log(await tools.read({ path: "AGENTS.md" })); console.log(typeof tools.workflow, typeof models);' };
+          session.agent.state.messages.push({
+            role: "assistant", api: "openai-responses", provider: "openai", model: "test",
+            content: [{ type: "toolCall", id: "codemode-probe", name: "codemode", arguments: args }],
+            stopReason: "toolUse", timestamp: 0,
+            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+          });
+          const result = await codemode.execute("codemode-probe", args);
+          assert.match(JSON.stringify(result.content), /Project child context/);
+          assert.match(JSON.stringify(result.content), /undefined undefined/);
+        }
+      } finally {
+        session.dispose();
+      }
+    }
     assert.equal(loader.getSystemPrompt(), undefined, "untrusted project system prompts stay hidden");
     const skillNames = loader.getSkills().skills.map((skill) => skill.name);
     assert.ok(skillNames.includes("ordinary"), "ordinary user skills remain available");

@@ -23,7 +23,7 @@ import {
   WORKFLOW_LOG_OMITTED_TEXT,
   runWorkflow,
 } from "./runtime.ts";
-import type { ModelRuntimeLike, ThinkingLevel } from "./agent-runner.ts";
+import type { AgentRunner, ModelRuntimeLike, ThinkingLevel } from "./agent-runner.ts";
 import { RunJournal, hashString, type JournalAgentRecord } from "./journal.ts";
 import { WorkflowRegistry } from "./registry.ts";
 import { normalizeMaxAgents } from "./admission.ts";
@@ -99,8 +99,8 @@ export interface WorkflowToolDeps {
   getThinkingLevel?: () => ThinkingLevel | undefined;
   /** Optional execution gate for mode-scoped registrations. Omit for standalone use. */
   isExecutionAllowed?: () => boolean;
-  /** Test seam: inject a subagent runner so the tool path can run without a model. */
-  testRunner?: { run: (call: any) => Promise<any> };
+  /** Test seam: inject a runner using the same scheduling contract as the runtime. */
+  testRunner?: AgentRunner;
   /** Test seam: override the workflow runtime (lets tests capture the options,
    *  including the forwarded thinkingLevel, without spinning up real subagents). */
   runWorkflowFn?: typeof runWorkflow;
@@ -124,6 +124,13 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
   const registry = deps.registry ?? new WorkflowRegistry();
   return defineTool({
     name: "workflow",
+    exposure: "model-only",
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
     label: "Workflow",
     description: WORKFLOW_TOOL_DESCRIPTION,
     promptSnippet: WORKFLOW_PROMPT_SNIPPET,

@@ -12,6 +12,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { JsonObject } from "@earendil-works/pi-ai";
+import { createJevBatch } from "../jev.ts";
 import { parseWorkflowScript, type WorkflowMeta } from "./parser.ts";
 import { executeWorkflowScript, type ScriptExecutorHost } from "./script-executor.ts";
 import {
@@ -26,12 +28,13 @@ import {
   type PanelReservation,
 } from "./admission.ts";
 // Static import: a dynamic import() of this module misbehaves under Pi's jiti
-// loader ("WorkflowAgentRunner is not a constructor"). Tests inject a runner, so
-// they never construct this class; production builds it via getRunner().
+// loader ("WorkflowAgentRunner is not a constructor"). getRunner() constructs the
+// default runner unless the host injects one.
 import { resolveModelSelection, WorkflowAgentRunner } from "./agent-runner.ts";
 import type {
   AgentActivityInput,
   AgentRunResult,
+  AgentRunner,
   AgentTelemetryEvent,
   AgentUsage,
   ModelLike,
@@ -107,14 +110,14 @@ export interface WorkflowRunOptions {
   hostCallLimit?: number;
   /** Internal test seam for the script Worker's V8 old-generation heap cap. */
   workerMemoryLimitMb?: number;
-  /** Synchronous extension facade used for model selection. */
+  /** Host registry used for model selection and native classification/auth. */
   modelRegistry?: ModelRegistryLike;
   /** Canonical model/auth runtime shared across child sessions. */
   modelRuntime?: ModelRuntimeLike;
   model?: ModelLike;
   thinkingLevel?: ThinkingLevel;
-  /** Inject a runner (tests). */
-  runner?: { run: WorkflowAgentRunner["run"] };
+  /** Inject a runner; scheduling-aware wrappers must declare supportsSchedulingHooks. */
+  runner?: AgentRunner;
   journal?: RunJournal;
   /** Loads a saved workflow body by name; defaults to disk discovery. */
   loadSavedWorkflow?: (name: string) => { meta: WorkflowMeta; body: string };
@@ -169,6 +172,17 @@ interface ActivePanelTrace {
   calls: Array<{ callPath: string; status: "pending" | "success" | "failed" }>;
 }
 
+interface AgentPayload {
+  callPath?: unknown;
+  prompt: unknown;
+  options?: unknown;
+  assignedPhase?: string;
+  workflowPath?: string[];
+  workflowContext?: JsonObject;
+  scheduling?: JsonObject[];
+  reservationIds?: string[];
+}
+
 interface RuntimeState {
   currentPhase?: string;
   logs: string[];
@@ -208,7 +222,7 @@ export async function runWorkflow<T = unknown>(
   const started = Date.now();
   const maxAgents = normalizeMaxAgents(options.maxAgents ?? options.journal?.effectiveMaxAgents);
   const { meta, body } = parseWorkflowScript(rawScript);
-  const runtime = new Runtime(effectiveOptions, maxAgents);
+  const runtime = new Runtime(effectiveOptions, maxAgents, meta);
   const onOuterAbort = () => runtime.abort();
   options.signal?.addEventListener("abort", onOuterAbort, { once: true });
   if (options.signal?.aborted) runtime.abort();
@@ -261,9 +275,10 @@ class Runtime implements ScriptExecutorHost {
   readonly state: RuntimeState;
   private readonly options: WorkflowRunOptions;
   private readonly cwd: string;
-  private runnerInstance: { run: WorkflowAgentRunner["run"] } | undefined;
+  private runnerInstance: AgentRunner | undefined;
   private readonly agentTypes: Map<string, AgentTypeDef>;
-  private readonly limiter: <R>(fn: () => Promise<R>) => Promise<R>;
+  private readonly acquireExecution: () => Promise<() => void>;
+  private readonly workflowContext: JsonObject;
   private readonly pending = new Set<Promise<unknown>>();
   private readonly childController = new AbortController();
   private readonly scriptController = new AbortController();
@@ -275,7 +290,8 @@ class Runtime implements ScriptExecutorHost {
   private cleanupDeadline?: number;
   policyError: WorkflowPolicyError | undefined;
 
-  constructor(options: WorkflowRunOptions, maxAgents: number) {
+  constructor(options: WorkflowRunOptions, maxAgents: number, meta: WorkflowMeta) {
+    this.workflowContext = JSON.parse(JSON.stringify({ meta, args: options.args }));
     this.options = options;
     this.cwd = options.cwd ?? process.cwd();
     this.runnerInstance = options.runner;
@@ -294,7 +310,7 @@ class Runtime implements ScriptExecutorHost {
     const cores = (globalThis as any).navigator?.hardwareConcurrency ?? os.cpus().length ?? 8;
     const defaultConcurrency = Math.max(1, Math.min(Math.max(1, cores - 2), MAX_CONCURRENCY));
     const concurrency = normalizeConcurrency(options.concurrency, defaultConcurrency);
-    this.limiter = createLimiter(concurrency, this.childController.signal);
+    this.acquireExecution = createExecutionSemaphore(concurrency, this.childController.signal);
   }
 
   get agentsUsed(): number {
@@ -333,7 +349,7 @@ class Runtime implements ScriptExecutorHost {
   }
 
   /** Lazily construct the default in-memory runner (skipped when a runner is injected). */
-  private getRunner(): { run: WorkflowAgentRunner["run"] } {
+  private getRunner(): AgentRunner {
     if (!this.runnerInstance) {
       this.runnerInstance = new WorkflowAgentRunner({
         cwd: this.cwd,
@@ -353,6 +369,7 @@ class Runtime implements ScriptExecutorHost {
       cwd: this.cwd,
       args,
       name,
+      meta: this.workflowContext.meta,
       signal: this.scriptController.signal,
       stallTimeoutMs: this.options.stallTimeoutMs,
       hostCallLimit: this.options.hostCallLimit,
@@ -576,14 +593,17 @@ class Runtime implements ScriptExecutorHost {
     }
   }
 
-  async agent(payload: {
-    callPath?: unknown;
-    prompt: unknown;
-    options?: unknown;
-    assignedPhase?: string;
-    workflowPath?: string[];
-    reservationIds?: string[];
-  }): Promise<unknown> {
+  agent(payload: AgentPayload): Promise<unknown> {
+    return this.agentBatch([payload])[0];
+  }
+
+  agentBatch(payloads: AgentPayload[]): Promise<unknown>[] {
+    const members = createJevBatch(payloads.length, this.workflowContext, this.childController.signal);
+    return payloads.map((payload, index) =>
+      this.runAgent(payload, members[index]).finally(() => members[index].skip()));
+  }
+
+  private async runAgent(payload: AgentPayload, member: ReturnType<typeof createJevBatch>[number]): Promise<unknown> {
     this.throwIfAborted();
     const workerCallPath = requireString(payload.callPath, "agent callPath");
     if (this.seenCallPaths.has(workerCallPath)) {
@@ -702,7 +722,8 @@ class Runtime implements ScriptExecutorHost {
     }
 
     this.beginPanelAgent(callPath);
-    const run = this.limiter(async () => {
+    const run = (async () => {
+      let releaseExecution: (() => void) | undefined;
       this.notifyObserver(() => this.options.onAgentStart?.({
         id,
         callPath,
@@ -723,11 +744,22 @@ class Runtime implements ScriptExecutorHost {
       let observedUsage: AgentUsage | undefined;
       try {
         this.throwIfAborted();
+        const runner = this.getRunner();
+        let executionPermit: Promise<() => void> | undefined;
+        const acquireExecution = async () => {
+          // Forwarding runners can re-enter while acquisition is pending or complete.
+          releaseExecution = await (executionPermit ??= this.acquireExecution());
+          this.throwIfAborted();
+        };
+        // Only declared scheduling-aware runners prepare/classify before admission.
+        if (!runner.supportsSchedulingHooks) {
+          member.skip();
+          await acquireExecution();
+        }
         if (opts.isolation === "worktree") {
           worktree = this.createIsolatedWorktree(id);
         }
 
-        const runner = this.getRunner();
         const onActivity: ((e: AgentActivityInput) => void) | undefined = this.options.onAgentActivity
           ? (e: AgentActivityInput) =>
               this.options.onAgentActivity!({ id, callPath, label, phase: assignedPhase, workflowPath, ...e })
@@ -742,6 +774,25 @@ class Runtime implements ScriptExecutorHost {
           label,
           schema: opts.schema,
           signal: this.childController.signal,
+          ...(runner.supportsSchedulingHooks ? {
+            acquireExecution,
+            selectEffort: (task) => {
+              if (!task) {
+                member.skip();
+                return Promise.resolve(undefined);
+              }
+              return member.select({
+                ...task,
+                context: {
+                  callPath,
+                  workflowPath,
+                  scheduling: payload.scheduling ?? [],
+                  ...(assignedPhase ? { phase: assignedPhase } : {}),
+                  ...(payload.workflowContext ? { workflow: payload.workflowContext } : {}),
+                },
+              });
+            },
+          } : {}),
           instructions: buildInstructions(assignedPhase, opts),
           modelPattern: opts.model,
           agentTypeDef,
@@ -858,6 +909,7 @@ class Runtime implements ScriptExecutorHost {
         }));
         return null;
       } finally {
+        releaseExecution?.();
         if (worktree && worktreeSettled && !keepWorktree) {
           try {
             removeWorktree(worktree);
@@ -866,7 +918,7 @@ class Runtime implements ScriptExecutorHost {
           }
         }
       }
-    });
+    })();
     this.track(run);
     return await run;
   }
@@ -1224,7 +1276,7 @@ async function raceWithCleanupTimeout(
   }
 }
 
-function createLimiter(limit: number, signal: AbortSignal): <T>(fn: () => Promise<T>) => Promise<T> {
+function createExecutionSemaphore(limit: number, signal: AbortSignal): () => Promise<() => void> {
   let active = 0;
   const queue: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
 
@@ -1258,13 +1310,9 @@ function createLimiter(limit: number, signal: AbortSignal): <T>(fn: () => Promis
     waiter.resolve();
   };
 
-  return async <T>(fn: () => Promise<T>): Promise<T> => {
+  return async () => {
     await acquire();
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    return release;
   };
 }
 

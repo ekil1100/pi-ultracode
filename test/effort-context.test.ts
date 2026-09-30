@@ -87,13 +87,7 @@ test("capability snapshot refreshes registry contents without remote discovery",
   assert.equal(rows(workflowEffortContext(context)).length, 1);
 });
 
-test("three-level parent suffixes execute unchanged without clamping or selection requests", async (t) => {
-  const previousKey = process.env.TYPESAFE_API_KEY;
-  delete process.env.TYPESAFE_API_KEY;
-  t.after(() => {
-    if (previousKey === undefined) delete process.env.TYPESAFE_API_KEY;
-    else process.env.TYPESAFE_API_KEY = previousKey;
-  });
+test("three-level parent suffixes execute unchanged without an available classifier", async (t) => {
   const fetch = t.mock.method(globalThis, "fetch", async () => { throw new Error("Unexpected request"); });
   const allowed = rows(workflowEffortContext({ model: threeLevel }))[0].supportedEfforts as ThinkingLevel[];
   const received: Array<ThinkingLevel | undefined> = [];

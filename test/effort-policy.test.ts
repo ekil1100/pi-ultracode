@@ -64,3 +64,9 @@ test("all depth modes and workflow guidelines inject the same effort policy", ()
     assert.doesNotMatch(prompt, /max only for deep or decisive high-risk verification/);
   }
 });
+
+test("Jev policy uses native availability rather than an environment switch", () => {
+  assert.match(policy, /Pi reports typesafe\/jev-latest as an available classifier/);
+  assert.match(policy, /retained if Jev is unavailable or fails/);
+  assert.doesNotMatch(policy, /TYPESAFE_API_KEY/);
+});

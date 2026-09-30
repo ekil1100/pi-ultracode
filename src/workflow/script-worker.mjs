@@ -15,6 +15,7 @@ let nextRpcId = 0;
 let checkpointCount = 0;
 let hostCallCount = 0;
 let stickyFatalError;
+let launchingAgents;
 const rpcWaiters = new Map();
 const orchestrationPromises = new Set();
 const executionContext = new AsyncLocalStorage();
@@ -48,7 +49,7 @@ runRoot().catch((error) => finish(false, undefined, error));
 
 async function runRoot() {
   const rootName = typeof workerData.name === "string" && workerData.name ? workerData.name : "workflow";
-  const result = await executeBody(workerData.body, workerData.args, 0, rootName);
+  const result = await executeBody(workerData.body, workerData.args, 0, rootName, "$", workerData.meta);
   if (stickyFatalError) throw stickyFatalError;
   const unobserved = [...orchestrationPromises].filter((record) => !record.observed);
   if (unobserved.length > 0) {
@@ -65,12 +66,14 @@ async function runRoot() {
   finish(true, result);
 }
 
-async function executeBody(body, bodyArgs, depth, name, scopePath = "$") {
+async function executeBody(body, bodyArgs, depth, name, scopePath = "$", meta) {
   throwIfAborted();
   const parent = executionContext.getStore();
   const context = createExecutionScope({
     workflowPath: [...(parent?.workflowPath ?? []), name || `workflow-${depth}`],
     depth,
+    workflowContext: { meta, args: bodyArgs },
+    scheduling: parent?.scheduling,
     currentPhase: parent?.currentPhase,
     reservationIds: Array.isArray(parent?.reservationIds) ? [...parent.reservationIds] : [],
     scopePath,
@@ -277,6 +280,8 @@ async function agentImpl(callSite, prompt, options = {}) {
     options: opts,
     assignedPhase,
     workflowPath: execution.workflowPath ?? [],
+    workflowContext: execution.depth > 0 ? execution.workflowContext : undefined,
+    scheduling: execution.scheduling,
     reservationIds: Array.isArray(execution.reservationIds) ? execution.reservationIds : [],
   });
 }
@@ -323,11 +328,15 @@ async function parallelImpl(callSite, thunks, options = {}) {
   let firstFatal;
   const branchOutcomes = Array.from({ length: plannedThunks.length }, () => "pending");
   try {
-    const branchPromises = plannedThunks.map(async (thunk, index) => {
+    const branchPromises = collectAgentBatch(() => plannedThunks.map(async (thunk, index) => {
       const branchReservationId = branchReservationIds[index];
       const childContext = createExecutionScope({
         workflowPath: [...(execution.workflowPath ?? [])],
         depth: execution.depth,
+        workflowContext: execution.workflowContext,
+        scheduling: [...execution.scheduling, {
+          kind: "parallel", callPath: panelCallPath, branchIndex: index, branchCount: plannedThunks.length,
+        }],
         currentPhase: execution.currentPhase,
         reservationIds: [branchReservationId, panelReservationId].filter(Boolean),
         scopePath: `${panelCallPath}/b:${index}`,
@@ -361,7 +370,7 @@ async function parallelImpl(callSite, thunks, options = {}) {
           await cleanupRpc("releasePanel", { reservationId: branchReservationId }).catch(() => undefined);
         }
       });
-    });
+    }));
     const settled = await Promise.allSettled(branchPromises);
     if (firstFatal) throw firstFatal;
     const rejected = settled.find((entry) => entry.status === "rejected");
@@ -397,7 +406,7 @@ async function pipelineImpl(callSite, items, ...stages) {
   }
   const execution = executionContext.getStore() ?? createExecutionScope({ scopePath: "$" });
   const pipelineCallPath = allocateCallPath(execution, "pipeline", "l", callSite);
-  return await Promise.all(plannedItems.map(async (item, index) => {
+  return await Promise.all(collectAgentBatch(() => plannedItems.map(async (item, index) => {
     let value = item;
     for (const [stageIndex, stage] of stages.entries()) {
       try {
@@ -405,6 +414,11 @@ async function pipelineImpl(callSite, items, ...stages) {
         const stageContext = createExecutionScope({
           workflowPath: [...(execution.workflowPath ?? [])],
           depth: execution.depth,
+          workflowContext: execution.workflowContext,
+          scheduling: [...execution.scheduling, {
+            kind: "pipeline", callPath: pipelineCallPath, itemIndex: index, itemCount: plannedItems.length,
+            stageIndex, stageCount: stages.length,
+          }],
           currentPhase: execution.currentPhase,
           reservationIds: Array.isArray(execution.reservationIds) ? [...execution.reservationIds] : [],
           scopePath: `${pipelineCallPath}/i:${index}/s:${stageIndex}`,
@@ -419,7 +433,7 @@ async function pipelineImpl(callSite, items, ...stages) {
       }
     }
     return value;
-  }));
+  })));
 }
 
 function copyDenseDataArray(value, label) {
@@ -463,6 +477,7 @@ async function workflowImpl(callSite, nameOrRef, nestedArgs) {
     (execution.depth ?? 0) + 1,
     loaded.meta.name,
     requireString(loaded.callPath, "nested workflow durable callPath"),
+    loaded.meta,
   );
   let outputSnapshot;
   try {
@@ -480,6 +495,8 @@ function createExecutionScope(input) {
     workflowPath: Array.isArray(input.workflowPath) ? input.workflowPath : [],
     depth: Number.isInteger(input.depth) ? input.depth : 0,
     phaseState,
+    workflowContext: input.workflowContext,
+    scheduling: input.scheduling ?? [],
     reservationIds: Array.isArray(input.reservationIds) ? input.reservationIds : [],
     scopePath: typeof input.scopePath === "string" ? input.scopePath : "$",
     counters: Object.create(null),
@@ -514,6 +531,8 @@ function invokeHelper(callSite, fn, thisArg, values) {
   const childContext = createExecutionScope({
     workflowPath: [...(execution.workflowPath ?? [])],
     depth: execution.depth,
+    workflowContext: execution.workflowContext,
+    scheduling: execution.scheduling,
     phaseState: execution.phaseState,
     reservationIds: [...(execution.reservationIds ?? [])],
     scopePath: invocationPath,
@@ -569,8 +588,25 @@ function postRpc(op, payload) {
   const id = ++nextRpcId;
   return new Promise((resolve, reject) => {
     rpcWaiters.set(id, { resolve, reject });
-    parentPort.postMessage({ type: "rpc", id, op, payload });
+    const message = { type: "rpc", id, op, payload };
+    if (op === "agent" && launchingAgents) launchingAgents.push(structuredClone(message));
+    else parentPort.postMessage(message);
   });
+}
+
+/** Seal at the synchronous fan-out boundary, never at a guessed elapsed time.
+ * Calls after an await (including nested workflow/panel loads) form new batches.
+ */
+function collectAgentBatch(launch) {
+  if (launchingAgents) return launch();
+  const calls = [];
+  launchingAgents = calls;
+  try {
+    return launch();
+  } finally {
+    launchingAgents = undefined;
+    if (calls.length) parentPort.postMessage({ type: "agentBatch", calls });
+  }
 }
 
 function consumeHostCall() {

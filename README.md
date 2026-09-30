@@ -29,7 +29,7 @@ pi --ultracode
 
 > `pi-ultracode` registers a tool named `workflow`. If `pi-dynamic-workflows` is installed, remove it first with `pi remove npm:pi-dynamic-workflows`.
 
-**Pi ≥ 0.86.0**
+**Pi ≥ 0.99.1**
 
 ## Core features
 
@@ -89,9 +89,11 @@ Research stops when key claims have direct evidence, no material conflict or unr
 
 ### Parent-selected depth in auto
 
-In `auto`, the parent always chooses `focused`, `standard`, or `deep` in its normal turn using the current task, conversation, and repository evidence, following the shared criteria in `src/depth.ts`. It starts at the shallowest sufficient depth and escalates only when evidence warrants it. No router agent or extra classification request is created, even when `TYPESAFE_API_KEY` is configured.
+In `auto`, the parent always chooses `focused`, `standard`, or `deep` in its normal turn using the current task, conversation, and repository evidence, following the shared criteria in `src/depth.ts`. It starts at the shallowest sufficient depth and escalates only when evidence warrants it. No router agent or extra classification request is created, even when Jev is available in Pi.
 
-`TYPESAFE_API_KEY` enables only the child-effort selector below, including in fixed depth modes. `/ultracode status` and the footer describe the **configured mode**, not a live estimate of the parent's evidence-driven depth.
+Jev availability affects only the child-effort selector below, including in fixed depth modes. `/ultracode status` and the footer describe the **configured mode**, not a live estimate of the parent's evidence-driven depth.
+
+The `workflow` tool uses Pi’s `model-only` exposure: it is declared to the model when active, but cannot be called through codemode or another tool’s `ctx.executeTool()`. Its annotations explicitly declare that it may modify or overwrite files, access external services, and produce additional effects when repeated. These are permission hints, not a sandbox.
 
 ### Child-agent effort
 
@@ -119,13 +121,18 @@ These are task-selection heuristics, not a universal provider capability scale. 
 
 #### Optional Jev selection
 
-Set a nonblank `TYPESAFE_API_KEY` in the environment used to launch Pi to enable Jev. If the key is absent or blank, existing parent-selected suffixes and user/model defaults remain unchanged.
+Jev selection runs automatically when Pi’s native `getAvailableOfType("classifier", "typesafe")` includes `typesafe/jev-latest`. This checks Pi’s credential configuration, not merely catalog presence or remote service health. If Jev is unavailable, no classification request is made and existing parent-selected suffixes and user/model defaults remain unchanged.
 
-- After each child session is created and before execution, `@typesafe-ai/sdk` requests a selection from `jev-1.13.0`, limited to effort levels supported by the **actual child model**. A successful selection overrides the parent-selected effort without changing the execution model, parent session, or global defaults.
-- Selection reuses the criteria in `src/effort-policy.ts`. Requests go to `https://api.typesafe.ai` and include the subtask prompt (role, additional instructions, label, and output requirements), child model identity, and supported levels. No additional repository reads or complete parent conversation history are sent. Enable this only if these task contents may be shared with TypeSafe.
-- Requests have a **10-second timeout and no retries**. Network, service, response-format errors, or unsupported effort selections retain the already-resolved parent selection or default effort. **Fallback does not make an additional model request to reconsider the selection.**
-- User cancellation aborts selection and terminates the subtask rather than executing a fallback task. Models supporting only one level need no Jev request; if the actual model cannot be determined, existing behavior is preserved.
-- The UI reports actual effort. Jev SDK logging is disabled; keys, raw responses, and service error bodies are not logged. Jev selection usage is not included in child execution usage.
+- Ready subtasks in one scheduler batch share **one** Pi-native `modelRuntime` / `modelRegistry.classify()` request to `typesafe/jev-latest`, with one `questions` entry per eligible task. Each question maps to that task’s full prompt, **actual child session model**, and supported effort levels. Answers are applied independently; a successful selection changes neither the execution model nor the parent session or global defaults.
+- Selection reuses `src/effort-policy.ts` and judges each task separately, not the complexity of the whole workflow. Shared background contains the existing workflow `meta` (including name/description and any supplied goal, acceptance criteria, or dependencies) and `args`. Per-task context includes phase, workflow path, known parallel branch/pipeline item-stage structure, and nested workflow metadata/arguments when applicable. Full task prompts include roles, additional instructions, labels, output requirements, and any upstream results already supplied by the script. Missing goals or dependency edges are not invented; no summarization model call, additional repository read, full script, or complete parent conversation is sent. By default, requests go to `https://api.typesafe.ai` through Pi’s provider configuration. Configure Jev in Pi only if these prompts, metadata, and arguments may be shared with TypeSafe; available credentials automatically enable selection.
+- Pi resolves credentials at request time from its runtime credentials, stored credentials, provider configuration, or normal environment sources (including `TYPESAFE_API_KEY`). Ultracode does not read that variable as a switch or pass an explicit `apiKey`, and does not change Pi’s stored credentials. No alternate provider or model is queried.
+- Requests have a **10-second timeout and no retries**. An invalid or unsupported answer exposed by Pi retains only that task’s already-resolved parent selection/default. A request-level error retains every task’s own default. **Pi 0.99.1 limitation:** its TypeSafe adapter discards all answers when any wire answer is missing or malformed; those cases necessarily fall back for the whole batch. Valid wire answers with unsupported choices still fall back independently. **Fallback never makes another model request.**
+- User cancellation aborts selection and terminates the subtasks, including those queued for execution, rather than executing fallback tasks. Cached resume results, models supporting only one level, and unknown actual models are excluded from classification; an entirely excluded batch makes no request.
+- The UI reports actual effort. The selector does not log keys, raw responses, or service error bodies. Jev selection usage is not included in child execution usage.
+
+**Batch boundary:** `parallel()` and `pipeline()` collect calls actually issued while synchronously launching their thunks/items, then seal that batch. No debounce, elapsed-time heuristic, full-script pre-evaluation, or waiting for future tasks is used. Calls after an `await`, nested workflow/panel loads, and later pipeline stages form new batches as they become ready (often a single task); a slow sibling does not block an already-ready later stage. A later explicit fan-out is batched again. This is not one request for an arbitrary lazy JavaScript workflow.
+
+Admission/cache checks still precede live session preparation. Idle child sessions (and isolated worktrees when requested) are prepared before classification so Jev sees actual capabilities; preparation may exceed the execution concurrency count, but remains bounded by lifetime admission. Batch collection/classification never holds an execution semaphore permit. Child execution and result/worktree delivery still obey the configured concurrency (maximum 16), even when a ready batch is larger than that limit.
 
 ## Workflow example
 
@@ -187,7 +194,7 @@ Worktree isolation requires a git repository with at least one commit and fails 
 
 A workflow defaults to `maxAgents: 128`, supports at most 16 concurrent agent calls, and allows one level of nested workflows. Nested `workflow()` calls accept only trust-aware saved-workflow names, not explicit paths. The lifetime agent limit is preserved across resumes; cached replay does not consume it again.
 
-Workflow agent sessions retain project context and ordinary skills, but do not initialize ambient Pi extensions or expose parent orchestration tools and skills (`workflow`, `subagent`, `subagent_wait`, or `pi-subagents`). This keeps orchestration at the parent boundary and allows `pi-ultracode` and `pi-subagents` to coexist in the main session. Project-scoped agents and settings follow Pi's project-trust decision. The built-in Explore and Plan roles have a sealed read-only tool list without shell or write tools.
+Workflow agent sessions retain project context and ordinary skills, but do not initialize ambient Pi extensions or expose parent orchestration tools and skills (`workflow`, `subagent`, `subagent_wait`, or `pi-subagents`). Codemode is explicitly enabled for tool scripting, without its model-call API; explicit role tool allowlists still apply. This keeps orchestration at the parent boundary and allows `pi-ultracode` and `pi-subagents` to coexist in the main session. Project-scoped agents and settings follow Pi's project-trust decision. The built-in Explore and Plan roles have a sealed read-only tool list without shell or write tools.
 
 Resume is intentionally immutable: the normalized script, arguments, canonical repository/relative cwd, project-trust context, agent definitions, effective models, and call structure must still match. Worktree delivery writes a durable recovery intent before changing the shared repository; an interrupted or conflicted delivery blocks automatic replay and reports its recovery patch. Changed work starts a new run.
 

@@ -14,6 +14,8 @@ import {
 
 export interface ScriptExecutorHost {
   agent(payload: any): Promise<unknown>;
+  /** Sealed ready calls; promises settle independently, without a result barrier. */
+  agentBatch?(payloads: any[]): Promise<unknown>[];
   /** Cancel child work after a fatal script policy without terminating branch finally blocks. */
   abortChildren?(error: Error): void;
   reservePanel(payload: {
@@ -43,6 +45,7 @@ export interface ScriptExecutorOptions {
   cwd: string;
   args?: unknown;
   name: string;
+  meta?: unknown;
   signal: AbortSignal;
   checkpointLimit?: number;
   /** Internal test seam: how long the worker may go without a heartbeat. Not a public workflow option. */
@@ -70,6 +73,7 @@ export async function executeWorkflowScript(
       args: options.args,
       cwd: options.cwd,
       name: options.name,
+      meta: options.meta,
       checkpointLimit: options.checkpointLimit ?? DEFAULT_WORKFLOW_CHECKPOINT_LIMIT,
       hostCallLimit: normalizeHostCallLimit(options.hostCallLimit),
     },
@@ -185,14 +189,14 @@ export async function executeWorkflowScript(
           }
           return;
         }
+        if (message.type === "agentBatch") {
+          const calls = message.calls as Array<{ payload: unknown }>;
+          const results = host.agentBatch?.(calls.map((call) => call.payload));
+          for (const [index, call] of calls.entries()) dispatchRpc(call, results?.[index]);
+          return;
+        }
         if (message.type === "rpc") {
-          pendingRpcCount++;
-          lastProgress = Date.now();
-          void handleRpc(message).finally(() => {
-            pendingRpcCount = Math.max(0, pendingRpcCount - 1);
-            lastProgress = Date.now();
-            maybeSettleFatal();
-          });
+          dispatchRpc(message);
           return;
         }
         if (message.type === "result") {
@@ -238,13 +242,23 @@ export async function executeWorkflowScript(
         }
       });
 
-      async function handleRpc(message: any): Promise<void> {
+      function dispatchRpc(message: any, agentResult?: Promise<unknown>): void {
+        pendingRpcCount++;
+        lastProgress = Date.now();
+        void handleRpc(message, agentResult).finally(() => {
+          pendingRpcCount = Math.max(0, pendingRpcCount - 1);
+          lastProgress = Date.now();
+          maybeSettleFatal();
+        });
+      }
+
+      async function handleRpc(message: any, agentResult?: Promise<unknown>): Promise<void> {
         const { id, op, payload } = message;
         try {
           let value: unknown;
           switch (op) {
             case "agent":
-              value = await host.agent(payload);
+              value = await (agentResult ?? host.agent(payload));
               break;
             case "reservePanel":
               value = await host.reservePanel(payload);

@@ -1,20 +1,10 @@
-import { test, type TestContext } from "node:test";
+import { test } from "node:test";
 import assert from "node:assert/strict";
 import extension from "../extensions/ultracode.ts";
 import { ANALYSIS_DEPTHS, DEPTH_CRITERIA, DEPTH_SELECTION_RULES } from "../src/depth.ts";
 import { ULTRACODE_ACTIVE_REMINDER, ultracodeSystemBlock } from "../src/prompts.ts";
 
-function setKey(t: TestContext, key: string | undefined = "test-depth-key") {
-  const previous = process.env.TYPESAFE_API_KEY;
-  if (key === undefined) delete process.env.TYPESAFE_API_KEY;
-  else process.env.TYPESAFE_API_KEY = key;
-  t.after(() => {
-    if (previous === undefined) delete process.env.TYPESAFE_API_KEY;
-    else process.env.TYPESAFE_API_KEY = previous;
-  });
-}
-
-function harness(signal?: AbortSignal) {
+function harness(signal?: AbortSignal, jevAvailable = false) {
   const events = new Map<string, (...args: any[]) => any>();
   const commands = new Map<string, any>();
   const entries: any[] = [];
@@ -33,6 +23,11 @@ function harness(signal?: AbortSignal) {
   extension(pi, { preferences: { getDefaultEnabled: () => false, setDefaultEnabled: () => {} } });
   const ctx: any = {
     cwd: process.cwd(), signal, hasUI: false,
+    modelRegistry: {
+      getAvailable: () => [],
+      getAvailableOfType: async () => jevAvailable ? [{ type: "classifier", provider: "typesafe", id: "jev-latest" }] : [],
+      classify: async () => { throw new Error("Depth selection must not classify"); },
+    },
     sessionManager: { getBranch: () => entries },
     ui: { notify: (message: string) => notifications.push(message), setStatus: () => {}, theme: { fg: (_: string, value: string) => value } },
   };
@@ -46,14 +41,14 @@ function harness(signal?: AbortSignal) {
   return { emit, command, start, entries, notifications, ctx, commands, activeTools: () => activeTools };
 }
 
-for (const key of [undefined, "", " \n ", "  test-depth-key  "]) {
-  test(`auto always uses parent routing without network requests: ${JSON.stringify(key)}`, async (t) => {
-    setKey(t, key ?? "");
-    if (key === undefined) delete process.env.TYPESAFE_API_KEY;
+for (const jevAvailable of [false, true]) {
+  test(`auto uses parent routing regardless of native Jev availability: ${jevAvailable}`, async (t) => {
     const fetch = t.mock.method(globalThis, "fetch", async () => {
       throw new Error("Depth selection must not use the network");
     });
-    const h = harness();
+    const h = harness(undefined, jevAvailable);
+    const available = t.mock.method(h.ctx.modelRegistry, "getAvailableOfType");
+    const classify = t.mock.method(h.ctx.modelRegistry, "classify");
     await h.command("auto");
     for (const prompt of ["Investigate interacting invariants", "Fix a typo", "What about that?", "   "]) {
       const turn = h.start(prompt);
@@ -69,16 +64,17 @@ for (const key of [undefined, "", " \n ", "  test-depth-key  "]) {
       assert.equal(fetch.mock.callCount(), 0);
     }
     assert.deepEqual(h.entries.at(-1).data, { mode: "auto" });
+    assert.equal(available.mock.callCount(), 0);
+    assert.equal(classify.mock.callCount(), 0);
   });
 }
 
 for (const mode of ["off", ...ANALYSIS_DEPTHS]) {
   test(`${mode} never requests depth selection or overrides the fixed policy`, async (t) => {
-    setKey(t);
     const fetch = t.mock.method(globalThis, "fetch", async () => {
       throw new Error("Depth selection must not use the network");
     });
-    const h = harness();
+    const h = harness(undefined, true);
     await h.command(mode);
     const turn = h.start();
     await turn.pending;
