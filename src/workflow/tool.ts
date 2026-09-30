@@ -14,7 +14,7 @@ import {
   WORKFLOW_PROMPT_SNIPPET,
   WORKFLOW_TOOL_DESCRIPTION,
 } from "../prompts.ts";
-import { redactCommand, safeDisplayText } from "./display-text.ts";
+import { DISPLAY_INPUT_LIMIT, redactCommand, safeDisplayText, safeTranscriptText } from "./display-text.ts";
 import { parseWorkflowScript, normalizeScript } from "./parser.ts";
 import {
   ABSOLUTE_MAX_AGENTS,
@@ -603,8 +603,14 @@ export function createWorkflowTool(deps: WorkflowToolDeps = {}): ToolDefinition<
         signal?.removeEventListener("abort", onOuterAbort);
       }
     },
-    renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("workflow")), 0, 0);
+    renderCall(args, theme) {
+      const title = theme.fg("toolTitle", theme.bold("workflow"));
+      // Arguments arrive incrementally; display source without parsing incomplete JavaScript.
+      if (typeof args.script === "string" && args.script.length > 0) {
+        return new Text(`${title}\n${theme.fg("toolOutput", safeTranscriptText(args.script, DISPLAY_INPUT_LIMIT))}`, 0, 0);
+      }
+      const source = args.scriptPath || args.name;
+      return new Text(source ? `${title} ${theme.fg("muted", safeDisplayText(source, 240))}` : title, 0, 0);
     },
     renderResult(result, { isPartial, expanded }, theme) {
       const snapshot = result.details as WorkflowSnapshot | undefined;
