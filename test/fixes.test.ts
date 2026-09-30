@@ -285,6 +285,53 @@ test("workflow child resources exclude ambient orchestrators without dropping or
   }
 });
 
+test("workflow children load configured safety extensions while ambient extensions stay disabled", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-child-safety-"));
+  const cwd = path.join(root, "project");
+  const agentDir = path.join(root, "agent");
+  const safetyPath = path.join(root, "safety.ts");
+  const ambientMarker = "__ultracodeAmbientSafetyProbe";
+  const safetyMarker = "__ultracodeChildSafetyProbe";
+  const configure = (childExtensions: unknown) => fs.writeFileSync(
+    path.join(agentDir, "ultracode.json"),
+    JSON.stringify({ childExtensions }),
+  );
+
+  try {
+    fs.mkdirSync(path.join(agentDir, "extensions"), { recursive: true });
+    fs.mkdirSync(cwd, { recursive: true });
+    fs.writeFileSync(
+      path.join(agentDir, "extensions", "ambient.ts"),
+      `export default function () { globalThis.${ambientMarker} = true; }\n`,
+    );
+    fs.writeFileSync(safetyPath, `export default function () { globalThis.${safetyMarker} = true; }\n`);
+    configure([safetyPath]);
+
+    const loader = await createWorkflowChildResourceLoader({ cwd, agentDir });
+
+    assert.equal((globalThis as Record<string, unknown>)[safetyMarker], true);
+    assert.equal((globalThis as Record<string, unknown>)[ambientMarker], undefined);
+    const loaded = loader.getExtensions().extensions.map((extension) => extension.resolvedPath);
+    assert.equal(loaded.length, 2, "only the explicit codemode extension and the configured one load");
+    assert.ok(loaded.includes(safetyPath));
+
+    configure([path.join(root, "missing.ts")]);
+    await assert.rejects(
+      createWorkflowChildResourceLoader({ cwd, agentDir }),
+      /configured workflow child extension failed to load/,
+    );
+    configure(["relative.ts"]);
+    await assert.rejects(
+      createWorkflowChildResourceLoader({ cwd, agentDir }),
+      /childExtensions must be an array of absolute paths/,
+    );
+  } finally {
+    delete (globalThis as Record<string, unknown>)[ambientMarker];
+    delete (globalThis as Record<string, unknown>)[safetyMarker];
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("WorkflowAgentRunner separates execution cwd from project resource discovery", async () => {
   const project = fs.mkdtempSync(path.join(os.tmpdir(), "uc-resource-project-"));
   const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "uc-resource-isolated-"));

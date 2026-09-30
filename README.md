@@ -194,7 +194,15 @@ Worktree isolation requires a git repository with at least one commit and fails 
 
 A workflow defaults to `maxAgents: 128`, supports at most 16 concurrent agent calls, and allows one level of nested workflows. Nested `workflow()` calls accept only trust-aware saved-workflow names, not explicit paths. The lifetime agent limit is preserved across resumes; cached replay does not consume it again.
 
-Workflow agent sessions retain project context and ordinary skills, but do not initialize ambient Pi extensions or expose parent orchestration tools and skills (`workflow`, `subagent`, `subagent_wait`, or `pi-subagents`). Codemode is explicitly enabled for tool scripting, without its model-call API; explicit role tool allowlists still apply. This keeps orchestration at the parent boundary and allows `pi-ultracode` and `pi-subagents` to coexist in the main session. Project-scoped agents and settings follow Pi's project-trust decision. The built-in Explore and Plan roles have a sealed read-only tool list without shell or write tools.
+Workflow agent sessions retain project context and ordinary skills, but do not initialize ambient Pi extensions or expose parent orchestration tools and skills (`workflow`, `subagent`, `subagent_wait`, or `pi-subagents`). Codemode is explicitly enabled for tool scripting, without its model-call API; explicit role tool allowlists still apply. This keeps orchestration at the parent boundary and allows `pi-ultracode` and `pi-subagents` to coexist in the main session.
+
+A parent's guard extensions therefore do not see child tool calls or provider requests. To keep a guard in force, list it in `~/.pi/agent/ultracode.json` (under the active agent directory):
+
+```json
+{ "childExtensions": ["/absolute/path/to/guard.ts"] }
+```
+
+Every child loads those extensions and nothing else from the ambient set. A child does not start if one fails to load or the setting is not an array of absolute paths. Project-scoped agents and settings follow Pi's project-trust decision. The built-in Explore and Plan roles have a sealed read-only tool list without shell or write tools.
 
 Resume is intentionally immutable: the normalized script, arguments, canonical repository/relative cwd, project-trust context, agent definitions, effective models, and call structure must still match. Worktree delivery writes a durable recovery intent before changing the shared repository; an interrupted or conflicted delivery blocks automatic replay and reports its recovery patch. Changed work starts a new run.
 

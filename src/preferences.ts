@@ -1,7 +1,7 @@
 /** Global Ultracode startup preferences, separate from Pi's own settings. */
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export interface UltracodePreferenceStore {
@@ -18,6 +18,16 @@ export class UltracodePreferences implements UltracodePreferenceStore {
 
   getDefaultEnabled(): boolean {
     return this.read().defaultEnabled === true;
+  }
+
+  /** Extensions every workflow child must load, such as provider-boundary guards. */
+  getChildExtensions(): string[] {
+    const value = this.read().childExtensions;
+    if (value === undefined) return [];
+    if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && isAbsolute(item))) {
+      throw new Error(`Invalid Ultracode preferences in ${this.path}: childExtensions must be an array of absolute paths.`);
+    }
+    return value;
   }
 
   setDefaultEnabled(enabled: boolean): void {

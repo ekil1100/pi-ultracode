@@ -45,6 +45,7 @@ import {
 } from "../thinking.ts";
 import type { AgentTypeDef } from "./agent-types.ts";
 import { selectJevEfforts, type JevRuntime, type JevSelection } from "../jev.ts";
+import { UltracodePreferences } from "../preferences.ts";
 
 export type { ThinkingLevel } from "../thinking.ts";
 
@@ -65,6 +66,8 @@ export interface WorkflowChildResourceLoaderOptions {
  * loaded extension result is too late: another in-process orchestrator may have
  * already replaced process-global lifecycle state. Disable ambient extensions at
  * the loader boundary while retaining project context and ordinary skills.
+ * Extensions named by `childExtensions` in ultracode.json still load, and a child
+ * never starts without them: they are how a host keeps provider/tool guards in force.
  */
 export async function createWorkflowChildResourceLoader(
   options: WorkflowChildResourceLoaderOptions,
@@ -73,12 +76,14 @@ export async function createWorkflowChildResourceLoader(
     ?? SettingsManager.create(options.cwd, options.agentDir, {
       projectTrusted: options.projectTrusted ?? false,
     });
+  const childExtensions = new UltracodePreferences(path.join(options.agentDir, "ultracode.json")).getChildExtensions();
   const loader = new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir: options.agentDir,
     settingsManager,
     noExtensions: true,
     extensionFactories: [createCodemodeExtension({ mode: "on", models: false })],
+    additionalExtensionPaths: childExtensions,
     skillsOverride: ({ skills, diagnostics }) => ({
       skills: skills.filter((skill) => !PARENT_ONLY_CHILD_SKILLS.has(skill.name)),
       diagnostics,
@@ -88,6 +93,13 @@ export async function createWorkflowChildResourceLoader(
   settingsManager.applyOverrides({
     defaultTools: [...(settingsManager.getDefaultTools() ?? []), "+codemode"],
   });
+  const { extensions, errors } = loader.getExtensions();
+  const loaded = new Set(extensions.map((extension) => extension.resolvedPath));
+  const missing = childExtensions.filter((extensionPath) => !loaded.has(extensionPath));
+  if (errors.length > 0 || missing.length > 0) {
+    const failures = [...errors.map((error) => `${error.path}: ${error.error}`), ...missing];
+    throw new Error(`configured workflow child extension failed to load: ${failures.join("; ")}`);
+  }
   return loader;
 }
 
