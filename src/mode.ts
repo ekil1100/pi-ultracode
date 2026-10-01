@@ -200,8 +200,8 @@ export class UltracodeMode {
     sections.ultracode = `${ultracodeSystemBlock(this.mode)}\n\n${ULTRACODE_ACTIVE_REMINDER}`;
   }
 
-  statusLine(styleLabel: (label: string) => string = (label) => label): string {
-    return [styleLabel("ultracode"), this.mode].join(" · ");
+  statusLine(style: (text: string, color: "accent" | "dim") => string = (text) => text): string {
+    return [style("ultracode", "accent"), style(this.mode, "dim")].join(" · ");
   }
 
   isEnforcing(): boolean {

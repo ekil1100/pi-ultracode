@@ -347,7 +347,7 @@ test("/ultracode modes leave parent effort user-controlled and inject their poli
 
   await command.handler("", ctx);
   assert.equal(state.thinking, "low");
-  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · auto");
+  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · <dim>auto</dim>");
   assert.equal(state.activeTools.includes("workflow"), true);
   assert.ok(notifications.some((n) => /Ultracode auto/.test(n.m)));
 
@@ -355,7 +355,7 @@ test("/ultracode modes leave parent effort user-controlled and inject their poli
     state.thinking = selected === "deep" ? "max" : "minimal";
     await command.handler(selected, ctx);
     assert.equal(state.thinking, selected === "deep" ? "max" : "minimal");
-    assert.equal(state.statuses.ultracode, `<accent>ultracode</accent> · ${selected}`);
+    assert.equal(state.statuses.ultracode, `<accent>ultracode</accent> · <dim>${selected}</dim>`);
   }
 
   const last = state.entries.filter((e) => e.customType === "ultracode-mode").pop();
@@ -428,7 +428,7 @@ test("mode state is restored from persisted entries on a fresh load", async () =
   await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
   assert.equal(state.thinking, "medium");
   assert.equal(state.activeTools.includes("workflow"), true);
-  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · deep");
+  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · <dim>deep</dim>");
   assert.doesNotMatch(String(state.statuses.ultracode), /budgetTotal|250000|250_000/i);
   // before_agent_start injects the migrated deep policy without the legacy token budget.
   const result = await runPromptHooks(state);
@@ -488,7 +488,7 @@ test("session_tree rehydrates branch-local Ultracode state", async () => {
   await state.events.get("session_tree")![0]({ newLeafId: "enabled", oldLeafId: null }, ctx);
   assert.equal(state.thinking, "medium");
   assert.equal(state.activeTools.includes("workflow"), true);
-  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · deep");
+  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · <dim>deep</dim>");
   const restored = await runPromptHooks(state);
   assert.ok(restored?.systemPrompt.includes("<ultracode>"));
 });
@@ -499,7 +499,7 @@ test("--ultracode flag enables auto mode at session_start", async () => {
   const { ctx } = makeCtx(state);
   await state.events.get("session_start")![0]({ reason: "startup" }, ctx);
   assert.equal(state.thinking, "medium");
-  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · auto");
+  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · <dim>auto</dim>");
   assert.equal(state.activeTools.includes("workflow"), true);
 });
 
@@ -518,7 +518,7 @@ test("/ultracode default on enables the current session and persists across exte
   assert.match(notifications.at(-1)!.m, /default on \(auto\).*current session: auto/);
   assert.deepEqual(state.entries.at(-1).data, { mode: "auto" });
   assert.equal(state.activeTools.includes("workflow"), true);
-  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · auto");
+  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · <dim>auto</dim>");
   assert.equal(state.thinking, "medium");
   const currentTurn = await runPromptHooks(state);
   assert.match(currentTurn.systemPrompt, /Configured mode: auto/);
@@ -528,7 +528,7 @@ test("/ultracode default on enables the current session and persists across exte
   const nextCtx = makeCtx(next.state).ctx;
   nextCtx.cwd = dir;
   await next.state.events.get("session_start")![0]({ reason: "new" }, nextCtx);
-  assert.equal(next.state.statuses.ultracode, "<accent>ultracode</accent> · auto");
+  assert.equal(next.state.statuses.ultracode, "<accent>ultracode</accent> · <dim>auto</dim>");
   assert.equal(next.state.activeTools.includes("workflow"), true);
   assert.equal(next.state.thinking, "medium");
   assert.deepEqual(next.state.entries.at(-1).data, { mode: "auto" });
@@ -552,7 +552,7 @@ test("startup defaults respect saved modes across reload, resume, and fork", asy
       const { ctx } = makeCtx(state);
       await state.events.get("session_start")![0]({ reason }, ctx);
       assert.equal(state.activeTools.includes("workflow"), mode !== "off");
-      assert.equal(state.statuses.ultracode, mode === "off" ? undefined : `<accent>ultracode</accent> · ${mode}`);
+      assert.equal(state.statuses.ultracode, mode === "off" ? undefined : `<accent>ultracode</accent> · <dim>${mode}</dim>`);
       assert.equal(state.entries.length, 1, "restoration must not replace a saved choice");
     }
   }
@@ -590,7 +590,7 @@ test("default on preserves the current active depth and parent effort", async ()
     await command.handler("default on", ctx);
     await command.handler("default on", ctx);
     assert.equal(state.activeTools.includes("workflow"), true);
-    assert.equal(state.statuses.ultracode, `<accent>ultracode</accent> · ${selected}`);
+    assert.equal(state.statuses.ultracode, `<accent>ultracode</accent> · <dim>${selected}</dim>`);
     assert.equal(state.thinking, "high");
     assert.equal(state.entries.length, entryCount, "repeated default on does not rewrite an active mode");
     assert.ok(notifications.at(-1)!.m.includes(`current session: ${selected}`));
@@ -635,7 +635,7 @@ test("manual parent effort changes are not intercepted or rendered in status", a
   state.thinking = "low";
   const turn = await runPromptHooks(state);
   assert.equal(state.thinking, "low");
-  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · deep");
+  assert.equal(state.statuses.ultracode, "<accent>ultracode</accent> · <dim>deep</dim>");
   assert.ok(turn?.systemPrompt.includes("<ultracode>"));
 });
 

@@ -90,7 +90,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     if (ctx.hasUI) {
       ctx.ui.setStatus(
         "ultracode",
-        mode.isEnabled() ? mode.statusLine((label) => ctx.ui.theme.fg("accent", label)) : undefined,
+        mode.isEnabled() ? mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)) : undefined,
       );
     }
   });
@@ -101,7 +101,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     if (ctx.hasUI) {
       ctx.ui.setStatus(
         "ultracode",
-        mode.isEnabled() ? mode.statusLine((label) => ctx.ui.theme.fg("accent", label)) : undefined,
+        mode.isEnabled() ? mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)) : undefined,
       );
     }
   });

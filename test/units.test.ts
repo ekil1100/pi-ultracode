@@ -939,8 +939,8 @@ test("status shows only the colored label and semantic mode", () => {
   m.enable(api, "auto");
   assert.equal(m.statusLine(), "ultracode · auto");
   assert.equal(
-    m.statusLine((label) => `<accent>${label}</accent>`),
-    "<accent>ultracode</accent> · auto",
+    m.statusLine((text, color) => `<${color}>${text}</${color}>`),
+    "<accent>ultracode</accent> · <dim>auto</dim>",
   );
   m.disable(api);
   assert.equal(m.statusLine(), "ultracode · off");

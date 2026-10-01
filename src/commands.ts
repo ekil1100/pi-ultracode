@@ -38,7 +38,7 @@ export function registerCommands(
         );
         ctx.ui.setStatus(
           "ultracode",
-          nowOn ? mode.statusLine((label) => ctx.ui.theme.fg("accent", label)) : undefined,
+          nowOn ? mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)) : undefined,
         );
         return;
       }
@@ -54,7 +54,7 @@ export function registerCommands(
           const enabled = preferences.getDefaultEnabled();
           if (value === "on") {
             if (!mode.isEnabled()) mode.enable(pi, "auto");
-            ctx.ui.setStatus("ultracode", mode.statusLine((label) => ctx.ui.theme.fg("accent", label)));
+            ctx.ui.setStatus("ultracode", mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)));
           }
           const sessionStatus = value === "on" ? `current session: ${mode.getMode()}` : "current session unchanged";
           ctx.ui.notify(
@@ -93,7 +93,7 @@ export function registerCommands(
       ctx.ui.notify(`Ultracode ${sub} — ${MODE_DESCRIPTIONS[sub]}`, "info");
       ctx.ui.setStatus(
         "ultracode",
-        mode.statusLine((label) => ctx.ui.theme.fg("accent", label)),
+        mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)),
       );
     },
   });
