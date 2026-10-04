@@ -5,7 +5,8 @@
  * workflow orchestration, and the `/ultracode` / `/workflows` commands.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Effect } from "effect";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createWorkflowTool, type WorkflowToolDeps } from "../src/workflow/tool.ts";
 import { UltracodeMode, type ThinkingPreferenceStore } from "../src/mode.ts";
 import { registerCommands } from "../src/commands.ts";
@@ -62,54 +63,73 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
     if (event.toolName === workflowTool.name && !mode.isEnforcing()) {
       return {
         block: true,
-        reason: "The workflow tool is disabled. Run /ultracode or select an Ultracode depth before using it.",
+        reason:
+          "The workflow tool is disabled. Run /ultracode or select an Ultracode depth before using it.",
       };
     }
   });
 
-  pi.on("session_start", async (_event, ctx) => {
-    // Restore persisted mode state across reload / resume / fork.
-    let hasSavedMode = true;
-    try {
-      // Mode entries are branch-local; discarded future branches must not win.
-      hasSavedMode = mode.restore(pi, ctx.sessionManager.getBranch() as any);
-    } catch {
-      // Do not apply a startup default when branch restoration failed.
-    }
-    if (!mode.isEnabled() && pi.getFlag?.("ultracode") === true) {
-      mode.enable(pi, "auto");
-    } else if (!hasSavedMode && !mode.isEnabled()) {
-      try {
-        if (preferences.getDefaultEnabled()) mode.enable(pi, "auto");
-      } catch (error) {
-        ctx.ui.notify(`Failed to read Ultracode default: ${String(error)}`, "warning");
+  const attempt = <A>(thunk: () => A) => Effect.try({ try: thunk, catch: (error) => error });
+  const updateStatus = (ctx: ExtensionContext) =>
+    attempt(() => {
+      mode.syncWorkflowTool(pi);
+      if (ctx.hasUI) {
+        ctx.ui.setStatus(
+          "ultracode",
+          mode.isEnabled()
+            ? mode.statusLine((text, color) => ctx.ui.theme.fg(color, text))
+            : undefined,
+        );
       }
-    }
-    // Registration makes tools discoverable; activation follows the chosen mode.
-    mode.syncWorkflowTool(pi);
-    if (ctx.hasUI) {
-      ctx.ui.setStatus(
-        "ultracode",
-        mode.isEnabled() ? mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)) : undefined,
-      );
-    }
-  });
+    });
 
-  pi.on("session_tree", async (_event, ctx) => {
-    if (mode.isSuspended()) return;
-    mode.restore(pi, ctx.sessionManager.getBranch() as any);
-    if (ctx.hasUI) {
-      ctx.ui.setStatus(
-        "ultracode",
-        mode.isEnabled() ? mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)) : undefined,
-      );
-    }
-  });
+  pi.on("session_start", (_event, ctx) =>
+    Effect.runPromise(
+      // Mode entries are branch-local; restoration failure suppresses startup defaults.
+      attempt(() => mode.restore(pi, ctx.sessionManager.getBranch() as any)).pipe(
+        Effect.catch(() => Effect.succeed(true)),
+        Effect.flatMap((hasSavedMode) =>
+          attempt(() => pi.getFlag?.("ultracode") === true).pipe(
+            Effect.flatMap((flagEnabled) => {
+              if (!mode.isEnabled() && flagEnabled) return attempt(() => mode.enable(pi, "auto"));
+              if (hasSavedMode || mode.isEnabled()) return Effect.void;
+              return attempt(() => {
+                if (preferences.getDefaultEnabled()) mode.enable(pi, "auto");
+              }).pipe(
+                Effect.catch((error) =>
+                  attempt(() => {
+                    ctx.ui.notify(`Failed to read Ultracode default: ${String(error)}`, "warning");
+                  }),
+                ),
+              );
+            }),
+          ),
+        ),
+        Effect.andThen(updateStatus(ctx)),
+      ),
+    ),
+  );
 
-  pi.on("session_shutdown", async () => {
-    // The persisted configured mode remains active for reload/resume/fork replacements.
-    mode.suspend(pi);
-  });
+  pi.on("session_tree", (_event, ctx) =>
+    Effect.runPromise(
+      Effect.suspend(() =>
+        mode.isSuspended()
+          ? Effect.void
+          : attempt(() => mode.restore(pi, ctx.sessionManager.getBranch() as any)).pipe(
+              Effect.andThen(updateStatus(ctx)),
+            ),
+      ),
+    ),
+  );
+
+  pi.on("session_shutdown", () =>
+    Effect.runPromise(
+      attempt(() => {
+        // Persisted configuration survives reload/resume/fork replacements.
+        mode.suspend(pi);
+      }),
+    ),
+  );
 
   pi.on("before_agent_start", (event, ctx) => {
     // Reconcile tool availability and update our prompt section on every turn,

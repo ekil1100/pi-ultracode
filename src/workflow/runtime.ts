@@ -12,6 +12,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Context, Deferred, Effect, Fiber, Queue, Result, Scope } from "effect";
 import type { JsonObject } from "@earendil-works/pi-ai";
 import { createJevBatch } from "../jev.ts";
 import { parseWorkflowScript, type WorkflowMeta } from "./parser.ts";
@@ -28,7 +29,7 @@ import {
   type PanelReservation,
 } from "./admission.ts";
 // Static import: a dynamic import() of this module misbehaves under Pi's jiti
-// loader ("WorkflowAgentRunner is not a constructor"). getRunner() constructs the
+// loader ("WorkflowAgentRunner is not a constructor"). The runner service constructs the
 // default runner unless the host injects one.
 import { resolveModelSelection, WorkflowAgentRunner } from "./agent-runner.ts";
 import type {
@@ -50,7 +51,7 @@ import {
   assertWorkflowSchemaLimit,
 } from "./value-limits.ts";
 
-import { discoverAgentTypes, resolveAgentType, type AgentTypeDef } from "./agent-types.ts";
+import { discoverAgentTypes, resolveAgentType } from "./agent-types.ts";
 import { readSavedWorkflowByName } from "./saved-workflow.ts";
 import { resolveRepositoryContext } from "./repository-context.ts";
 import {
@@ -75,7 +76,7 @@ import {
 
 const MAX_CONCURRENCY = 16;
 const DEFAULT_CLEANUP_TIMEOUT_MS = 25_000;
-const REPOSITORY_APPLY_LOCKS = new Map<string, Mutex>();
+const REPOSITORY_APPLY_LOCKS = new Map<string, ExecutionGate>();
 export { DEFAULT_MAX_AGENTS, ABSOLUTE_MAX_AGENTS };
 export const MAX_WORKFLOW_LOGS = 256;
 export const WORKFLOW_LOG_OMITTED_TEXT = "additional workflow logs omitted";
@@ -123,25 +124,29 @@ export interface WorkflowRunOptions {
   loadSavedWorkflow?: (name: string) => { meta: WorkflowMeta; body: string };
   onLog?: (message: string) => void;
   onPhase?: (title: string) => void;
-  onAgentStart?: (event: AgentEventBase & {
-    prompt: string;
-    cached: boolean;
-    modelPattern?: string;
-    requestedEffort?: ThinkingLevel;
-    agentType?: string;
-    isolation?: string;
-    structuredOutput?: boolean;
-    cachedRecord?: JournalAgentRecord;
-  }) => void;
-  onAgentEnd?: (event: AgentEventBase & {
-    result: unknown;
-    status: "done" | "error";
-    usage?: AgentUsage;
-    modelId?: string;
-    effort?: ThinkingLevel;
-    error?: string;
-    cachedRecord?: JournalAgentRecord;
-  }) => void;
+  onAgentStart?: (
+    event: AgentEventBase & {
+      prompt: string;
+      cached: boolean;
+      modelPattern?: string;
+      requestedEffort?: ThinkingLevel;
+      agentType?: string;
+      isolation?: string;
+      structuredOutput?: boolean;
+      cachedRecord?: JournalAgentRecord;
+    },
+  ) => void;
+  onAgentEnd?: (
+    event: AgentEventBase & {
+      result: unknown;
+      status: "done" | "error";
+      usage?: AgentUsage;
+      modelId?: string;
+      effort?: ThinkingLevel;
+      error?: string;
+      cachedRecord?: JournalAgentRecord;
+    },
+  ) => void;
   onAgentActivity?: (event: AgentActivityEvent) => void;
   onAgentTelemetry?: (event: AgentEventBase & AgentTelemetryEvent) => void;
 }
@@ -200,279 +205,414 @@ type WorktreeOutcome =
   | { status: "rescued"; keepWorktree: false; recoveryPath: string }
   | { status: "preserved"; keepWorktree: true; recoveryPath: string };
 
-export async function runWorkflow<T = unknown>(
+// Runtime failures retain the exact thrown value (including non-Error rejections).
+// Host boundaries unwrap them; Effect v4 runPromise throws a failure
+// directly rather than replacing it with a FiberFailure.
+interface RuntimeFailure {
+  readonly _tag: "RuntimeFailure";
+  readonly error: unknown;
+}
+const runtimeFailure = (error: unknown): RuntimeFailure => ({ _tag: "RuntimeFailure", error });
+const attempt = <A>(thunk: () => A): Effect.Effect<A, RuntimeFailure> =>
+  Effect.try({ try: thunk, catch: runtimeFailure });
+const fromPromise = <A>(thunk: () => Promise<A>): Effect.Effect<A, RuntimeFailure> =>
+  Effect.tryPromise({ try: thunk, catch: runtimeFailure });
+const runBoundary = <A>(effect: Effect.Effect<A, RuntimeFailure>): Promise<A> =>
+  Effect.runPromise(effect.pipe(Effect.mapError((failure) => failure.error)));
+
+// Result unwrapping keeps synchronous callbacks synchronous and throws the exact
+// original value, independently of the Effect runtime's failure representation.
+const runSyncBoundary = <A>(effect: Effect.Effect<A, RuntimeFailure>): A =>
+  Result.getOrThrowWith(Effect.runSync(Effect.result(effect)), (failure) => failure.error);
+
+const WorkflowOptions = Context.Service<WorkflowRunOptions>("pi-ultracode/workflow/Options");
+const WorkflowRunner = Context.Service<{
+  readonly get: Effect.Effect<AgentRunner, RuntimeFailure>;
+}>("pi-ultracode/workflow/Runner");
+
+function makeRunnerService(options: WorkflowRunOptions) {
+  let runner = options.runner;
+  return {
+    get: attempt(
+      () =>
+        (runner ??= new WorkflowAgentRunner({
+          cwd: options.cwd ?? process.cwd(),
+          projectTrusted: options.projectTrusted ?? false,
+          modelRegistry: options.modelRegistry,
+          modelRuntime: options.modelRuntime,
+          model: options.model,
+          thinkingLevel: options.thinkingLevel,
+        })),
+    ),
+  };
+}
+
+function prepareWorkflow(rawScript: string, options: WorkflowRunOptions) {
+  return attempt(() => {
+    if (options.signal?.aborted) throw new WorkflowAbortError();
+    assertWorkflowArgsLimit(options.args);
+    if (options.journal && options.journal.projectTrusted !== options.projectTrusted) {
+      throw new WorkflowPolicyError(
+        "workflow journal project trust context does not match this execution",
+      );
+    }
+    const targetIdentity = resolveRepositoryContext(options.cwd ?? process.cwd()).identity;
+    if (options.targetIdentity !== undefined && options.targetIdentity !== targetIdentity) {
+      throw new WorkflowPolicyError("workflow target identity does not match the actual cwd");
+    }
+    if (options.journal && options.journal.targetIdentity !== targetIdentity) {
+      throw new WorkflowPolicyError(
+        "workflow journal repository/cwd target does not match this execution",
+      );
+    }
+    const cleanupTimeoutMs = normalizeCleanupTimeout(options.cleanupTimeoutMs);
+    const effectiveOptions = { ...options, targetIdentity, cleanupTimeoutMs };
+    const started = Date.now();
+    const maxAgents = normalizeMaxAgents(options.maxAgents ?? options.journal?.effectiveMaxAgents);
+    return {
+      effectiveOptions,
+      cleanupTimeoutMs,
+      started,
+      maxAgents,
+      ...parseWorkflowScript(rawScript),
+    };
+  });
+}
+
+type PreparedWorkflow = Effect.Success<ReturnType<typeof prepareWorkflow>>;
+type WorkflowRuntime = Effect.Success<ReturnType<typeof initializeWorkflowRuntime>>;
+
+function recoverWorkflowFailure(
+  runtime: WorkflowRuntime,
+  options: WorkflowRunOptions,
+  cleanupTimeoutMs: number,
+  failure: RuntimeFailure,
+): Effect.Effect<never, RuntimeFailure> {
+  return Effect.suspend(() => {
+    runtime.abort();
+    if (failure.error instanceof WorkflowCleanupTimeoutError) return Effect.fail(failure);
+    return runtime.drain(cleanupTimeoutMs).pipe(
+      Effect.catch((cleanupFailure) => {
+        const policy =
+          runtime.policyError() ??
+          (isWorkflowPolicyError(failure.error) ? failure.error : undefined);
+        if (policy) {
+          (policy as WorkflowPolicyError & { cleanupError?: unknown }).cleanupError =
+            cleanupFailure.error;
+          return Effect.fail(runtimeFailure(policy));
+        }
+        return Effect.fail(cleanupFailure);
+      }),
+      Effect.andThen(runtime.checkPolicy),
+      Effect.andThen(() =>
+        Effect.fail(
+          options.signal?.aborted && !isWorkflowPolicyError(failure.error)
+            ? runtimeFailure(new WorkflowAbortError())
+            : failure,
+        ),
+      ),
+    );
+  });
+}
+
+function executePreparedWorkflow<T>(
+  runtime: WorkflowRuntime,
+  prepared: PreparedWorkflow,
+  options: WorkflowRunOptions,
+) {
+  const { cleanupTimeoutMs, started, maxAgents, meta, body } = prepared;
+  return runtime.runBody(body, options.args, meta.name).pipe(
+    Effect.tap(runtime.checkPolicy),
+    Effect.tap(() => runtime.drain(cleanupTimeoutMs)),
+    Effect.tap(runtime.checkPolicy),
+    Effect.flatMap((result) =>
+      attempt(() => {
+        assertWorkflowOutputLimit(result);
+        return {
+          meta,
+          result: cloneResult(result, "workflow result") as T,
+          logs: runtime.state.logs,
+          phases: runtime.state.phases,
+          agentCount: runtime.state.agentCount,
+          agentsUsed: runtime.agentsUsed(),
+          cachedCount: runtime.state.cachedCount,
+          spentTokens: runtime.state.spent,
+          newTokens: runtime.state.newTokens,
+          replayedTokens: runtime.state.replayedTokens,
+          durationMs: Date.now() - started,
+          maxAgents,
+        };
+      }),
+    ),
+    Effect.catch((failure) => recoverWorkflowFailure(runtime, options, cleanupTimeoutMs, failure)),
+  );
+}
+
+export function runWorkflow<T = unknown>(
   rawScript: string,
   options: WorkflowRunOptions = {},
 ): Promise<WorkflowRunResult<T>> {
-  if (options.signal?.aborted) throw new WorkflowAbortError();
-  assertWorkflowArgsLimit(options.args);
-  if (options.journal && options.journal.projectTrusted !== options.projectTrusted) {
-    throw new WorkflowPolicyError("workflow journal project trust context does not match this execution");
-  }
-  const actualTargetIdentity = resolveRepositoryContext(options.cwd ?? process.cwd()).identity;
-  if (options.targetIdentity !== undefined && options.targetIdentity !== actualTargetIdentity) {
-    throw new WorkflowPolicyError("workflow target identity does not match the actual cwd");
-  }
-  const targetIdentity = actualTargetIdentity;
-  if (options.journal && options.journal.targetIdentity !== targetIdentity) {
-    throw new WorkflowPolicyError("workflow journal repository/cwd target does not match this execution");
-  }
-  const cleanupTimeoutMs = normalizeCleanupTimeout(options.cleanupTimeoutMs);
-  const effectiveOptions: WorkflowRunOptions = { ...options, targetIdentity, cleanupTimeoutMs };
-  const started = Date.now();
-  const maxAgents = normalizeMaxAgents(options.maxAgents ?? options.journal?.effectiveMaxAgents);
-  const { meta, body } = parseWorkflowScript(rawScript);
-  const runtime = new Runtime(effectiveOptions, maxAgents, meta);
-  const onOuterAbort = () => runtime.abort();
-  options.signal?.addEventListener("abort", onOuterAbort, { once: true });
-  if (options.signal?.aborted) runtime.abort();
-  try {
-    const result = await runtime.runBody(body, options.args, meta.name);
-    if (runtime.policyError) throw runtime.policyError;
-    await runtime.drain(cleanupTimeoutMs);
-    if (runtime.policyError) throw runtime.policyError;
-    assertWorkflowOutputLimit(result);
-    // Keep the public value detached from the Worker message object.
-    const cloned = cloneResult(result, "workflow result");
-    return {
-      meta,
-      result: cloned as T,
-      logs: runtime.state.logs,
-      phases: runtime.state.phases,
-      agentCount: runtime.state.agentCount,
-      agentsUsed: runtime.agentsUsed,
-      cachedCount: runtime.state.cachedCount,
-      spentTokens: runtime.state.spent,
-      newTokens: runtime.state.newTokens,
-      replayedTokens: runtime.state.replayedTokens,
-      durationMs: Date.now() - started,
-      maxAgents,
-    };
-  } catch (error) {
-    runtime.abort();
-    if (error instanceof WorkflowCleanupTimeoutError) throw error;
-    try {
-      await runtime.drain(cleanupTimeoutMs);
-    } catch (cleanupError) {
-      const policy = runtime.policyError ?? (isWorkflowPolicyError(error) ? error : undefined);
-      if (policy) {
-        (policy as WorkflowPolicyError & { cleanupError?: unknown }).cleanupError = cleanupError;
-        throw policy;
-      }
-      throw cleanupError;
-    }
-    if (runtime.policyError) throw runtime.policyError;
-    if (options.signal?.aborted && !isWorkflowPolicyError(error)) {
-      throw new WorkflowAbortError();
-    }
-    throw error;
-  } finally {
-    options.signal?.removeEventListener("abort", onOuterAbort);
-  }
+  return runBoundary(
+    prepareWorkflow(rawScript, options).pipe(
+      Effect.flatMap((prepared) =>
+        makeWorkflowRuntime(prepared.maxAgents, prepared.meta).pipe(
+          Effect.provideService(WorkflowOptions, prepared.effectiveOptions),
+          Effect.provideService(WorkflowRunner, makeRunnerService(prepared.effectiveOptions)),
+          Effect.flatMap((runtime) =>
+            Effect.acquireRelease(
+              Effect.sync(() => {
+                options.signal?.addEventListener("abort", runtime.abort, { once: true });
+                if (options.signal?.aborted) runtime.abort();
+              }),
+              () => Effect.sync(() => options.signal?.removeEventListener("abort", runtime.abort)),
+            ).pipe(Effect.andThen(() => executePreparedWorkflow<T>(runtime, prepared, options))),
+          ),
+        ),
+      ),
+      Effect.scoped,
+    ),
+  );
 }
 
-class Runtime implements ScriptExecutorHost {
-  readonly state: RuntimeState;
-  private readonly options: WorkflowRunOptions;
-  private readonly cwd: string;
-  private runnerInstance: AgentRunner | undefined;
-  private readonly agentTypes: Map<string, AgentTypeDef>;
-  private readonly acquireExecution: () => Promise<() => void>;
-  private readonly workflowContext: JsonObject;
-  private readonly pending = new Set<Promise<unknown>>();
-  private readonly childController = new AbortController();
-  private readonly scriptController = new AbortController();
-  private readonly admission: AgentAdmission;
-  private readonly seenCallPaths = new Set<string>();
-  private readonly agentRequestOccurrences = new Map<string, number>();
-  private readonly nestedRequestOccurrences = new Map<string, number>();
-  private readonly activePanelTraces = new Map<string, ActivePanelTrace>();
-  private cleanupDeadline?: number;
-  policyError: WorkflowPolicyError | undefined;
-
-  constructor(options: WorkflowRunOptions, maxAgents: number, meta: WorkflowMeta) {
-    this.workflowContext = JSON.parse(JSON.stringify({ meta, args: options.args }));
-    this.options = options;
-    this.cwd = options.cwd ?? process.cwd();
-    this.runnerInstance = options.runner;
-    this.agentTypes = discoverAgentTypes(this.cwd, options.projectTrusted ?? false);
-    this.admission = new AgentAdmission(maxAgents, options.journal?.agentsUsed ?? 0);
-    this.state = {
-      logs: [],
-      phases: [],
-      agentCount: 0,
-      cachedCount: 0,
-      spent: 0,
-      newTokens: 0,
-      replayedTokens: 0,
-      maxAgents,
-    };
+function prepareRuntime(options: WorkflowRunOptions, maxAgents: number, meta: WorkflowMeta) {
+  return attempt(() => {
+    const cwd = options.cwd ?? process.cwd();
+    const workflowContext: JsonObject = JSON.parse(JSON.stringify({ meta, args: options.args }));
+    const agentTypes = discoverAgentTypes(cwd, options.projectTrusted ?? false);
+    const admission = new AgentAdmission(maxAgents, options.journal?.agentsUsed ?? 0);
     const cores = (globalThis as any).navigator?.hardwareConcurrency ?? os.cpus().length ?? 8;
-    const defaultConcurrency = Math.max(1, Math.min(Math.max(1, cores - 2), MAX_CONCURRENCY));
-    const concurrency = normalizeConcurrency(options.concurrency, defaultConcurrency);
-    this.acquireExecution = createExecutionSemaphore(concurrency, this.childController.signal);
+    const fallback = Math.max(1, Math.min(Math.max(1, cores - 2), MAX_CONCURRENCY));
+    return {
+      workflowContext,
+      cwd,
+      agentTypes,
+      admission,
+      concurrency: normalizeConcurrency(options.concurrency, fallback),
+    };
+  });
+}
+
+function makeWorkflowRuntime(maxAgents: number, meta: WorkflowMeta) {
+  return WorkflowOptions.pipe(
+    Effect.flatMap((options) =>
+      WorkflowRunner.pipe(
+        Effect.flatMap((runnerService) =>
+          prepareRuntime(options, maxAgents, meta).pipe(
+            Effect.flatMap((prepared) =>
+              makeExecutionGate(prepared.concurrency).pipe(
+                Effect.flatMap((execution) =>
+                  initializeWorkflowRuntime(options, runnerService, maxAgents, prepared, execution),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+function initializeWorkflowRuntime(
+  options: WorkflowRunOptions,
+  runnerService: ReturnType<typeof makeRunnerService>,
+  maxAgents: number,
+  {
+    workflowContext,
+    cwd,
+    agentTypes,
+    admission,
+  }: Effect.Success<ReturnType<typeof prepareRuntime>>,
+  execution: ExecutionGate,
+) {
+  const state: RuntimeState = {
+    logs: [],
+    phases: [],
+    agentCount: 0,
+    cachedCount: 0,
+    spent: 0,
+    newTokens: 0,
+    replayedTokens: 0,
+    maxAgents,
+  };
+  const pending = new Set<Fiber.Fiber<unknown, RuntimeFailure>>();
+  const childController = new AbortController();
+  const scriptController = new AbortController();
+  const seenCallPaths = new Set<string>();
+  const agentRequestOccurrences = new Map<string, number>();
+  const nestedRequestOccurrences = new Map<string, number>();
+  const activePanelTraces = new Map<string, ActivePanelTrace>();
+  let cleanupDeadline: number | undefined;
+  let policyError: WorkflowPolicyError | undefined;
+
+  function abortChildren(): void {
+    cleanupDeadline ??= Date.now() + (options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS);
+    if (!childController.signal.aborted) childController.abort();
+  }
+  function abort(): void {
+    abortChildren();
+    if (!scriptController.signal.aborted) scriptController.abort();
   }
 
-  get agentsUsed(): number {
-    return this.admission.usedAgents;
-  }
-
-  abort(): void {
-    this.cleanupDeadline ??= Date.now() + (this.options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS);
-    this.abortChildren();
-    if (!this.scriptController.signal.aborted) this.scriptController.abort();
-  }
-
-  abortChildren(): void {
-    this.cleanupDeadline ??= Date.now() + (this.options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS);
-    if (!this.childController.signal.aborted) this.childController.abort();
-  }
-
-  async drain(timeoutMs?: number): Promise<void> {
-    const configuredTimeoutMs = timeoutMs;
-    if (configuredTimeoutMs !== undefined) this.cleanupDeadline ??= Date.now() + configuredTimeoutMs;
-    const deadline = configuredTimeoutMs === undefined ? undefined : this.cleanupDeadline;
-    try {
-      while (this.pending.size > 0) {
-        const batch = Promise.allSettled([...this.pending]);
-        if (deadline === undefined) {
-          await batch;
-          continue;
-        }
-        const remainingMs = deadline - Date.now();
-        if (remainingMs <= 0) throw new WorkflowCleanupTimeoutError(configuredTimeoutMs!);
-        await raceWithCleanupTimeout(batch, remainingMs, configuredTimeoutMs!);
-      }
-    } finally {
-      this.releaseOpenPanels();
-    }
-  }
-
-  /** Lazily construct the default in-memory runner (skipped when a runner is injected). */
-  private getRunner(): AgentRunner {
-    if (!this.runnerInstance) {
-      this.runnerInstance = new WorkflowAgentRunner({
-        cwd: this.cwd,
-        projectTrusted: this.options.projectTrusted ?? false,
-        modelRegistry: this.options.modelRegistry,
-        modelRuntime: this.options.modelRuntime,
-        model: this.options.model,
-        thinkingLevel: this.options.thinkingLevel,
+  function drain(timeoutMs: number): Effect.Effect<void, RuntimeFailure> {
+    return Effect.suspend(() => {
+      cleanupDeadline ??= Date.now() + timeoutMs;
+      return Effect.whileLoop({
+        while: () => pending.size > 0,
+        body: () => {
+          const remainingMs = cleanupDeadline! - Date.now();
+          if (remainingMs <= 0)
+            return Effect.fail(runtimeFailure(new WorkflowCleanupTimeoutError(timeoutMs)));
+          // Timeout interrupts only the wait, not the underlying runner. A native
+          // runner may ignore cancellation; its scoped recovery must still run if it
+          // settles later, without publishing a result after cancellation.
+          return Fiber.awaitAll([...pending]).pipe(
+            Effect.timeoutOrElse({
+              duration: remainingMs,
+              orElse: () => Effect.fail(runtimeFailure(new WorkflowCleanupTimeoutError(timeoutMs))),
+            }),
+          );
+        },
+        step: () => {},
       });
-    }
-    return this.runnerInstance;
+    }).pipe(Effect.ensuring(Effect.sync(() => releaseOpenPanels())));
   }
 
-  async runBody(body: string, args: unknown, name: string): Promise<unknown> {
-    this.throwIfAborted();
-    return await executeWorkflowScript(body, this, {
-      cwd: this.cwd,
-      args,
-      name,
-      meta: this.workflowContext.meta,
-      signal: this.scriptController.signal,
-      stallTimeoutMs: this.options.stallTimeoutMs,
-      hostCallLimit: this.options.hostCallLimit,
-      workerMemoryLimitMb: this.options.workerMemoryLimitMb,
-      fatalDrainTimeoutMs: this.options.cleanupTimeoutMs,
-    });
+  function runBody(body: string, args: unknown, name: string) {
+    return attempt(throwIfAborted).pipe(
+      Effect.andThen(
+        fromPromise(() =>
+          executeWorkflowScript(body, host, {
+            cwd,
+            args,
+            name,
+            meta: workflowContext.meta,
+            signal: scriptController.signal,
+            stallTimeoutMs: options.stallTimeoutMs,
+            hostCallLimit: options.hostCallLimit,
+            workerMemoryLimitMb: options.workerMemoryLimitMb,
+            fatalDrainTimeoutMs: options.cleanupTimeoutMs,
+          }),
+        ),
+      ),
+    );
   }
 
-  private throwIfAborted(): void {
-    if (this.childController.signal.aborted || this.options.signal?.aborted) throw new WorkflowAbortError();
+  const recordPolicyFailure = <A, R>(effect: Effect.Effect<A, RuntimeFailure, R>) =>
+    effect.pipe(Effect.tapError(({ error }) => Effect.sync(() => recordPolicyError(error))));
+
+  const journalOperation = <A>(operation: string, thunk: () => A) =>
+    attempt(thunk).pipe(
+      Effect.mapError(({ error }) => runtimeFailure(journalPolicyError(error, operation))),
+    );
+
+  type PanelRequest = Parameters<ScriptExecutorHost["reservePanel"]>[0];
+
+  function reservePanelSlots(
+    payload: PanelRequest,
+    replay: ReturnType<RunJournal["panelReplayPlan"]> | undefined,
+  ): PanelReservation {
+    const parentReservationIds = Array.isArray(payload.parentReservationIds)
+      ? payload.parentReservationIds
+      : [];
+    const liveSlots = replay
+      ? Math.max(
+          replay.branchNeedsSlot.filter(Boolean).length,
+          payload.reserveAgents - replay.slotCredit,
+        )
+      : payload.reserveAgents;
+    return replay
+      ? admission.reservePanelWithBranchNeeds(
+          liveSlots,
+          replay.branchNeedsSlot,
+          parentReservationIds,
+          payload.reserveAgents - liveSlots,
+        )
+      : admission.reservePanelWithBranches(
+          payload.reserveAgents,
+          payload.branchCount,
+          parentReservationIds,
+        );
   }
 
-  phase(title: string): void {
-    if (!title) return;
-    this.state.currentPhase = title;
-    if (!this.state.phases.includes(title)) this.state.phases.push(title);
-    this.options.onPhase?.(title);
+  function commitPanelReservation(
+    payload: PanelRequest,
+    callPath: string,
+    panel: PanelReservation,
+  ) {
+    return journalOperation("workflow panel-open commit failed", () =>
+      options.journal?.recordPanelOpen(callPath, payload.reserveAgents, payload.branchCount),
+    ).pipe(
+      Effect.andThen(
+        attempt(() => {
+          if (activePanelTraces.has(callPath)) {
+            throw new WorkflowPolicyError(
+              `workflow produced duplicate parallel callPath: ${callPath}`,
+            );
+          }
+        }),
+      ),
+      Effect.tapError(() =>
+        Effect.sync(() => {
+          for (const reservationId of panel.branchReservationIds)
+            admission.releasePanel(reservationId);
+          admission.releasePanel(panel.panelReservationId);
+        }),
+      ),
+      Effect.andThen(
+        Effect.sync(() => {
+          activePanelTraces.set(callPath, {
+            branchCount: payload.branchCount,
+            panelReservationId: panel.panelReservationId,
+            branchReservationIds: [...panel.branchReservationIds],
+            calls: [],
+          });
+          return panel;
+        }),
+      ),
+    );
   }
 
-  log(message: string): void {
-    this.logLine(message);
-  }
+  const reservePanel = (payload: PanelRequest) =>
+    attempt(throwIfAborted).pipe(
+      Effect.andThen(attempt(() => requireString(payload.callPath, "parallel callPath"))),
+      Effect.flatMap((callPath) =>
+        journalOperation("workflow panel replay lookup failed", () =>
+          options.journal?.panelReplayPlan(callPath, payload.branchCount),
+        ).pipe(
+          Effect.flatMap((replay) => attempt(() => reservePanelSlots(payload, replay))),
+          Effect.flatMap((panel) => commitPanelReservation(payload, callPath, panel)),
+        ),
+      ),
+      recordPolicyFailure,
+    );
 
-  async reservePanel(payload: {
-    callPath?: unknown;
-    reserveAgents: number;
-    branchCount: number;
-    parentReservationIds?: string[];
-  }): Promise<PanelReservation> {
-    this.throwIfAborted();
-    try {
-      const callPath = requireString(payload.callPath, "parallel callPath");
-      const parentReservationIds = Array.isArray(payload.parentReservationIds)
-        ? payload.parentReservationIds
-        : [];
-      let replay: ReturnType<RunJournal["panelReplayPlan"]> | undefined;
-      try {
-        replay = this.options.journal?.panelReplayPlan(callPath, payload.branchCount);
-      } catch (error) {
-        throw journalPolicyError(error, "workflow panel replay lookup failed");
-      }
-      const liveSlots = replay
-        ? Math.max(
-            replay.branchNeedsSlot.filter(Boolean).length,
-            payload.reserveAgents - replay.slotCredit,
-          )
-        : payload.reserveAgents;
-      const panel = replay
-        ? this.admission.reservePanelWithBranchNeeds(
-            liveSlots,
-            replay.branchNeedsSlot,
-            parentReservationIds,
-            payload.reserveAgents - liveSlots,
-          )
-        : this.admission.reservePanelWithBranches(payload.reserveAgents, payload.branchCount, parentReservationIds);
-      try {
-        this.options.journal?.recordPanelOpen(callPath, payload.reserveAgents, payload.branchCount);
-      } catch (error) {
-        for (const reservationId of panel.branchReservationIds) this.admission.releasePanel(reservationId);
-        this.admission.releasePanel(panel.panelReservationId);
-        throw journalPolicyError(error, "workflow panel-open commit failed");
-      }
-      if (this.activePanelTraces.has(callPath)) {
-        for (const reservationId of panel.branchReservationIds) this.admission.releasePanel(reservationId);
-        this.admission.releasePanel(panel.panelReservationId);
-        throw new WorkflowPolicyError(`workflow produced duplicate parallel callPath: ${callPath}`);
-      }
-      this.activePanelTraces.set(callPath, {
-        branchCount: payload.branchCount,
-        panelReservationId: panel.panelReservationId,
-        branchReservationIds: [...panel.branchReservationIds],
-        calls: [],
-      });
-      return panel;
-    } catch (error) {
-      this.recordPolicyError(error);
-      throw error;
-    }
-  }
-
-  async completePanelBranch(payload: {
+  const completePanelBranch = (payload: {
     callPath?: unknown;
     branchIndex: number;
     outcome: "success" | "failed";
-  }): Promise<void> {
-    try {
+  }) =>
+    journalOperation("workflow panel-branch commit failed", () => {
       const callPath = requireString(payload.callPath, "parallel callPath");
-      const trace = this.activePanelTraces.get(callPath);
+      const trace = activePanelTraces.get(callPath);
       if (
-        !trace
-        || !Number.isInteger(payload.branchIndex)
-        || payload.branchIndex < 0
-        || payload.branchIndex >= trace.branchCount
-        || (payload.outcome !== "success" && payload.outcome !== "failed")
+        !trace ||
+        !Number.isInteger(payload.branchIndex) ||
+        payload.branchIndex < 0 ||
+        payload.branchIndex >= trace.branchCount ||
+        (payload.outcome !== "success" && payload.outcome !== "failed")
       ) {
-        throw new WorkflowPolicyError(`workflow returned invalid branch completion for ${callPath}`);
+        throw new WorkflowPolicyError(
+          `workflow returned invalid branch completion for ${callPath}`,
+        );
       }
       const prefix = `${callPath}/b:${payload.branchIndex}/`;
       const calls = trace.calls.filter((call) => call.callPath.startsWith(prefix));
       if (calls.some((call) => call.status === "pending")) {
-        throw new WorkflowPolicyError(`workflow branch completed with pending agent calls at ${callPath}`);
+        throw new WorkflowPolicyError(
+          `workflow branch completed with pending agent calls at ${callPath}`,
+        );
       }
-      this.options.journal?.recordPanelBranch(
+      options.journal?.recordPanelBranch(
         callPath,
         payload.branchIndex,
         payload.outcome,
@@ -481,666 +621,991 @@ class Runtime implements ScriptExecutorHost {
           status: call.status === "success" ? "success" : "failed",
         })),
       );
-    } catch (error) {
-      const failure = journalPolicyError(error, "workflow panel-branch commit failed");
-      this.recordPolicyError(failure);
-      throw failure;
-    }
-  }
+    }).pipe(recordPolicyFailure);
 
-  async releasePanel(payload: {
+  const releasePanel = (payload: {
     reservationId: string;
     callPath?: unknown;
     completed?: boolean;
     branchOutcomes?: unknown;
-  }): Promise<void> {
-    const callPath = typeof payload.callPath === "string" ? payload.callPath : undefined;
-    const trace = callPath ? this.activePanelTraces.get(callPath) : undefined;
-    try {
-      if (payload.completed && callPath && trace) {
-        const branchOutcomes = Array.isArray(payload.branchOutcomes)
-          ? payload.branchOutcomes
-          : [];
-        if (
-          branchOutcomes.length !== trace.branchCount
-          || branchOutcomes.some((outcome) => outcome !== "success" && outcome !== "failed")
-        ) {
-          throw new WorkflowPolicyError(`workflow returned invalid branch outcomes for ${callPath}`);
+  }) =>
+    Effect.suspend(() => {
+      const callPath = typeof payload.callPath === "string" ? payload.callPath : undefined;
+      const trace = callPath ? activePanelTraces.get(callPath) : undefined;
+      return journalOperation("workflow panel completion commit failed", () => {
+        if (payload.completed && callPath && trace) {
+          const branchOutcomes = Array.isArray(payload.branchOutcomes)
+            ? payload.branchOutcomes
+            : [];
+          if (
+            branchOutcomes.length !== trace.branchCount ||
+            branchOutcomes.some((outcome) => outcome !== "success" && outcome !== "failed")
+          ) {
+            throw new WorkflowPolicyError(
+              `workflow returned invalid branch outcomes for ${callPath}`,
+            );
+          }
+          options.journal?.recordPanelComplete(
+            callPath,
+            trace.branchCount,
+            branchOutcomes as Array<"success" | "failed">,
+            trace.calls.map((call) => ({
+              callPath: call.callPath,
+              status: call.status === "success" ? "success" : "failed",
+            })),
+          );
         }
-        this.options.journal?.recordPanelComplete(
-          callPath,
-          trace.branchCount,
-          branchOutcomes as Array<"success" | "failed">,
-          trace.calls.map((call) => ({
-            callPath: call.callPath,
-            status: call.status === "success" ? "success" : "failed",
+      }).pipe(
+        recordPolicyFailure,
+        Effect.ensuring(
+          Effect.sync(() => {
+            admission.releasePanel(payload.reservationId);
+            if (callPath && trace) releasePanelTrace(callPath, trace);
+          }),
+        ),
+      );
+    });
+
+  const loadWorkflow = (payload: { nameOrRef: unknown; callPath?: unknown; args?: unknown }) =>
+    attempt(() => {
+      throwIfAborted();
+      assertWorkflowArgsLimit(payload.args);
+      const workerCallPath = requireString(payload.callPath, "nested workflow callPath");
+      const ref = normalizeWorkflowRef(payload.nameOrRef);
+      const argsJson = JSON.stringify(payload.args);
+      const sourceCallPath = workerCallPath.replace(/:\d+$/, "");
+      const requestHash = hashString(`${stableStringify(ref)}\u0000${argsJson}`).slice(0, 16);
+      const requestBase = `${sourceCallPath}/q:${requestHash}`;
+      const requestOccurrence = nestedRequestOccurrences.get(requestBase) ?? 0;
+      nestedRequestOccurrences.set(requestBase, requestOccurrence + 1);
+      const callPath = `${requestBase}:${requestOccurrence}`;
+      const loader =
+        options.loadSavedWorkflow ??
+        ((r) => loadSavedWorkflowFromDisk(r, cwd, options.projectTrusted ?? false));
+      const loaded = loader(ref);
+      const sourceHash = hashString(
+        `${stableStringify(loaded.meta)}\u0000${loaded.body}\u0000${argsJson}`,
+      );
+      return { loaded, callPath, sourceHash };
+    }).pipe(
+      Effect.flatMap(({ loaded, callPath, sourceHash }) =>
+        journalOperation("nested workflow identity commit failed", () =>
+          options.journal?.recordNestedSource(callPath, sourceHash),
+        ).pipe(recordPolicyFailure, Effect.as({ ...loaded, callPath })),
+      ),
+    );
+
+  const validateOutput = (payload: { value: unknown; label?: unknown }) =>
+    attempt(() => assertWorkflowOutputLimit(payload.value, "nested workflow output")).pipe(
+      recordPolicyFailure,
+    );
+
+  function prepareAgent(payload: AgentPayload) {
+    return attempt(() => {
+      throwIfAborted();
+      const workerCallPath = requireString(payload.callPath, "agent callPath");
+      if (seenCallPaths.has(workerCallPath)) {
+        const error = new WorkflowPolicyError(
+          `workflow produced duplicate agent callPath: ${workerCallPath}`,
+        );
+        recordPolicyError(error);
+        throw error;
+      }
+      seenCallPaths.add(workerCallPath);
+      const prompt = requireString(payload.prompt, "agent prompt");
+      const opts = normalizeAgentOptions(payload.options);
+      // The Worker owns phase scope. Falling back to host-global display state here
+      // would make cache identity depend on parallel branch completion order.
+      const assignedPhase = opts.phase ?? payload.assignedPhase;
+      const sourceCallPath = workerCallPath.replace(/:\d+$/, "");
+      const requestHash = hashString(
+        stableStringify({
+          prompt,
+          options: { ...opts, phase: assignedPhase },
+        }),
+      ).slice(0, 16);
+      const requestBase = `${sourceCallPath}/q:${requestHash}`;
+      const requestOccurrence = agentRequestOccurrences.get(requestBase) ?? 0;
+      agentRequestOccurrences.set(requestBase, requestOccurrence + 1);
+      const callPath = `${requestBase}:${requestOccurrence}`;
+      const id = ++state.agentCount;
+      const label = opts.label?.trim() || defaultLabel(assignedPhase, id);
+      const workflowPath = Array.isArray(payload.workflowPath) ? [...payload.workflowPath] : [];
+      const agentTypeDef = resolveAgentType(opts.agentType, agentTypes);
+      if (opts.agentType !== undefined && !agentTypeDef) {
+        const error = new WorkflowPolicyError(`unknown agent type: ${opts.agentType}`);
+        recordPolicyError(error);
+        throw error;
+      }
+      const selection = resolveModelSelection({
+        pattern: opts.model,
+        roleModel: agentTypeDef?.model,
+        roleThinking: agentTypeDef?.thinking,
+        defaultModel: options.model,
+        defaultThinking: options.thinkingLevel,
+        models: options.modelRegistry?.getAvailable(),
+      });
+      const key = agentCallKey(prompt, {
+        ...opts,
+        phase: assignedPhase,
+        agentTypeDefinition: agentTypeDef,
+        effectiveModel: modelIdentity(selection.model),
+        effectiveThinking: selection.thinkingLevel,
+        targetIdentity: options.targetIdentity,
+      });
+
+      return {
+        callPath,
+        prompt,
+        opts,
+        assignedPhase,
+        id,
+        label,
+        workflowPath,
+        agentTypeDef,
+        selection,
+        key,
+      };
+    }).pipe(
+      Effect.flatMap((prepared) =>
+        journalOperation("workflow cache lookup failed", () => {
+          assertTargetIdentityCurrent();
+          return options.journal?.lookup(prepared.callPath, prepared.key);
+        }).pipe(
+          recordPolicyFailure,
+          Effect.map((cached) => ({ ...prepared, cached })),
+        ),
+      ),
+    );
+  }
+
+  type PreparedAgent = Effect.Success<ReturnType<typeof prepareAgent>>;
+  type JevMember = ReturnType<typeof createJevBatch>[number];
+
+  function replayAgent(prepared: PreparedAgent, cached: JournalAgentRecord) {
+    const { callPath, prompt, opts, assignedPhase, id, label, workflowPath, selection } = prepared;
+    return verifyCachedDelivery(cached).pipe(
+      Effect.andThen(
+        attempt(() => {
+          beginPanelAgent(callPath);
+          state.cachedCount++;
+          state.spent += cached.outputTokens ?? 0;
+          state.replayedTokens += cached.totalTokens ?? 0;
+          const cachedUsage: AgentUsage = {
+            inputTokens: cached.inputTokens,
+            outputTokens: cached.outputTokens ?? 0,
+            totalTokens: cached.totalTokens ?? 0,
+            cacheReadTokens: cached.cacheReadTokens,
+            cacheWriteTokens: cached.cacheWriteTokens,
+            cost: cached.cost ?? 0,
+            turns: cached.turns,
+            toolUses: cached.toolUses,
+            retries: cached.retries,
+            compactions: cached.compactions,
+          };
+          const replayValue = cloneResult(cached.value, "cached agent result");
+          notifyObserver(() =>
+            options.onAgentStart?.({
+              id,
+              callPath,
+              label,
+              phase: assignedPhase,
+              workflowPath,
+              prompt,
+              cached: true,
+              modelPattern: opts.model,
+              requestedEffort: selection.thinkingLevel,
+              agentType: opts.agentType,
+              isolation: opts.isolation,
+              structuredOutput: opts.schema != null,
+              cachedRecord: cloneResult(cached, "cached agent record"),
+            }),
+          );
+          notifyObserverBestEffort(() =>
+            options.onAgentEnd?.({
+              id,
+              callPath,
+              label,
+              phase: assignedPhase,
+              workflowPath,
+              result: cloneResult(replayValue, "cached observer result"),
+              status: "done",
+              usage: cachedUsage,
+              modelId: cached.modelId,
+              effort: cached.effort,
+              cachedRecord: cloneResult(cached, "cached agent record"),
+            }),
+          );
+          finishPanelAgent(callPath, "success");
+          return replayValue;
+        }),
+      ),
+    );
+  }
+
+  function admitAgent(payload: AgentPayload, { callPath, key }: PreparedAgent) {
+    return journalOperation("workflow admission commit failed", () => {
+      const ordinal = admission.consumeAgent(
+        Array.isArray(payload.reservationIds) ? payload.reservationIds : [],
+      );
+      options.journal?.recordAdmission(callPath, key, ordinal);
+    }).pipe(recordPolicyFailure, Effect.andThen(attempt(() => beginPanelAgent(callPath))));
+  }
+
+  function makeAgentExecution() {
+    return Effect.scope.pipe(
+      Effect.flatMap((scope) => {
+        let closed = false;
+        const checkOpen = () => {
+          throwIfAborted();
+          if (closed) throw new WorkflowAbortError();
+        };
+        // Cache the Effect, not a Promise: forwarding runners share both pending
+        // and completed acquisition. Closing this agent's scope cancels even an
+        // acquisition that a faulty runner started without awaiting it.
+        return Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            closed = true;
+          }),
+        ).pipe(
+          Effect.andThen(
+            Effect.cached(
+              Effect.acquireRelease(
+                attempt(() => {
+                  checkOpen();
+                  return execution.request();
+                }),
+                (request) => Effect.sync(request.release),
+              ).pipe(
+                Effect.flatMap((request) => request.ready),
+                Scope.provide(scope),
+              ),
+            ),
+          ),
+          Effect.map((permit) => permit.pipe(Effect.andThen(attempt(checkOpen)))),
+        );
+      }),
+    );
+  }
+
+  function runLiveAgent(payload: AgentPayload, member: JevMember, prepared: PreparedAgent) {
+    return Effect.suspend(() => {
+      const {
+        callPath,
+        prompt,
+        opts,
+        assignedPhase,
+        id,
+        label,
+        workflowPath,
+        agentTypeDef,
+        selection,
+        key,
+      } = prepared;
+      let worktree: Worktree | undefined;
+      let worktreeSettled = false;
+      let keepWorktree = true;
+      let observedUsage: AgentUsage | undefined;
+
+      function prepareAgentResult(result: AgentRunResult, agentStartedAt: number) {
+        return attempt(() => {
+          throwIfAborted();
+          const usage = normalizeAgentUsage(result.usage);
+          state.spent += usage.outputTokens;
+          state.newTokens += usage.totalTokens;
+          observedUsage = usage;
+
+          // Clone failures are ordinary runner-result failures. Values that clone
+          // successfully but violate the durable JSON contract are fatal policy.
+          const clonedValue = cloneResult(result.value, "agent result");
+          return { clonedValue, usage };
+        }).pipe(
+          Effect.tap(({ clonedValue }) =>
+            attempt(() => assertWorkflowOutputLimit(clonedValue, "workflow agent output")).pipe(
+              recordPolicyFailure,
+            ),
+          ),
+          Effect.map(({ clonedValue, usage }) => ({
+            clonedValue,
+            usage,
+            commitAgent: (delivery?: { patchPath: string; patchHash: string }) =>
+              attempt(assertTargetIdentityCurrent).pipe(
+                Effect.andThen(
+                  journalOperation("workflow agent-result commit failed", () => {
+                    options.journal?.recordAgent({
+                      callPath,
+                      seq: id,
+                      key,
+                      label,
+                      value: clonedValue,
+                      inputTokens: usage.inputTokens,
+                      outputTokens: usage.outputTokens,
+                      totalTokens: usage.totalTokens,
+                      cacheReadTokens: usage.cacheReadTokens,
+                      cacheWriteTokens: usage.cacheWriteTokens,
+                      cost: usage.cost,
+                      turns: usage.turns,
+                      toolUses: usage.toolUses,
+                      retries: usage.retries,
+                      compactions: usage.compactions,
+                      requestedModelId: opts.model,
+                      requestedEffort: selection.thinkingLevel,
+                      modelId: result.modelId,
+                      effort: result.effort,
+                      agentType: opts.agentType,
+                      isolation: opts.isolation,
+                      structuredOutput: opts.schema != null,
+                      deliveryPatchPath: delivery?.patchPath,
+                      deliveryPatchHash: delivery?.patchHash,
+                      startedAt: agentStartedAt,
+                      durationMs: Date.now() - agentStartedAt,
+                    });
+                  }).pipe(recordPolicyFailure),
+                ),
+              ),
           })),
         );
       }
-    } catch (error) {
-      const failure = journalPolicyError(error, "workflow panel completion commit failed");
-      this.recordPolicyError(failure);
-      throw failure;
-    } finally {
-      this.admission.releasePanel(payload.reservationId);
-      if (callPath && trace) this.releasePanelTrace(callPath, trace);
-    }
+
+      function deliverAgentResult(
+        commitAgent: (delivery?: {
+          patchPath: string;
+          patchHash: string;
+        }) => Effect.Effect<void, RuntimeFailure>,
+      ) {
+        if (!worktree) return commitAgent();
+        return integrateWorktree(worktree, id, label, callPath, commitAgent).pipe(
+          Effect.flatMap((outcome) => {
+            worktreeSettled = true;
+            keepWorktree = outcome.keepWorktree;
+            return outcome.status === "rescued" || outcome.status === "preserved"
+              ? Effect.fail(
+                  runtimeFailure(
+                    new Error(
+                      `worktree changes were not delivered; recover from ${outcome.recoveryPath}`,
+                    ),
+                  ),
+                )
+              : Effect.void;
+          }),
+        );
+      }
+
+      function publishAgentResult(result: AgentRunResult, clonedValue: unknown, usage: AgentUsage) {
+        return attempt(() => {
+          // The durable agent record is the publication point. Completion observers
+          // run afterward and cannot veto a committed result.
+          notifyObserverBestEffort(() =>
+            options.onAgentEnd?.({
+              id,
+              callPath,
+              label,
+              phase: assignedPhase,
+              workflowPath,
+              result: cloneResult(clonedValue, "live observer result"),
+              status: "done",
+              usage,
+              modelId: result.modelId,
+              effort: result.effort,
+            }),
+          );
+          finishPanelAgent(callPath, "success");
+          return clonedValue;
+        });
+      }
+
+      function callRunner(
+        runner: AgentRunner,
+        acquireExecution: Effect.Effect<void, RuntimeFailure>,
+      ) {
+        const onActivity: ((e: AgentActivityInput) => void) | undefined = options.onAgentActivity
+          ? (e: AgentActivityInput) =>
+              options.onAgentActivity!({
+                id,
+                callPath,
+                label,
+                phase: assignedPhase,
+                workflowPath,
+                ...e,
+              })
+          : undefined;
+        const onTelemetry: ((e: AgentTelemetryEvent) => void) | undefined = options.onAgentTelemetry
+          ? (e: AgentTelemetryEvent) =>
+              options.onAgentTelemetry!({
+                id,
+                callPath,
+                label,
+                phase: assignedPhase,
+                workflowPath,
+                ...e,
+              })
+          : undefined;
+        const agentStartedAt = Date.now();
+        return fromPromise(() =>
+          runner.run({
+            prompt,
+            label,
+            schema: opts.schema,
+            signal: childController.signal,
+            ...(runner.supportsSchedulingHooks
+              ? {
+                  acquireExecution: () => runBoundary(acquireExecution),
+                  selectEffort: (task) => {
+                    if (!task) {
+                      member.skip();
+                      return runBoundary(Effect.succeed(undefined));
+                    }
+                    return member.select({
+                      ...task,
+                      context: {
+                        callPath,
+                        workflowPath,
+                        scheduling: payload.scheduling ?? [],
+                        ...(assignedPhase ? { phase: assignedPhase } : {}),
+                        ...(payload.workflowContext ? { workflow: payload.workflowContext } : {}),
+                      },
+                    });
+                  },
+                }
+              : {}),
+            instructions: buildInstructions(assignedPhase, opts),
+            modelPattern: opts.model,
+            agentTypeDef,
+            cwd: worktree?.agentCwd,
+            onActivity,
+            onTelemetry,
+          }),
+        ).pipe(
+          Effect.flatMap((result) =>
+            prepareAgentResult(result, agentStartedAt).pipe(
+              Effect.flatMap(({ clonedValue, usage, commitAgent }) =>
+                deliverAgentResult(commitAgent).pipe(
+                  Effect.andThen(publishAgentResult(result, clonedValue, usage)),
+                ),
+              ),
+            ),
+          ),
+        );
+      }
+
+      function executeAgent(
+        runner: AgentRunner,
+        acquireExecution: Effect.Effect<void, RuntimeFailure>,
+      ) {
+        const ready = runner.supportsSchedulingHooks
+          ? Effect.void
+          : Effect.sync(() => member.skip()).pipe(Effect.andThen(acquireExecution));
+        return ready.pipe(
+          Effect.andThen(() =>
+            opts.isolation === "worktree"
+              ? createIsolatedWorktree(id).pipe(
+                  Effect.tap((created) =>
+                    Effect.sync(() => {
+                      worktree = created;
+                    }),
+                  ),
+                )
+              : Effect.void,
+          ),
+          Effect.andThen(() => callRunner(runner, acquireExecution)),
+        );
+      }
+
+      function recoverAgentFailure({ error }: RuntimeFailure) {
+        const recovery =
+          worktree && !worktreeSettled
+            ? recoverFailedWorktree(worktree, id, label).pipe(
+                Effect.tap((outcome) =>
+                  Effect.sync(() => {
+                    worktreeSettled = true;
+                    keepWorktree = outcome.keepWorktree;
+                    if (
+                      childController.signal.aborted ||
+                      options.signal?.aborted ||
+                      isWorkflowPolicyError(error)
+                    ) {
+                      // Recursive worktree removal is not synchronously deadline-safe.
+                      // Preserve it on cancellation/policy cleanup instead of overrunning the budget.
+                      keepWorktree = true;
+                      logLineBestEffort(
+                        `worktree[${label}]: cleanup cancelled; worktree KEPT at ${worktree!.path}`,
+                      );
+                    }
+                  }),
+                ),
+              )
+            : Effect.void;
+        return recovery.pipe(
+          Effect.andThen(
+            attempt(() => {
+              if (
+                childController.signal.aborted ||
+                options.signal?.aborted ||
+                isWorkflowPolicyError(error)
+              )
+                throw error;
+
+              const message = error instanceof Error ? error.message : String(error);
+              finishPanelAgent(callPath, "failed");
+              logLine(`agent ${label} failed: ${message}`);
+              notifyObserverBestEffort(() =>
+                options.onAgentEnd?.({
+                  id,
+                  callPath,
+                  label,
+                  phase: assignedPhase,
+                  workflowPath,
+                  result: null,
+                  status: "error",
+                  error: message,
+                  usage: observedUsage,
+                }),
+              );
+              return null;
+            }),
+          ),
+        );
+      }
+
+      return Effect.addFinalizer(() =>
+        // Removal is best effort and must never change a delivery outcome.
+        attempt(() => {
+          if (worktree && worktreeSettled && !keepWorktree) removeWorktree(worktree);
+        }).pipe(Effect.ignore),
+      ).pipe(
+        Effect.andThen(
+          attempt(() => {
+            notifyObserver(() =>
+              options.onAgentStart?.({
+                id,
+                callPath,
+                label,
+                phase: assignedPhase,
+                workflowPath,
+                prompt,
+                cached: false,
+                modelPattern: opts.model,
+                requestedEffort: selection.thinkingLevel,
+                agentType: opts.agentType,
+                isolation: opts.isolation,
+                structuredOutput: opts.schema != null,
+              }),
+            );
+          }),
+        ),
+        Effect.andThen(makeAgentExecution()),
+        Effect.flatMap((acquireExecution) =>
+          attempt(throwIfAborted).pipe(
+            Effect.andThen(runnerService.get),
+            Effect.flatMap((runner) => executeAgent(runner, acquireExecution)),
+            Effect.catch(recoverAgentFailure),
+          ),
+        ),
+        Effect.scoped,
+      );
+    });
   }
 
-  private releasePanelTrace(callPath: string, trace: ActivePanelTrace): void {
-    for (const reservationId of trace.branchReservationIds) this.admission.releasePanel(reservationId);
-    this.admission.releasePanel(trace.panelReservationId);
-    this.activePanelTraces.delete(callPath);
+  function runAgent(payload: AgentPayload, member: JevMember) {
+    return prepareAgent(payload).pipe(
+      Effect.flatMap((prepared) =>
+        prepared.cached
+          ? replayAgent(prepared, prepared.cached)
+          : admitAgent(payload, prepared).pipe(
+              Effect.andThen(() => runLiveAgent(payload, member, prepared)),
+            ),
+      ),
+      // Keep the selected policy failure on the host side before the Worker
+      // serializes it. Recovery and rollback have already chosen its precedence.
+      recordPolicyFailure,
+    );
   }
 
-  private releaseOpenPanels(): void {
-    for (const [callPath, trace] of this.activePanelTraces) this.releasePanelTrace(callPath, trace);
+  function agentBatch(payloads: AgentPayload[]): Promise<unknown>[] {
+    const members = createJevBatch(payloads.length, workflowContext, childController.signal);
+    return payloads.map((payload, index) => {
+      // These fibers intentionally outlive a bounded drain if a native runner
+      // ignores AbortSignal. Each owns its scope; the runtime tracks their exits.
+      const fiber = Effect.runFork(
+        runAgent(payload, members[index]).pipe(
+          Effect.ensuring(Effect.sync(() => members[index].skip())),
+        ),
+      );
+      pending.add(fiber);
+      fiber.addObserver(() => pending.delete(fiber));
+      return runBoundary(Fiber.join(fiber));
+    });
   }
 
-  private beginPanelAgent(callPath: string): void {
-    for (const [panelPath, trace] of this.activePanelTraces) {
+  function verifyCachedDelivery(record: JournalAgentRecord): Effect.Effect<void, RuntimeFailure> {
+    return Effect.suspend(() => {
+      if (!record.deliveryPatchPath || !record.deliveryPatchHash) return Effect.void;
+      const { deliveryPatchPath, deliveryPatchHash } = record;
+      return attempt(() => {
+        const context = resolveRepositoryContext(cwd);
+        if (!context.repoRoot || !options.journal) {
+          const error = new WorkflowPolicyError(
+            `cached worktree delivery at ${record.callPath} has no matching Git target`,
+          );
+          recordPolicyError(error);
+          throw error;
+        }
+        return {
+          repoRoot: context.repoRoot,
+          patchRoot: path.join(path.dirname(options.journal.filePath), "patches"),
+        };
+      }).pipe(
+        Effect.flatMap(({ repoRoot, patchRoot }) =>
+          repositoryApplyLock(repoRoot).pipe(
+            Effect.flatMap((lock) =>
+              withExecutionPermit(
+                lock,
+                attempt(() =>
+                  verifyAppliedPatch(repoRoot, deliveryPatchPath, deliveryPatchHash, patchRoot),
+                ),
+              ),
+            ),
+            Effect.flatMap((valid) =>
+              valid
+                ? Effect.void
+                : Effect.fail(
+                    runtimeFailure(
+                      new Error(
+                        "the delivered patch is no longer present in the shared working tree",
+                      ),
+                    ),
+                  ),
+            ),
+            Effect.catch(({ error }) =>
+              attempt(() => {
+                const failure = new WorkflowPolicyError(
+                  `cached worktree delivery at ${record.callPath} requires recovery: ${errorMessage(error)}`,
+                );
+                (failure as Error & { cause?: unknown }).cause = error;
+                recordPolicyError(failure);
+                throw failure;
+              }),
+            ),
+          ),
+        ),
+      );
+    });
+  }
+
+  /** Fold a successful isolated result into the shared repository. */
+  function integrateWorktree(
+    worktree: Worktree,
+    id: number,
+    label: string,
+    callPath: string,
+    commitAgent: (delivery?: {
+      patchPath: string;
+      patchHash: string;
+    }) => Effect.Effect<void, RuntimeFailure>,
+  ): Effect.Effect<WorktreeOutcome, RuntimeFailure> {
+    const planDelivery = (diff: WorktreeDiff) =>
+      attempt(() => {
+        // Persist the exact delivery material before the shared repository changes.
+        const runId = options.journal ? path.basename(options.journal.filePath, ".jsonl") : "run";
+        const durablePatch = writeRescuePatch(rescueDir(), runId, id, label, diff.patch);
+        return { durablePatch, patchHash: hashBytes(fs.readFileSync(durablePatch)) };
+      });
+    const applyDelivery = (diff: WorktreeDiff, durablePatch: string, patchHash: string) =>
+      attempt(() => {
+        throwIfAborted();
+        assertTargetIdentityCurrent();
+        options.journal?.recordDeliveryStart(callPath, durablePatch, patchHash);
+        return applyPatch(worktree.repoRoot, diff.patch);
+      }).pipe(
+        Effect.flatMap((applied): Effect.Effect<WorktreeOutcome, RuntimeFailure> => {
+          if (!applied) {
+            logLineBestEffort(
+              `worktree[${label}]: changes could NOT be applied cleanly; patch saved to ${durablePatch} — review and apply manually`,
+            );
+            return Effect.succeed({
+              status: "rescued",
+              keepWorktree: false,
+              recoveryPath: durablePatch,
+            });
+          }
+          return commitAgent({ patchPath: durablePatch, patchHash }).pipe(
+            Effect.andThen(
+              options.journal
+                ? Effect.void
+                : // Standalone runs have no replay state to verify.
+                  attempt(() => fs.unlinkSync(durablePatch)).pipe(Effect.ignore),
+            ),
+            Effect.andThen(
+              Effect.sync(() => {
+                logLineBestEffort(
+                  `worktree[${label}]: ${diff.filesChanged} file(s), +${diff.insertions}/-${diff.deletions} applied to working tree`,
+                );
+                return { status: "applied", keepWorktree: false } as const;
+              }),
+            ),
+          );
+        }),
+      );
+    return attempt(() => captureWorktreeDiff(worktree)).pipe(
+      Effect.flatMap((diff): Effect.Effect<WorktreeOutcome, RuntimeFailure> => {
+        if (!hasChanges(diff)) {
+          return commitAgent().pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                logLineBestEffort(`worktree[${label}]: no changes (auto-removed)`);
+                return { status: "unchanged", keepWorktree: false } as const;
+              }),
+            ),
+          );
+        }
+        return planDelivery(diff).pipe(
+          Effect.flatMap(({ durablePatch, patchHash }) =>
+            repositoryApplyLock(worktree.repoRoot).pipe(
+              Effect.flatMap((lock) =>
+                withExecutionPermit(lock, applyDelivery(diff, durablePatch, patchHash)),
+              ),
+            ),
+          ),
+        );
+      }),
+      Effect.catch((failure) => {
+        logLineBestEffort(
+          `worktree[${label}]: integration failed (${errorMessage(failure.error)}); worktree KEPT at ${worktree.path} — recover with: git -C ${worktree.path} diff`,
+        );
+        return isWorkflowPolicyError(failure.error)
+          ? Effect.fail(failure)
+          : Effect.succeed({
+              status: "preserved",
+              keepWorktree: true,
+              recoveryPath: worktree.path,
+            } as const);
+      }),
+    );
+  }
+
+  /** Preserve edits from a runner/policy/abort failure without publishing them. */
+  const recoverFailedWorktree = (
+    worktree: Worktree,
+    id: number,
+    label: string,
+  ): Effect.Effect<WorktreeOutcome, RuntimeFailure> =>
+    attempt(() => captureWorktreeDiff(worktree, remainingCleanupTimeout())).pipe(
+      Effect.flatMap((diff) =>
+        hasChanges(diff)
+          ? rescueDiff(worktree, diff, id, label, "agent failed before delivery")
+          : Effect.succeed({ status: "unchanged", keepWorktree: false } as const),
+      ),
+      Effect.catch(({ error }) =>
+        Effect.sync(() => {
+          logLineBestEffort(
+            `worktree[${label}]: recovery capture failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} — recover with: git -C ${worktree.path} diff`,
+          );
+          return { status: "preserved", keepWorktree: true, recoveryPath: worktree.path } as const;
+        }),
+      ),
+    );
+
+  function throwIfAborted(): void {
+    if (childController.signal.aborted || options.signal?.aborted) throw new WorkflowAbortError();
+  }
+
+  function phase(title: string): void {
+    if (!title) return;
+    state.currentPhase = title;
+    if (!state.phases.includes(title)) state.phases.push(title);
+    options.onPhase?.(title);
+  }
+
+  function releasePanelTrace(callPath: string, trace: ActivePanelTrace): void {
+    for (const reservationId of trace.branchReservationIds) admission.releasePanel(reservationId);
+    admission.releasePanel(trace.panelReservationId);
+    activePanelTraces.delete(callPath);
+  }
+
+  function releaseOpenPanels(): void {
+    for (const [callPath, trace] of activePanelTraces) releasePanelTrace(callPath, trace);
+  }
+
+  function beginPanelAgent(callPath: string): void {
+    for (const [panelPath, trace] of activePanelTraces) {
       if (!callPath.startsWith(`${panelPath}/`)) continue;
       trace.calls.push({ callPath, status: "pending" });
     }
   }
 
-  private finishPanelAgent(callPath: string, status: "success" | "failed"): void {
-    for (const [panelPath, trace] of this.activePanelTraces) {
+  function finishPanelAgent(callPath: string, status: "success" | "failed"): void {
+    for (const [panelPath, trace] of activePanelTraces) {
       if (!callPath.startsWith(`${panelPath}/`)) continue;
       const call = trace.calls.find((candidate) => candidate.callPath === callPath);
       if (call) call.status = status;
     }
   }
 
-  async loadWorkflow(payload: {
-    nameOrRef: unknown;
-    callPath?: unknown;
-    args?: unknown;
-  }): Promise<{ meta: WorkflowMeta; body: string; callPath: string }> {
-    this.throwIfAborted();
-    assertWorkflowArgsLimit(payload.args);
-    const workerCallPath = requireString(payload.callPath, "nested workflow callPath");
-    const ref = normalizeWorkflowRef(payload.nameOrRef);
-    const argsJson = JSON.stringify(payload.args);
-    const sourceCallPath = workerCallPath.replace(/:\d+$/, "");
-    const requestHash = hashString(`${stableStringify(ref)}\u0000${argsJson}`).slice(0, 16);
-    const requestBase = `${sourceCallPath}/q:${requestHash}`;
-    const requestOccurrence = this.nestedRequestOccurrences.get(requestBase) ?? 0;
-    this.nestedRequestOccurrences.set(requestBase, requestOccurrence + 1);
-    const callPath = `${requestBase}:${requestOccurrence}`;
-    const loader = this.options.loadSavedWorkflow
-      ?? ((r) => loadSavedWorkflowFromDisk(r, this.cwd, this.options.projectTrusted ?? false));
-    const loaded = loader(ref);
-    const sourceHash = hashString(
-      `${stableStringify(loaded.meta)}\u0000${loaded.body}\u0000${argsJson}`,
-    );
-    try {
-      this.options.journal?.recordNestedSource(callPath, sourceHash);
-    } catch (error) {
-      const failure = journalPolicyError(error, "nested workflow identity commit failed");
-      this.recordPolicyError(failure);
-      throw failure;
-    }
-    return { ...loaded, callPath };
-  }
-
-  async validateOutput(payload: { value: unknown; label?: unknown }): Promise<void> {
-    try {
-      assertWorkflowOutputLimit(payload.value, "nested workflow output");
-    } catch (error) {
-      this.recordPolicyError(error);
-      throw error;
-    }
-  }
-
-  agent(payload: AgentPayload): Promise<unknown> {
-    return this.agentBatch([payload])[0];
-  }
-
-  agentBatch(payloads: AgentPayload[]): Promise<unknown>[] {
-    const members = createJevBatch(payloads.length, this.workflowContext, this.childController.signal);
-    return payloads.map((payload, index) =>
-      this.runAgent(payload, members[index]).finally(() => members[index].skip()));
-  }
-
-  private async runAgent(payload: AgentPayload, member: ReturnType<typeof createJevBatch>[number]): Promise<unknown> {
-    this.throwIfAborted();
-    const workerCallPath = requireString(payload.callPath, "agent callPath");
-    if (this.seenCallPaths.has(workerCallPath)) {
-      const error = new WorkflowPolicyError(`workflow produced duplicate agent callPath: ${workerCallPath}`);
-      this.recordPolicyError(error);
-      throw error;
-    }
-    this.seenCallPaths.add(workerCallPath);
-    const prompt = requireString(payload.prompt, "agent prompt");
-    const opts = normalizeAgentOptions(payload.options);
-    // The Worker owns phase scope. Falling back to host-global display state here
-    // would make cache identity depend on parallel branch completion order.
-    const assignedPhase = opts.phase ?? payload.assignedPhase;
-    const sourceCallPath = workerCallPath.replace(/:\d+$/, "");
-    const requestHash = hashString(stableStringify({
-      prompt,
-      options: { ...opts, phase: assignedPhase },
-    })).slice(0, 16);
-    const requestBase = `${sourceCallPath}/q:${requestHash}`;
-    const requestOccurrence = this.agentRequestOccurrences.get(requestBase) ?? 0;
-    this.agentRequestOccurrences.set(requestBase, requestOccurrence + 1);
-    const callPath = `${requestBase}:${requestOccurrence}`;
-    const id = ++this.state.agentCount;
-    const label = opts.label?.trim() || defaultLabel(assignedPhase, id);
-    const workflowPath = Array.isArray(payload.workflowPath) ? [...payload.workflowPath] : [];
-    const agentTypeDef = resolveAgentType(opts.agentType, this.agentTypes);
-    if (opts.agentType !== undefined && !agentTypeDef) {
-      const error = new WorkflowPolicyError(`unknown agent type: ${opts.agentType}`);
-      this.recordPolicyError(error);
-      throw error;
-    }
-    const selection = resolveModelSelection({
-      pattern: opts.model,
-      roleModel: agentTypeDef?.model,
-      roleThinking: agentTypeDef?.thinking,
-      defaultModel: this.options.model,
-      defaultThinking: this.options.thinkingLevel,
-      models: this.options.modelRegistry?.getAvailable(),
-    });
-    const key = agentCallKey(prompt, {
-      ...opts,
-      phase: assignedPhase,
-      agentTypeDefinition: agentTypeDef,
-      effectiveModel: modelIdentity(selection.model),
-      effectiveThinking: selection.thinkingLevel,
-      targetIdentity: this.options.targetIdentity,
-    });
-
-    let cached: JournalAgentRecord | undefined;
-    try {
-      this.assertTargetIdentityCurrent();
-      cached = this.options.journal?.lookup(callPath, key);
-    } catch (error) {
-      const failure = journalPolicyError(error, "workflow cache lookup failed");
-      this.recordPolicyError(failure);
-      throw failure;
-    }
-    if (cached) {
-      await this.verifyCachedDelivery(cached);
-      this.beginPanelAgent(callPath);
-      this.state.cachedCount++;
-      this.state.spent += cached.outputTokens ?? 0;
-      this.state.replayedTokens += cached.totalTokens ?? 0;
-      const cachedUsage: AgentUsage = {
-        inputTokens: cached.inputTokens,
-        outputTokens: cached.outputTokens ?? 0,
-        totalTokens: cached.totalTokens ?? 0,
-        cacheReadTokens: cached.cacheReadTokens,
-        cacheWriteTokens: cached.cacheWriteTokens,
-        cost: cached.cost ?? 0,
-        turns: cached.turns,
-        toolUses: cached.toolUses,
-        retries: cached.retries,
-        compactions: cached.compactions,
-      };
-      const replayValue = cloneResult(cached.value, "cached agent result");
-      this.notifyObserver(() => this.options.onAgentStart?.({
-        id,
-        callPath,
-        label,
-        phase: assignedPhase,
-        workflowPath,
-        prompt,
-        cached: true,
-        modelPattern: opts.model,
-        requestedEffort: selection.thinkingLevel,
-        agentType: opts.agentType,
-        isolation: opts.isolation,
-        structuredOutput: opts.schema != null,
-        cachedRecord: cloneResult(cached, "cached agent record"),
-      }));
-      this.notifyObserverBestEffort(() => this.options.onAgentEnd?.({
-        id,
-        callPath,
-        label,
-        phase: assignedPhase,
-        workflowPath,
-        result: cloneResult(replayValue, "cached observer result"),
-        status: "done",
-        usage: cachedUsage,
-        modelId: cached.modelId,
-        effort: cached.effort,
-        cachedRecord: cloneResult(cached, "cached agent record"),
-      }));
-      this.finishPanelAgent(callPath, "success");
-      return replayValue;
-    }
-
-    try {
-      const ordinal = this.admission.consumeAgent(Array.isArray(payload.reservationIds) ? payload.reservationIds : []);
-      this.options.journal?.recordAdmission(callPath, key, ordinal);
-    } catch (error) {
-      const failure = journalPolicyError(error, "workflow admission commit failed");
-      this.recordPolicyError(failure);
-      throw failure;
-    }
-
-    this.beginPanelAgent(callPath);
-    const run = (async () => {
-      let releaseExecution: (() => void) | undefined;
-      this.notifyObserver(() => this.options.onAgentStart?.({
-        id,
-        callPath,
-        label,
-        phase: assignedPhase,
-        workflowPath,
-        prompt,
-        cached: false,
-        modelPattern: opts.model,
-        requestedEffort: selection.thinkingLevel,
-        agentType: opts.agentType,
-        isolation: opts.isolation,
-        structuredOutput: opts.schema != null,
-      }));
-      let worktree: Worktree | undefined;
-      let worktreeSettled = false;
-      let keepWorktree = true;
-      let observedUsage: AgentUsage | undefined;
-      try {
-        this.throwIfAborted();
-        const runner = this.getRunner();
-        let executionPermit: Promise<() => void> | undefined;
-        const acquireExecution = async () => {
-          // Forwarding runners can re-enter while acquisition is pending or complete.
-          releaseExecution = await (executionPermit ??= this.acquireExecution());
-          this.throwIfAborted();
-        };
-        // Only declared scheduling-aware runners prepare/classify before admission.
-        if (!runner.supportsSchedulingHooks) {
-          member.skip();
-          await acquireExecution();
-        }
-        if (opts.isolation === "worktree") {
-          worktree = this.createIsolatedWorktree(id);
-        }
-
-        const onActivity: ((e: AgentActivityInput) => void) | undefined = this.options.onAgentActivity
-          ? (e: AgentActivityInput) =>
-              this.options.onAgentActivity!({ id, callPath, label, phase: assignedPhase, workflowPath, ...e })
-          : undefined;
-        const onTelemetry: ((e: AgentTelemetryEvent) => void) | undefined = this.options.onAgentTelemetry
-          ? (e: AgentTelemetryEvent) =>
-              this.options.onAgentTelemetry!({ id, callPath, label, phase: assignedPhase, workflowPath, ...e })
-          : undefined;
-        const agentStartedAt = Date.now();
-        const result: AgentRunResult = await runner.run({
-          prompt,
-          label,
-          schema: opts.schema,
-          signal: this.childController.signal,
-          ...(runner.supportsSchedulingHooks ? {
-            acquireExecution,
-            selectEffort: (task) => {
-              if (!task) {
-                member.skip();
-                return Promise.resolve(undefined);
-              }
-              return member.select({
-                ...task,
-                context: {
-                  callPath,
-                  workflowPath,
-                  scheduling: payload.scheduling ?? [],
-                  ...(assignedPhase ? { phase: assignedPhase } : {}),
-                  ...(payload.workflowContext ? { workflow: payload.workflowContext } : {}),
-                },
-              });
-            },
-          } : {}),
-          instructions: buildInstructions(assignedPhase, opts),
-          modelPattern: opts.model,
-          agentTypeDef,
-          cwd: worktree?.agentCwd,
-          onActivity,
-          onTelemetry,
-        });
-        this.throwIfAborted();
-        const usage = normalizeAgentUsage(result.usage);
-        this.state.spent += usage.outputTokens;
-        this.state.newTokens += usage.totalTokens;
-        observedUsage = usage;
-
-        // Clone failures are ordinary runner-result failures. Values that clone
-        // successfully but violate the durable JSON contract are fatal policy.
-        const clonedValue = cloneResult(result.value, "agent result");
-        try {
-          assertWorkflowOutputLimit(clonedValue, "workflow agent output");
-        } catch (error) {
-          this.recordPolicyError(error);
-          throw error;
-        }
-
-        const commitAgent = (delivery?: { patchPath: string; patchHash: string }) => {
-          this.assertTargetIdentityCurrent();
-          try {
-            this.options.journal?.recordAgent({
-              callPath,
-              seq: id,
-              key,
-              label,
-              value: clonedValue,
-              inputTokens: usage.inputTokens,
-              outputTokens: usage.outputTokens,
-              totalTokens: usage.totalTokens,
-              cacheReadTokens: usage.cacheReadTokens,
-              cacheWriteTokens: usage.cacheWriteTokens,
-              cost: usage.cost,
-              turns: usage.turns,
-              toolUses: usage.toolUses,
-              retries: usage.retries,
-              compactions: usage.compactions,
-              requestedModelId: opts.model,
-              requestedEffort: selection.thinkingLevel,
-              modelId: result.modelId,
-              effort: result.effort,
-              agentType: opts.agentType,
-              isolation: opts.isolation,
-              structuredOutput: opts.schema != null,
-              deliveryPatchPath: delivery?.patchPath,
-              deliveryPatchHash: delivery?.patchHash,
-              startedAt: agentStartedAt,
-              durationMs: Date.now() - agentStartedAt,
-            });
-          } catch (error) {
-            const failure = journalPolicyError(error, "workflow agent-result commit failed");
-            this.recordPolicyError(failure);
-            throw failure;
-          }
-        };
-
-        if (worktree) {
-          const outcome = await this.integrateWorktree(worktree, id, label, callPath, commitAgent);
-          worktreeSettled = true;
-          keepWorktree = outcome.keepWorktree;
-          if (outcome.status === "rescued" || outcome.status === "preserved") {
-            throw new Error(`worktree changes were not delivered; recover from ${outcome.recoveryPath}`);
-          }
-        } else {
-          commitAgent();
-        }
-        // The durable agent record is the publication point. Completion observers
-        // run afterward and cannot veto a committed result.
-        this.notifyObserverBestEffort(() => this.options.onAgentEnd?.({
-          id,
-          callPath,
-          label,
-          phase: assignedPhase,
-          workflowPath,
-          result: cloneResult(clonedValue, "live observer result"),
-          status: "done",
-          usage,
-          modelId: result.modelId,
-          effort: result.effort,
-        }));
-        this.finishPanelAgent(callPath, "success");
-        return clonedValue;
-      } catch (error) {
-        if (worktree && !worktreeSettled) {
-          const outcome = await this.recoverFailedWorktree(worktree, id, label);
-          worktreeSettled = true;
-          keepWorktree = outcome.keepWorktree;
-          if (this.childController.signal.aborted || this.options.signal?.aborted || isWorkflowPolicyError(error)) {
-            // Recursive worktree removal is not synchronously deadline-safe.
-            // Preserve it on cancellation/policy cleanup instead of overrunning the budget.
-            keepWorktree = true;
-            this.logLineBestEffort(`worktree[${label}]: cleanup cancelled; worktree KEPT at ${worktree.path}`);
-          }
-        }
-        if (this.childController.signal.aborted || this.options.signal?.aborted || isWorkflowPolicyError(error)) throw error;
-        const message = error instanceof Error ? error.message : String(error);
-        this.finishPanelAgent(callPath, "failed");
-        this.logLine(`agent ${label} failed: ${message}`);
-        this.notifyObserverBestEffort(() => this.options.onAgentEnd?.({
-          id,
-          callPath,
-          label,
-          phase: assignedPhase,
-          workflowPath,
-          result: null,
-          status: "error",
-          error: message,
-          usage: observedUsage,
-        }));
-        return null;
-      } finally {
-        releaseExecution?.();
-        if (worktree && worktreeSettled && !keepWorktree) {
-          try {
-            removeWorktree(worktree);
-          } catch {
-            // A cleanup failure must not change the delivery outcome.
-          }
-        }
-      }
-    })();
-    this.track(run);
-    return await run;
-  }
-
-  private async verifyCachedDelivery(record: JournalAgentRecord): Promise<void> {
-    if (!record.deliveryPatchPath || !record.deliveryPatchHash) return;
-    const context = resolveRepositoryContext(this.cwd);
-    if (!context.repoRoot || !this.options.journal) {
-      const error = new WorkflowPolicyError(`cached worktree delivery at ${record.callPath} has no matching Git target`);
-      this.recordPolicyError(error);
-      throw error;
-    }
-    const patchRoot = path.join(path.dirname(this.options.journal.filePath), "patches");
-    try {
-      const valid = await repositoryApplyLock(context.repoRoot).run(async () =>
-        verifyAppliedPatch(
-          context.repoRoot!,
-          record.deliveryPatchPath!,
-          record.deliveryPatchHash!,
-          patchRoot,
-        ));
-      if (!valid) {
-        throw new Error("the delivered patch is no longer present in the shared working tree");
-      }
-    } catch (error) {
-      const failure = new WorkflowPolicyError(
-        `cached worktree delivery at ${record.callPath} requires recovery: ${errorMessage(error)}`,
-      );
-      (failure as Error & { cause?: unknown }).cause = error;
-      this.recordPolicyError(failure);
-      throw failure;
-    }
-  }
-
-  private notifyObserver(callback: () => void): void {
-    try {
-      callback();
-    } catch (error) {
-      const failure = new WorkflowPolicyError(`workflow observer failed: ${errorMessage(error)}`);
-      (failure as Error & { cause?: unknown }).cause = error;
-      this.recordPolicyError(failure);
-      throw failure;
-    }
-  }
-
-  private notifyObserverBestEffort(callback: () => void): void {
-    try {
-      callback();
-    } catch (error) {
-      this.logLineBestEffort(`workflow completion observer failed: ${errorMessage(error)}`);
-    }
-  }
-
-  private recordPolicyError(error: unknown): void {
-    if (isWorkflowPolicyError(error)) {
-      this.policyError ??= error;
-      // Let the Worker finish branch/panel finally blocks; only child work stops here.
-      this.abortChildren();
-    }
-  }
-
-  private createIsolatedWorktree(index: number): Worktree {
-    this.assertTargetIdentityCurrent();
-    const runId = this.options.journal ? path.basename(this.options.journal.filePath, ".jsonl") : "run";
-    try {
-      const worktree = createWorktree(this.cwd, runId, index);
-      try {
-        this.assertTargetIdentityCurrent();
-      } catch (error) {
-        removeWorktree(worktree);
-        throw error;
-      }
-      return worktree;
-    } catch (error) {
-      if (isWorkflowPolicyError(error)) throw error;
-      throw new Error(`agent #${index}: worktree setup failed: ${errorMessage(error)}`);
-    }
-  }
-
-  /** Fold a successful isolated result into the shared repository. */
-  private async integrateWorktree(
-    worktree: Worktree,
-    id: number,
-    label: string,
-    callPath: string,
-    commitAgent: (delivery?: { patchPath: string; patchHash: string }) => void,
-  ): Promise<WorktreeOutcome> {
-    try {
-      const diff = captureWorktreeDiff(worktree);
-      if (!hasChanges(diff)) {
-        commitAgent();
-        this.logLineBestEffort(`worktree[${label}]: no changes (auto-removed)`);
-        return { status: "unchanged", keepWorktree: false };
-      }
-
-      // Persist the exact delivery material before the shared repository changes.
-      const runId = this.options.journal
-        ? path.basename(this.options.journal.filePath, ".jsonl")
-        : "run";
-      const durablePatch = writeRescuePatch(this.rescueDir(), runId, id, label, diff.patch);
-      const patchHash = hashBytes(fs.readFileSync(durablePatch));
-      const applyLock = repositoryApplyLock(worktree.repoRoot);
-      return await applyLock.run(async () => {
-        this.throwIfAborted();
-        this.assertTargetIdentityCurrent();
-        this.options.journal?.recordDeliveryStart(callPath, durablePatch, patchHash);
-        if (!applyPatch(worktree.repoRoot, diff.patch)) {
-          this.logLineBestEffort(
-            `worktree[${label}]: changes could NOT be applied cleanly; patch saved to ${durablePatch} — review and apply manually`,
+  function notifyObserver(callback: () => void): void {
+    runSyncBoundary(
+      attempt(callback).pipe(
+        Effect.mapError(({ error }) => {
+          const failure = new WorkflowPolicyError(
+            `workflow observer failed: ${errorMessage(error)}`,
           );
-          return { status: "rescued", keepWorktree: false, recoveryPath: durablePatch } as const;
-        }
-        commitAgent({ patchPath: durablePatch, patchHash });
-        if (!this.options.journal) {
-          try {
-            fs.unlinkSync(durablePatch);
-          } catch {
-            // Standalone runs have no replay state to verify.
-          }
-        }
-        this.logLineBestEffort(
-          `worktree[${label}]: ${diff.filesChanged} file(s), +${diff.insertions}/-${diff.deletions} applied to working tree`,
+          (failure as Error & { cause?: unknown }).cause = error;
+          return runtimeFailure(failure);
+        }),
+        recordPolicyFailure,
+      ),
+    );
+  }
+
+  function notifyObserverBestEffort(callback: () => void): void {
+    Effect.runSync(
+      attempt(callback).pipe(
+        Effect.catch(({ error }) =>
+          Effect.sync(() =>
+            logLineBestEffort(`workflow completion observer failed: ${errorMessage(error)}`),
+          ),
+        ),
+      ),
+    );
+  }
+
+  function recordPolicyError(error: unknown): void {
+    if (isWorkflowPolicyError(error)) {
+      policyError ??= error;
+      // Let the Worker finish branch/panel finally blocks; only child work stops here.
+      abortChildren();
+    }
+  }
+
+  function createIsolatedWorktree(index: number): Effect.Effect<Worktree, RuntimeFailure> {
+    return attempt(assertTargetIdentityCurrent).pipe(
+      Effect.andThen(() => {
+        const runId = options.journal ? path.basename(options.journal.filePath, ".jsonl") : "run";
+        return attempt(() => createWorktree(cwd, runId, index)).pipe(
+          Effect.flatMap((worktree) =>
+            attempt(assertTargetIdentityCurrent).pipe(
+              // Roll back only a failed post-create identity check. As before, a
+              // removal failure takes precedence over that check's failure here.
+              Effect.tapError(() => attempt(() => removeWorktree(worktree))),
+              Effect.as(worktree),
+            ),
+          ),
+          Effect.mapError((failure) =>
+            isWorkflowPolicyError(failure.error)
+              ? failure
+              : runtimeFailure(
+                  new Error(
+                    `agent #${index}: worktree setup failed: ${errorMessage(failure.error)}`,
+                  ),
+                ),
+          ),
         );
-        return { status: "applied", keepWorktree: false } as const;
-      });
-    } catch (error) {
-      this.logLineBestEffort(
-        `worktree[${label}]: integration failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} — recover with: git -C ${worktree.path} diff`,
-      );
-      if (isWorkflowPolicyError(error)) throw error;
-      return { status: "preserved", keepWorktree: true, recoveryPath: worktree.path };
-    }
+      }),
+    );
   }
 
-  /** Preserve edits from a runner/policy/abort failure without publishing them. */
-  private async recoverFailedWorktree(worktree: Worktree, id: number, label: string): Promise<WorktreeOutcome> {
-    try {
-      const diff = captureWorktreeDiff(worktree, this.remainingCleanupTimeout());
-      if (!hasChanges(diff)) return { status: "unchanged", keepWorktree: false };
-      return this.rescueDiff(worktree, diff, id, label, "agent failed before delivery");
-    } catch (error) {
-      this.logLineBestEffort(
-        `worktree[${label}]: recovery capture failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} — recover with: git -C ${worktree.path} diff`,
-      );
-      return { status: "preserved", keepWorktree: true, recoveryPath: worktree.path };
-    }
-  }
-
-  private rescueDiff(
+  function rescueDiff(
     worktree: Worktree,
     diff: WorktreeDiff,
     id: number,
     label: string,
     reason: string,
-  ): WorktreeOutcome {
-    const runId = this.options.journal
-      ? path.basename(this.options.journal.filePath, ".jsonl")
-      : "run";
-    try {
-      const rescue = writeRescuePatch(this.rescueDir(), runId, id, label, diff.patch);
-      this.logLineBestEffort(
-        `worktree[${label}]: ${reason}; patch saved to ${rescue} — review and apply manually`,
-      );
-      return { status: "rescued", keepWorktree: false, recoveryPath: rescue };
-    } catch (error) {
-      this.logLineBestEffort(
-        `worktree[${label}]: ${reason} AND rescue write failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} — recover with: git -C ${worktree.path} diff`,
-      );
-      return { status: "preserved", keepWorktree: true, recoveryPath: worktree.path };
-    }
+  ): Effect.Effect<WorktreeOutcome> {
+    return attempt(() => {
+      const runId = options.journal ? path.basename(options.journal.filePath, ".jsonl") : "run";
+      return writeRescuePatch(rescueDir(), runId, id, label, diff.patch);
+    }).pipe(
+      Effect.match({
+        onSuccess: (rescue): WorktreeOutcome => {
+          logLineBestEffort(
+            `worktree[${label}]: ${reason}; patch saved to ${rescue} — review and apply manually`,
+          );
+          return { status: "rescued", keepWorktree: false, recoveryPath: rescue };
+        },
+        onFailure: ({ error }): WorktreeOutcome => {
+          logLineBestEffort(
+            `worktree[${label}]: ${reason} AND rescue write failed (${errorMessage(error)}); worktree KEPT at ${worktree.path} — recover with: git -C ${worktree.path} diff`,
+          );
+          return { status: "preserved", keepWorktree: true, recoveryPath: worktree.path };
+        },
+      }),
+    );
   }
 
-  private assertTargetIdentityCurrent(): void {
-    const expected = this.options.targetIdentity;
-    const actual = resolveRepositoryContext(this.cwd).identity;
+  function assertTargetIdentityCurrent(): void {
+    const expected = options.targetIdentity;
+    const actual = resolveRepositoryContext(cwd).identity;
     if (expected !== actual) {
-      const error = new WorkflowPolicyError("workflow repository/cwd target changed during execution");
-      this.recordPolicyError(error);
+      const error = new WorkflowPolicyError(
+        "workflow repository/cwd target changed during execution",
+      );
+      recordPolicyError(error);
       throw error;
     }
   }
 
-  private remainingCleanupTimeout(): number {
-    if (this.cleanupDeadline === undefined) return DEFAULT_CLEANUP_TIMEOUT_MS;
-    const remaining = this.cleanupDeadline - Date.now();
-    if (remaining <= 0) throw new WorkflowCleanupTimeoutError(this.options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS);
+  function remainingCleanupTimeout(): number {
+    if (cleanupDeadline === undefined) return DEFAULT_CLEANUP_TIMEOUT_MS;
+    const remaining = cleanupDeadline - Date.now();
+    if (remaining <= 0)
+      throw new WorkflowCleanupTimeoutError(options.cleanupTimeoutMs ?? DEFAULT_CLEANUP_TIMEOUT_MS);
     return remaining;
   }
 
   /** Write rescue patches beside the journal or in a user-owned cwd-hash scope. */
-  private rescueDir(): string {
-    const journalDir = this.options.journal ? path.dirname(this.options.journal.filePath) : undefined;
+  function rescueDir(): string {
+    const journalDir = options.journal ? path.dirname(options.journal.filePath) : undefined;
     if (journalDir) return path.join(journalDir, "patches");
-    return path.join(standaloneWorkflowRunsDir(this.cwd), "patches");
+    return path.join(standaloneWorkflowRunsDir(cwd), "patches");
   }
 
-  private track(promise: Promise<unknown>): void {
-    this.pending.add(promise);
-    promise.then(
-      () => this.pending.delete(promise),
-      () => this.pending.delete(promise),
-    );
+  function logLineBestEffort(text: string): void {
+    // Durable runtime state is authoritative; display observers cannot veto it.
+    Effect.runSync(attempt(() => logLine(text)).pipe(Effect.ignore));
   }
 
-  private logLineBestEffort(text: string): void {
-    try {
-      this.logLine(text);
-    } catch {
-      // Durable runtime state is authoritative; display observers cannot veto it.
-    }
-  }
-
-  private logLine(text: string): void {
-    if (this.state.logs.length > MAX_WORKFLOW_LOGS) return;
+  function logLine(text: string): void {
+    if (state.logs.length > MAX_WORKFLOW_LOGS) return;
     const safe = safeDisplayText(text, 512);
     if (!safe) return;
-    const entry = this.state.logs.length === MAX_WORKFLOW_LOGS
-      ? WORKFLOW_LOG_OMITTED_TEXT
-      : safe;
-    this.state.logs.push(entry);
-    this.options.onLog?.(entry);
+    const entry = state.logs.length === MAX_WORKFLOW_LOGS ? WORKFLOW_LOG_OMITTED_TEXT : safe;
+    state.logs.push(entry);
+    options.onLog?.(entry);
   }
+  const host: ScriptExecutorHost = {
+    agent: (payload) => agentBatch([payload])[0],
+    agentBatch,
+    abortChildren,
+    reservePanel: (payload) => runBoundary(reservePanel(payload)),
+    completePanelBranch: (payload) => runBoundary(completePanelBranch(payload)),
+    releasePanel: (payload) => runBoundary(releasePanel(payload)),
+    loadWorkflow: (payload) => runBoundary(loadWorkflow(payload)),
+    validateOutput: (payload) => runBoundary(validateOutput(payload)),
+    phase,
+    log: logLine,
+  };
+  return Effect.acquireRelease(
+    Effect.sync(() =>
+      childController.signal.addEventListener("abort", execution.close, { once: true }),
+    ),
+    () =>
+      Effect.sync(() => {
+        childController.signal.removeEventListener("abort", execution.close);
+        execution.close();
+        releaseOpenPanels();
+      }),
+  ).pipe(
+    Effect.map(() => ({
+      state,
+      abort,
+      drain,
+      runBody,
+      agentsUsed: () => admission.usedAgents,
+      policyError: () => policyError,
+      checkPolicy: attempt(() => {
+        if (policyError) throw policyError;
+      }),
+    })),
+  );
 }
 
 export interface AgentOptions {
@@ -1172,10 +1637,14 @@ function normalizeAgentOptions(value: unknown): AgentOptions {
 
 function normalizeWorkflowRef(value: unknown): string {
   if (typeof value !== "string") {
-    throw new TypeError("workflow() expects a saved workflow name string; scriptPath is not supported");
+    throw new TypeError(
+      "workflow() expects a saved workflow name string; scriptPath is not supported",
+    );
   }
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(value)) {
-    throw new TypeError("workflow() name must contain only letters, numbers, underscore, or hyphen");
+    throw new TypeError(
+      "workflow() name must contain only letters, numbers, underscore, or hyphen",
+    );
   }
   return value;
 }
@@ -1187,14 +1656,18 @@ export function loadSavedWorkflowFromDisk(
 ): { meta: WorkflowMeta; body: string } {
   const saved = readSavedWorkflowByName(ref, cwd, projectTrusted);
   if (saved) return parseWorkflowScript(saved.script);
-  throw new Error(`workflow() could not find an accessible saved workflow for ${JSON.stringify(ref)}`);
+  throw new Error(
+    `workflow() could not find an accessible saved workflow for ${JSON.stringify(ref)}`,
+  );
 }
 
 function buildInstructions(phase: string | undefined, opts: AgentOptions): string | undefined {
   const lines: string[] = [];
   if (phase) lines.push(`Workflow phase: ${phase}`);
   if (opts.isolation === "worktree") {
-    lines.push("You are running in an isolated git worktree; edit files freely without coordinating with siblings.");
+    lines.push(
+      "You are running in an isolated git worktree; edit files freely without coordinating with siblings.",
+    );
   }
   return lines.length ? lines.join("\n") : undefined;
 }
@@ -1209,7 +1682,10 @@ function normalizeAgentUsage(value: AgentUsage): AgentUsage {
     totalTokens: inputTokens + outputTokens,
     cacheReadTokens: optionalUsageInteger(value.cacheReadTokens),
     cacheWriteTokens: optionalUsageInteger(value.cacheWriteTokens),
-    cost: typeof value.cost === "number" && Number.isFinite(value.cost) && value.cost >= 0 ? value.cost : 0,
+    cost:
+      typeof value.cost === "number" && Number.isFinite(value.cost) && value.cost >= 0
+        ? value.cost
+        : 0,
     turns: optionalUsageInteger(value.turns),
     toolUses: optionalUsageInteger(value.toolUses),
     retries: optionalUsageInteger(value.retries),
@@ -1225,7 +1701,7 @@ function usageInteger(value: unknown): number | undefined {
 }
 
 function optionalUsageInteger(value: unknown): number | undefined {
-  return value === undefined ? undefined : usageInteger(value) ?? 0;
+  return value === undefined ? undefined : (usageInteger(value) ?? 0);
 }
 
 function modelIdentity(model: ModelLike | undefined): unknown {
@@ -1245,7 +1721,9 @@ function defaultLabel(phase: string | undefined, index: number): string {
 function normalizeConcurrency(value: number | undefined, fallback: number): number {
   if (value === undefined) return fallback;
   if (!Number.isFinite(value) || !Number.isInteger(value) || value < 1 || value > MAX_CONCURRENCY) {
-    throw new WorkflowPolicyError(`workflow concurrency must be an integer between 1 and ${MAX_CONCURRENCY}`);
+    throw new WorkflowPolicyError(
+      `workflow concurrency must be an integer between 1 and ${MAX_CONCURRENCY}`,
+    );
   }
   return value;
 }
@@ -1258,92 +1736,102 @@ function normalizeCleanupTimeout(value: number | undefined): number {
   return value;
 }
 
-async function raceWithCleanupTimeout(
-  work: Promise<unknown>,
-  remainingMs: number,
-  configuredTimeoutMs: number,
-): Promise<void> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  try {
-    await Promise.race([
-      work,
-      new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new WorkflowCleanupTimeoutError(configuredTimeoutMs)), remainingMs);
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
+interface ExecutionRequest {
+  readonly ready: Effect.Effect<void, RuntimeFailure>;
+  readonly release: () => void;
+}
+interface ExecutionGate {
+  readonly request: () => ExecutionRequest;
+  readonly close: () => void;
 }
 
-function createExecutionSemaphore(limit: number, signal: AbortSignal): () => Promise<() => void> {
-  let active = 0;
-  const queue: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
-
-  const rejectQueued = () => {
-    const error = new WorkflowAbortError();
-    for (const waiter of queue.splice(0)) waiter.reject(error);
+// A token is handed directly to the oldest waiter, before waking its fiber.
+// Effect's Semaphore / token Queue wakeups alone allow a new caller to barge
+// between release and the waiting fiber's next turn.
+function makeExecutionGate(limit: number): Effect.Effect<ExecutionGate> {
+  type Waiter = {
+    readonly ready: Deferred.Deferred<void, RuntimeFailure>;
+    state: "queued" | "held" | "released";
   };
-  signal.addEventListener("abort", rejectQueued, { once: true });
-
-  const acquire = async (): Promise<void> => {
-    if (signal.aborted) throw new WorkflowAbortError();
-    if (active < limit) {
-      active++;
-      return;
-    }
-    await new Promise<void>((resolve, reject) => {
-      queue.push({ resolve, reject });
-      if (signal.aborted) rejectQueued();
-    });
-  };
-
-  const release = () => {
-    active--;
-    if (signal.aborted) {
-      rejectQueued();
-      return;
-    }
-    const waiter = queue.shift();
-    if (!waiter) return;
-    active++;
-    waiter.resolve();
-  };
-
-  return async () => {
-    await acquire();
-    return release;
-  };
+  return Queue.unbounded<Waiter>().pipe(
+    Effect.map((queue) => {
+      let active = 0;
+      let closed = false;
+      function pump(): void {
+        while (active < limit) {
+          const next = Queue.takeUnsafe(queue);
+          if (!next || next._tag === "Failure") return;
+          const waiter = next.value;
+          if (waiter.state !== "queued") continue;
+          waiter.state = "held";
+          active++;
+          Deferred.doneUnsafe(waiter.ready, Effect.void);
+        }
+      }
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        const failure = Effect.fail(runtimeFailure(new WorkflowAbortError()));
+        for (;;) {
+          const next = Queue.takeUnsafe(queue);
+          if (!next || next._tag === "Failure") break;
+          next.value.state = "released";
+          Deferred.doneUnsafe(next.value.ready, failure);
+        }
+        Queue.shutdownUnsafe(queue);
+      };
+      const request = (): ExecutionRequest => {
+        const waiter: Waiter = { ready: Deferred.makeUnsafe(), state: "queued" };
+        if (closed) {
+          waiter.state = "released";
+          Deferred.doneUnsafe(waiter.ready, Effect.fail(runtimeFailure(new WorkflowAbortError())));
+        } else {
+          Queue.offerUnsafe(queue, waiter);
+          pump();
+        }
+        return {
+          ready: Deferred.await(waiter.ready),
+          release: () => {
+            if (waiter.state === "released") return;
+            if (waiter.state === "held") active--;
+            waiter.state = "released";
+            Deferred.doneUnsafe(
+              waiter.ready,
+              Effect.fail(runtimeFailure(new WorkflowAbortError())),
+            );
+            if (!closed) pump();
+          },
+        };
+      };
+      return { request, close } satisfies ExecutionGate;
+    }),
+  );
 }
 
-function repositoryApplyLock(repoRoot: string): Mutex {
-  const key = fsRealpathOrResolve(repoRoot);
-  let lock = REPOSITORY_APPLY_LOCKS.get(key);
-  if (!lock) {
-    lock = new Mutex();
-    REPOSITORY_APPLY_LOCKS.set(key, lock);
-  }
-  return lock;
+const withExecutionPermit = <A, E, R>(gate: ExecutionGate, effect: Effect.Effect<A, E, R>) =>
+  Effect.acquireRelease(Effect.sync(gate.request), (request) => Effect.sync(request.release)).pipe(
+    Effect.flatMap((request) => request.ready),
+    Effect.andThen(effect),
+    Effect.scoped,
+  );
+
+function repositoryApplyLock(repoRoot: string): Effect.Effect<ExecutionGate> {
+  return Effect.suspend(() => {
+    const key = fsRealpathOrResolve(repoRoot);
+    const existing = REPOSITORY_APPLY_LOCKS.get(key);
+    if (existing) return Effect.succeed(existing);
+    return makeExecutionGate(1).pipe(
+      Effect.tap((lock) =>
+        Effect.sync(() => {
+          REPOSITORY_APPLY_LOCKS.set(key, lock);
+        }),
+      ),
+    );
+  });
 }
 
 function fsRealpathOrResolve(value: string): string {
-  try {
-    return path.resolve(value);
-  } catch {
-    return value;
-  }
-}
-
-class Mutex {
-  private tail: Promise<unknown> = Promise.resolve();
-  run<T>(fn: () => Promise<T>): Promise<T> {
-    const result = this.tail.then(fn, fn);
-    this.tail = result.then(
-      () => undefined,
-      () => undefined,
-    );
-    return result;
-  }
+  return Result.try(() => path.resolve(value)).pipe(Result.getOrElse(() => value));
 }
 
 function requireString(value: unknown, name: string): string {
@@ -1376,12 +1864,13 @@ function errorMessage(error: unknown): string {
 }
 
 function cloneResult<T>(value: T, name: string): T {
-  try {
-    return structuredClone(value);
-  } catch (error) {
-    const detail = error instanceof Error ? ` ${error.message}` : "";
-    throw new Error(
-      `${name} must be structured-cloneable; did you forget to await agent(), parallel(), or pipeline()?${detail}`,
-    );
-  }
+  return Result.try({
+    try: () => structuredClone(value),
+    catch: (error) => {
+      const detail = error instanceof Error ? ` ${error.message}` : "";
+      return new Error(
+        `${name} must be structured-cloneable; did you forget to await agent(), parallel(), or pipeline()?${detail}`,
+      );
+    },
+  }).pipe(Result.getOrThrow);
 }

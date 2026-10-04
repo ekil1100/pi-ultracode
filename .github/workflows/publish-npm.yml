@@ -42,7 +42,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: "24"
+          node-version-file: .node-version
           registry-url: https://registry.npmjs.org/
           cache: npm
 
@@ -118,8 +118,11 @@ jobs:
       - name: Run tests
         run: npm test
 
-      - name: Run type checking
-        run: npm run typecheck
+      - name: Run formatting, lint, and type checking
+        run: npm run check
+
+      - name: Check package contents
+        run: npm pack --dry-run
 
       - name: Publish package
         env:

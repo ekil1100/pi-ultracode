@@ -57,7 +57,8 @@ export class WorkflowRegistry {
   restoreRuns(runsDir: string): number {
     let files: string[];
     try {
-      files = fs.readdirSync(runsDir)
+      files = fs
+        .readdirSync(runsDir)
         .filter((name) => /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.details\.json$/.test(name))
         .map((name) => path.join(runsDir, name))
         .sort((a, b) => fs.statSync(a).mtimeMs - fs.statSync(b).mtimeMs)

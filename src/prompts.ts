@@ -1,6 +1,11 @@
 /** Prompt text for Ultracode's adaptive analysis-depth modes. */
 
-import { ANALYSIS_DEPTHS, DEPTH_CRITERIA, DEPTH_SELECTION_RULES, type ActiveUltracodeMode } from "./depth.ts";
+import {
+  ANALYSIS_DEPTHS,
+  DEPTH_CRITERIA,
+  DEPTH_SELECTION_RULES,
+  type ActiveUltracodeMode,
+} from "./depth.ts";
 import { WORKFLOW_EFFORT_GUIDELINES } from "./effort-policy.ts";
 
 /** One-line description shown by `/ultracode status` and the footer. */
@@ -50,13 +55,17 @@ function modeInstructions(mode: ActiveUltracodeMode): string[] {
   return [
     `Fixed analysis depth: ${mode}. Apply its criteria and verification requirements; do not silently switch to another depth.`,
     ...(mode === "focused"
-      ? ["Prefer the normal parent-agent loop. Delegate only narrowly scoped work when it adds clear value."]
+      ? [
+          "Prefer the normal parent-agent loop. Delegate only narrowly scoped work when it adds clear value.",
+        ]
       : mode === "standard"
-        ? ["Cover the material independent dimensions and use conditional verification, not an automatic adversarial panel."]
+        ? [
+            "Cover the material independent dimensions and use conditional verification, not an automatic adversarial panel.",
+          ]
         : [
-          "Independent evidence can come from a distinct test, reproduction, proof, or source; a second agent is neither necessary nor sufficient.",
-          "Use multi-perspective or adversarial investigation only where it adds evidence. Choose bounded fan-out and round limits if a workflow is needed; stop as soon as the evidence is sufficient, even in one round.",
-        ]),
+            "Independent evidence can come from a distinct test, reproduction, proof, or source; a second agent is neither necessary nor sufficient.",
+            "Use multi-perspective or adversarial investigation only where it adds evidence. Choose bounded fan-out and round limits if a workflow is needed; stop as soon as the evidence is sufficient, even in one round.",
+          ]),
   ];
 }
 

@@ -21,7 +21,8 @@ const MAX_DETAILS_MANIFEST_BYTES = 4 * 1024 * 1024;
 const MAX_RUN_TRANSCRIPT_PAYLOAD_BYTES = MAX_RUN_TRANSCRIPT_BYTES - MAX_DETAILS_MANIFEST_BYTES;
 const TRANSCRIPT_HEAD_BYTES = 1024 * 1024;
 const TRANSCRIPT_MARKER_BYTES = 1024;
-const TRANSCRIPT_TAIL_BYTES = MAX_TASK_TRANSCRIPT_BYTES - TRANSCRIPT_HEAD_BYTES - TRANSCRIPT_MARKER_BYTES;
+const TRANSCRIPT_TAIL_BYTES =
+  MAX_TASK_TRANSCRIPT_BYTES - TRANSCRIPT_HEAD_BYTES - TRANSCRIPT_MARKER_BYTES;
 const TRANSCRIPT_TEXT_CHUNK_CHARS = 48 * 1024;
 const MAX_PERSISTED_EVENT_TEXT = 32 * 1024 * 1024;
 const MAX_RESULT_PREVIEW = 64 * 1024;
@@ -29,7 +30,8 @@ const MAX_LIVE_PROMPT_BYTES = 128 * 1024;
 const MAX_LIVE_PROMPT_LINES = 500;
 const ESTIMATED_RENDER_WIDTH = 80;
 const LIVE_OMISSION_TEXT = "… earlier live output omitted …";
-const PROMPT_OMISSION_TEXT = "… prompt truncated in live view; full prompt remains in the transcript …";
+const PROMPT_OMISSION_TEXT =
+  "… prompt truncated in live view; full prompt remains in the transcript …";
 
 export interface WorkflowTaskUsage {
   inputTokens: number;
@@ -164,7 +166,9 @@ function emptyUsage(): WorkflowTaskUsage {
   };
 }
 
-export function normalizeTaskUsage(value: AgentUsage | Partial<WorkflowTaskUsage> | undefined): WorkflowTaskUsage {
+export function normalizeTaskUsage(
+  value: AgentUsage | Partial<WorkflowTaskUsage> | undefined,
+): WorkflowTaskUsage {
   const inputTokens = finite(value?.inputTokens);
   const outputTokens = finite(value?.outputTokens);
   return {
@@ -195,7 +199,12 @@ function displayRequestedModelId(value: string | undefined): string | undefined 
   if (!value) return undefined;
   const withoutThinking = value.replace(/:(?:off|minimal|low|medium|high|xhigh|max)$/i, "");
   const providerSeparator = withoutThinking.indexOf("/");
-  return safeDisplayText(providerSeparator >= 0 ? withoutThinking.slice(providerSeparator + 1) : withoutThinking, 120) || undefined;
+  return (
+    safeDisplayText(
+      providerSeparator >= 0 ? withoutThinking.slice(providerSeparator + 1) : withoutThinking,
+      120,
+    ) || undefined
+  );
 }
 
 function safeMultiline(value: string, max = MAX_PERSISTED_EVENT_TEXT): string {
@@ -327,21 +336,26 @@ export class WorkflowRunDetails {
     this.artifactBudget = new RunArtifactBudget(taskDir, MAX_RUN_TRANSCRIPT_PAYLOAD_BYTES);
   }
 
-  static restore(manifestPath: string): { details: WorkflowRunDetails; snapshot: WorkflowSnapshot } | undefined {
+  static restore(
+    manifestPath: string,
+  ): { details: WorkflowRunDetails; snapshot: WorkflowSnapshot } | undefined {
     let manifest: WorkflowRunDetailsManifest;
     try {
-      manifest = JSON.parse(readArtifactFile(manifestPath, "workflow details manifest", MAX_DETAILS_MANIFEST_BYTES)) as WorkflowRunDetailsManifest;
+      manifest = JSON.parse(
+        readArtifactFile(manifestPath, "workflow details manifest", MAX_DETAILS_MANIFEST_BYTES),
+      ) as WorkflowRunDetailsManifest;
     } catch {
       return undefined;
     }
     const expectedFileName = `${manifest.runId}.details.json`;
     if (
-      manifest.version !== RUN_DETAILS_VERSION
-      || !/^wf_[a-z0-9_-]{1,120}$/i.test(manifest.runId ?? "")
-      || path.basename(manifestPath) !== expectedFileName
-      || typeof manifest.name !== "string"
-      || !manifest.snapshot
-    ) return undefined;
+      manifest.version !== RUN_DETAILS_VERSION ||
+      !/^wf_[a-z0-9_-]{1,120}$/i.test(manifest.runId ?? "") ||
+      path.basename(manifestPath) !== expectedFileName ||
+      typeof manifest.name !== "string" ||
+      !manifest.snapshot
+    )
+      return undefined;
     const details = new WorkflowRunDetails({
       runId: manifest.runId,
       name: manifest.name,
@@ -352,7 +366,9 @@ export class WorkflowRunDetails {
       if (!summary) continue;
       const task: InternalTask = {
         ...summary,
-        transcriptPath: isPathInside(summary.transcriptPath, details.taskDir()) ? summary.transcriptPath : undefined,
+        transcriptPath: isPathInside(summary.transcriptPath, details.taskDir())
+          ? summary.transcriptPath
+          : undefined,
         workflowPath: [...(summary.workflowPath ?? [details.name])],
         usage: normalizeTaskUsage(summary.usage),
         prompt: summary.promptPreview ?? "",
@@ -377,7 +393,9 @@ export class WorkflowRunDetails {
     snapshot.detailsManifestPath = manifestPath;
     snapshot.agents = snapshot.agents.map((agent) => ({
       ...agent,
-      transcriptPath: isPathInside(agent.transcriptPath, details.taskDir()) ? agent.transcriptPath : undefined,
+      transcriptPath: isPathInside(agent.transcriptPath, details.taskDir())
+        ? agent.transcriptPath
+        : undefined,
     }));
     return { details, snapshot };
   }
@@ -439,8 +457,12 @@ export class WorkflowRunDetails {
       status: input.cached ? "cached" : "running",
       prompt,
       promptPreview: safeDisplayText(prompt, 240),
-      requestedModelId: displayRequestedModelId(input.cached ? cached?.requestedModelId ?? input.modelPattern : input.modelPattern),
-      requestedEffort: input.cached ? cached?.requestedEffort ?? cached?.effort : input.requestedEffort,
+      requestedModelId: displayRequestedModelId(
+        input.cached ? (cached?.requestedModelId ?? input.modelPattern) : input.modelPattern,
+      ),
+      requestedEffort: input.cached
+        ? (cached?.requestedEffort ?? cached?.effort)
+        : input.requestedEffort,
       modelId: displayActualModelId(cached?.modelId),
       effort: cached?.effort,
       usage: normalizeTaskUsage(cached?.usage),
@@ -454,7 +476,8 @@ export class WorkflowRunDetails {
       isolation: input.isolation ? safeDisplayText(input.isolation, 40) : cached?.isolation,
       structuredOutput: input.structuredOutput ?? cached?.structuredOutput,
       cached: Boolean(input.cached),
-      legacyCache: cached?.legacyCache ?? Boolean(input.cached && (!cached?.modelId || !cached?.effort)),
+      legacyCache:
+        cached?.legacyCache ?? Boolean(input.cached && (!cached?.modelId || !cached?.effort)),
       transcriptPath: cached?.transcriptPath,
       transcriptOmittedBytes: cached?.transcriptOmittedBytes,
       events: [],
@@ -505,11 +528,17 @@ export class WorkflowRunDetails {
       case "turn_start": {
         const turn = task.usage.turns + 1;
         task.currentTurn = turn;
-        this.pushEvent(task, { seq: ++this.sequence, ts: now, kind: "turn", turn, state: "streaming" }, true);
+        this.pushEvent(
+          task,
+          { seq: ++this.sequence, ts: now, kind: "turn", turn, state: "streaming" },
+          true,
+        );
         break;
       }
       case "text_delta": {
-        let textEvent = [...task.events].reverse().find((candidate) => candidate.kind === "text" && candidate.streaming);
+        let textEvent = [...task.events]
+          .reverse()
+          .find((candidate) => candidate.kind === "text" && candidate.streaming);
         if (!textEvent) {
           textEvent = {
             seq: ++this.sequence,
@@ -521,13 +550,14 @@ export class WorkflowRunDetails {
           };
           this.pushEvent(task, textEvent, false);
         }
-        const delta = event.delta.length > MAX_LIVE_TASK_BYTES
-          ? safeTranscriptText(event.delta, MAX_LIVE_TASK_BYTES)
-          : event.delta;
+        const delta =
+          event.delta.length > MAX_LIVE_TASK_BYTES
+            ? safeTranscriptText(event.delta, MAX_LIVE_TASK_BYTES)
+            : event.delta;
         const previousText = textEvent.text ?? "";
         const lineKey = `${task.id}:${textEvent.seq}`;
-        const previousColumn = this.streamingLineColumns.get(lineKey)
-          ?? advanceRenderedLines(previousText).column;
+        const previousColumn =
+          this.streamingLineColumns.get(lineKey) ?? advanceRenderedLines(previousText).column;
         const lineAdvance = advanceRenderedLines(delta, previousColumn);
         this.streamingLineColumns.set(lineKey, lineAdvance.column);
         textEvent.text = `${previousText}${delta}`;
@@ -546,7 +576,9 @@ export class WorkflowRunDetails {
           task.usage.cost += event.usage.cost;
         }
         const text = safeMultiline(event.text);
-        let textEvent = [...task.events].reverse().find((candidate) => candidate.kind === "text" && candidate.streaming);
+        let textEvent = [...task.events]
+          .reverse()
+          .find((candidate) => candidate.kind === "text" && candidate.streaming);
         if (!textEvent && text) {
           textEvent = {
             seq: ++this.sequence,
@@ -563,18 +595,18 @@ export class WorkflowRunDetails {
           this.streamingLineColumns.delete(`${task.id}:${textEvent.seq}`);
           this.persistTimelineEvent(task, textEvent);
         }
-        const thinking = [...task.events].reverse().find(
-          (candidate) => candidate.kind === "thinking" && candidate.streaming,
-        );
+        const thinking = [...task.events]
+          .reverse()
+          .find((candidate) => candidate.kind === "thinking" && candidate.streaming);
         if (thinking) {
           thinking.streaming = false;
           thinking.state = "done";
           thinking.endedAt = now;
           this.persistTimelineEvent(task, thinking);
         }
-        const turnEvent = [...task.events].reverse().find(
-          (candidate) => candidate.kind === "turn" && candidate.state === "streaming",
-        );
+        const turnEvent = [...task.events]
+          .reverse()
+          .find((candidate) => candidate.kind === "turn" && candidate.state === "streaming");
         if (turnEvent) {
           turnEvent.state = "done";
           turnEvent.endedAt = now;
@@ -586,18 +618,24 @@ export class WorkflowRunDetails {
         break;
       }
       case "thinking_start":
-        this.pushEvent(task, {
-          seq: ++this.sequence,
-          ts: now,
-          kind: "thinking",
-          turn: task.currentTurn,
-          state: "streaming",
-          streaming: true,
-          startedAt: now,
-        }, true);
+        this.pushEvent(
+          task,
+          {
+            seq: ++this.sequence,
+            ts: now,
+            kind: "thinking",
+            turn: task.currentTurn,
+            state: "streaming",
+            streaming: true,
+            startedAt: now,
+          },
+          true,
+        );
         break;
       case "thinking_end": {
-        const thinking = [...task.events].reverse().find((candidate) => candidate.kind === "thinking" && candidate.streaming);
+        const thinking = [...task.events]
+          .reverse()
+          .find((candidate) => candidate.kind === "thinking" && candidate.streaming);
         if (thinking) {
           thinking.streaming = false;
           thinking.state = "done";
@@ -608,23 +646,32 @@ export class WorkflowRunDetails {
       }
       case "tool_start":
         task.usage.toolUses++;
-        this.pushEvent(task, {
-          seq: ++this.sequence,
-          ts: now,
-          kind: "tool",
-          turn: task.currentTurn ?? task.usage.turns,
-          state: "running",
-          streaming: true,
-          startedAt: now,
-          toolCallId: event.toolCallId,
-          toolName: safeDisplayText(event.toolName, 80) || "tool",
-          toolArgs: event.toolArgs ? safeDisplayText(event.toolArgs, 240) : undefined,
-        }, true);
+        this.pushEvent(
+          task,
+          {
+            seq: ++this.sequence,
+            ts: now,
+            kind: "tool",
+            turn: task.currentTurn ?? task.usage.turns,
+            state: "running",
+            streaming: true,
+            startedAt: now,
+            toolCallId: event.toolCallId,
+            toolName: safeDisplayText(event.toolName, 80) || "tool",
+            toolArgs: event.toolArgs ? safeDisplayText(event.toolArgs, 240) : undefined,
+          },
+          true,
+        );
         break;
       case "tool_end": {
-        let tool = [...task.events].reverse().find(
-          (candidate) => candidate.kind === "tool" && candidate.toolCallId === event.toolCallId && candidate.streaming,
-        );
+        let tool = [...task.events]
+          .reverse()
+          .find(
+            (candidate) =>
+              candidate.kind === "tool" &&
+              candidate.toolCallId === event.toolCallId &&
+              candidate.streaming,
+          );
         if (!tool) {
           tool = {
             seq: ++this.sequence,
@@ -640,30 +687,40 @@ export class WorkflowRunDetails {
         tool.state = event.isError ? "failed" : "done";
         tool.isError = event.isError;
         tool.endedAt = now;
-        tool.resultPreview = event.resultPreview ? safeMultiline(event.resultPreview, 8 * 1024) : undefined;
+        tool.resultPreview = event.resultPreview
+          ? safeMultiline(event.resultPreview, 8 * 1024)
+          : undefined;
         this.persistTimelineEvent(task, tool);
         this.recomputeTaskWeight(task);
         break;
       }
       case "retry":
         if (event.state === "start") task.usage.retries++;
-        this.pushEvent(task, {
-          seq: ++this.sequence,
-          ts: now,
-          kind: "retry",
-          state: event.state,
-          text: safeDisplayText(event.detail, 240),
-        }, true);
+        this.pushEvent(
+          task,
+          {
+            seq: ++this.sequence,
+            ts: now,
+            kind: "retry",
+            state: event.state,
+            text: safeDisplayText(event.detail, 240),
+          },
+          true,
+        );
         break;
       case "compaction":
         if (event.state === "start") task.usage.compactions++;
-        this.pushEvent(task, {
-          seq: ++this.sequence,
-          ts: now,
-          kind: "compaction",
-          state: event.state,
-          text: safeDisplayText(event.detail, 240),
-        }, true);
+        this.pushEvent(
+          task,
+          {
+            seq: ++this.sequence,
+            ts: now,
+            kind: "compaction",
+            state: event.state,
+            text: safeDisplayText(event.detail, 240),
+          },
+          true,
+        );
         break;
       case "run_error":
         task.modelId = displayActualModelId(event.modelId) ?? task.modelId;
@@ -706,9 +763,12 @@ export class WorkflowRunDetails {
         event.text = safeMultiline(event.text ?? "");
         this.streamingLineColumns.delete(`${task.id}:${event.seq}`);
       }
-      if (event.kind === "turn") event.state = input.status === "cancelled" ? "cancelled" : "incomplete";
-      if (event.kind === "thinking") event.state = input.status === "cancelled" ? "cancelled" : "incomplete";
-      if (event.kind === "tool") event.state = input.status === "cancelled" ? "cancelled" : "incomplete";
+      if (event.kind === "turn")
+        event.state = input.status === "cancelled" ? "cancelled" : "incomplete";
+      if (event.kind === "thinking")
+        event.state = input.status === "cancelled" ? "cancelled" : "incomplete";
+      if (event.kind === "tool")
+        event.state = input.status === "cancelled" ? "cancelled" : "incomplete";
       this.persistTimelineEvent(task, event);
     }
     this.recomputeTaskWeight(task);
@@ -737,7 +797,9 @@ export class WorkflowRunDetails {
       events: task.events.map((event) => ({
         ...cloneEvent(event),
         text: event.text ? safeMultiline(event.text, MAX_LIVE_TASK_BYTES) : undefined,
-        resultPreview: event.resultPreview ? safeMultiline(event.resultPreview, 8 * 1024) : undefined,
+        resultPreview: event.resultPreview
+          ? safeMultiline(event.resultPreview, 8 * 1024)
+          : undefined,
       })),
     };
   }
@@ -748,9 +810,10 @@ export class WorkflowRunDetails {
   }
 
   persist(snapshot: WorkflowSnapshot): void {
-    const persistedTasks = this.tasks.size === 0 && this.previousGenerationTasks.size > 0
-      ? [...this.previousGenerationTasks.values()]
-      : [...this.tasks.values()];
+    const persistedTasks =
+      this.tasks.size === 0 && this.previousGenerationTasks.size > 0
+        ? [...this.previousGenerationTasks.values()]
+        : [...this.tasks.values()];
     persistedTasks.sort((a, b) => a.id - b.id);
     const manifest: WorkflowRunDetailsManifest = {
       version: RUN_DETAILS_VERSION,
@@ -781,7 +844,10 @@ export class WorkflowRunDetails {
         serialized = JSON.stringify(manifest);
       }
       if (Buffer.byteLength(serialized, "utf8") > MAX_DETAILS_MANIFEST_BYTES) return;
-      writeArtifactFile(this.manifestPath, serialized, { trustedRoot: this.runsDir, overwrite: true });
+      writeArtifactFile(this.manifestPath, serialized, {
+        trustedRoot: this.runsDir,
+        overwrite: true,
+      });
     } catch {
       // Persistence failure does not affect the workflow result.
     }
@@ -806,13 +872,17 @@ export class WorkflowRunDetails {
     task.error = safeDisplayText(error, 512);
     const previous = [...task.events].reverse().find((event) => event.kind === "error");
     if (previous?.text === task.error) return;
-    this.pushEvent(task, {
-      seq: ++this.sequence,
-      ts: now,
-      kind: "error",
-      text: task.error,
-      isError: true,
-    }, true);
+    this.pushEvent(
+      task,
+      {
+        seq: ++this.sequence,
+        ts: now,
+        kind: "error",
+        text: task.error,
+        isError: true,
+      },
+      true,
+    );
   }
 
   private pushEvent(task: InternalTask, event: WorkflowTimelineEvent, persist: boolean): void {
@@ -823,7 +893,12 @@ export class WorkflowRunDetails {
     if (persist) this.persistTimelineEvent(task, event);
   }
 
-  private persistPrompt(writer: BoundedTaskTranscriptWriter, taskId: number, callPath: string, prompt: string): void {
+  private persistPrompt(
+    writer: BoundedTaskTranscriptWriter,
+    taskId: number,
+    callPath: string,
+    prompt: string,
+  ): void {
     const chunks = chunkText(safeMultiline(prompt), TRANSCRIPT_TEXT_CHUNK_CHARS);
     for (const [chunkIndex, text] of chunks.entries()) {
       writer.append({
@@ -849,7 +924,10 @@ export class WorkflowRunDetails {
       toolArgs: event.toolArgs ? safeDisplayText(event.toolArgs, 240) : undefined,
       streaming: event.streaming,
     };
-    const chunks = safeEvent.kind === "text" ? chunkText(safeEvent.text ?? "", TRANSCRIPT_TEXT_CHUNK_CHARS) : [safeEvent.text];
+    const chunks =
+      safeEvent.kind === "text"
+        ? chunkText(safeEvent.text ?? "", TRANSCRIPT_TEXT_CHUNK_CHARS)
+        : [safeEvent.text];
     for (const [chunkIndex, text] of chunks.entries()) {
       task.writer.append({
         version: RUN_DETAILS_VERSION,
@@ -877,7 +955,10 @@ export class WorkflowRunDetails {
       task.liveBytes += weight.bytes;
       task.liveLines += weight.lines;
       if (event.kind === "text" && event.streaming) {
-        this.streamingLineColumns.set(`${task.id}:${event.seq}`, advanceRenderedLines(event.text ?? "").column);
+        this.streamingLineColumns.set(
+          `${task.id}:${event.seq}`,
+          advanceRenderedLines(event.text ?? "").column,
+        );
       }
     }
   }
@@ -936,7 +1017,9 @@ export class WorkflowRunDetails {
   private removeOldestEvent(task: InternalTask): number {
     const index = task.events.findIndex((event) => event.kind !== "omitted" && !event.streaming);
     if (index < 0) {
-      const streaming = task.events.find((event) => event.kind === "text" && event.streaming && (event.text?.length ?? 0) > 1024);
+      const streaming = task.events.find(
+        (event) => event.kind === "text" && event.streaming && (event.text?.length ?? 0) > 1024,
+      );
       return streaming ? this.shrinkTextEvent(task, streaming) : 0;
     }
     const candidate = task.events[index];
@@ -992,7 +1075,10 @@ export class WorkflowRunDetails {
       return;
     }
     const loadedEvents = new Map<number, WorkflowTimelineEvent>();
-    const eventChunks = new Map<number, { event: WorkflowTimelineEvent; chunks: Map<number, string>; count: number }>();
+    const eventChunks = new Map<
+      number,
+      { event: WorkflowTimelineEvent; chunks: Map<number, string>; count: number }
+    >();
     const promptChunks = new Map<number, string>();
     let promptChunkCount = 0;
     const omissionEvents: WorkflowTimelineEvent[] = [];
@@ -1001,23 +1087,38 @@ export class WorkflowRunDetails {
       try {
         const record = JSON.parse(line) as any;
         if (
-          record.version !== RUN_DETAILS_VERSION
-          || record.runId !== this.runId
-          || record.callPath !== task.callPath
-        ) continue;
+          record.version !== RUN_DETAILS_VERSION ||
+          record.runId !== this.runId ||
+          record.callPath !== task.callPath
+        )
+          continue;
         if (record.recordType === "prompt" && typeof record.text === "string") {
           const index = Number.isFinite(record.chunkIndex) ? record.chunkIndex : 0;
           promptChunks.set(index, record.text);
-          promptChunkCount = Math.max(promptChunkCount, Number.isFinite(record.chunkCount) ? record.chunkCount : 1);
-        } else if (record.recordType === "event" && record.event?.kind && Number.isFinite(record.event.seq)) {
+          promptChunkCount = Math.max(
+            promptChunkCount,
+            Number.isFinite(record.chunkCount) ? record.chunkCount : 1,
+          );
+        } else if (
+          record.recordType === "event" &&
+          record.event?.kind &&
+          Number.isFinite(record.event.seq)
+        ) {
           const event = record.event as WorkflowTimelineEvent;
           const count = Number.isFinite(record.chunkCount) ? Math.max(1, record.chunkCount) : 1;
           if (event.kind === "text" && count > 1) {
             const seq = Number.isFinite(record.baseSeq) ? record.baseSeq : event.seq;
-            const group = eventChunks.get(seq) ?? { event, chunks: new Map<number, string>(), count };
+            const group = eventChunks.get(seq) ?? {
+              event,
+              chunks: new Map<number, string>(),
+              count,
+            };
             group.event = event;
             group.count = Math.max(group.count, count);
-            group.chunks.set(Number.isFinite(record.chunkIndex) ? record.chunkIndex : 0, event.text ?? "");
+            group.chunks.set(
+              Number.isFinite(record.chunkIndex) ? record.chunkIndex : 0,
+              event.text ?? "",
+            );
             eventChunks.set(seq, group);
           } else {
             loadedEvents.set(event.seq, event);
@@ -1039,9 +1140,16 @@ export class WorkflowRunDetails {
       task.promptPreview = safeDisplayText(task.prompt, 240);
     }
     for (const [seq, group] of eventChunks) {
-      loadedEvents.set(seq, { ...group.event, seq, text: joinTranscriptChunks(group.chunks, group.count) });
+      loadedEvents.set(seq, {
+        ...group.event,
+        seq,
+        text: joinTranscriptChunks(group.chunks, group.count),
+      });
     }
-    task.events.push(...omissionEvents, ...[...loadedEvents.values()].sort((left, right) => left.seq - right.seq));
+    task.events.push(
+      ...omissionEvents,
+      ...[...loadedEvents.values()].sort((left, right) => left.seq - right.seq),
+    );
     this.recomputeTaskWeight(task);
     this.trimMemory();
   }
@@ -1062,8 +1170,17 @@ function restoreTaskSummary(value: unknown, fallbackName: string): WorkflowTaskS
   const raw = value as Record<string, unknown>;
   const id = Number.isInteger(raw.id) ? Number(raw.id) : 0;
   if (id < 1 || id > 1024) return undefined;
-  const statuses: WorkflowAgentStatus[] = ["running", "done", "error", "cancelled", "skipped", "cached"];
-  const status = statuses.includes(raw.status as WorkflowAgentStatus) ? raw.status as WorkflowAgentStatus : "cancelled";
+  const statuses: WorkflowAgentStatus[] = [
+    "running",
+    "done",
+    "error",
+    "cancelled",
+    "skipped",
+    "cached",
+  ];
+  const status = statuses.includes(raw.status as WorkflowAgentStatus)
+    ? (raw.status as WorkflowAgentStatus)
+    : "cancelled";
   const requestedEffort = normalizeThinkingLevel(raw.requestedEffort);
   const effort = normalizeThinkingLevel(raw.effort);
   const workflowPath = Array.isArray(raw.workflowPath)
@@ -1094,13 +1211,16 @@ function restoreTaskSummary(value: unknown, fallbackName: string): WorkflowTaskS
     cached: raw.cached === true,
     legacyCache: raw.legacyCache === true,
     transcriptPath: typeof raw.transcriptPath === "string" ? raw.transcriptPath : undefined,
-    transcriptOmittedBytes: typeof raw.transcriptOmittedBytes === "number" ? finite(raw.transcriptOmittedBytes) : undefined,
+    transcriptOmittedBytes:
+      typeof raw.transcriptOmittedBytes === "number"
+        ? finite(raw.transcriptOmittedBytes)
+        : undefined,
   });
 }
 
 function normalizeThinkingLevel(value: unknown): ThinkingLevel | undefined {
   return ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(String(value))
-    ? value as ThinkingLevel
+    ? (value as ThinkingLevel)
     : undefined;
 }
 
@@ -1111,7 +1231,9 @@ function taskForManifest(task: WorkflowTaskSummary): WorkflowTaskSummary {
     phase: task.phase ? safeDisplayText(task.phase, 120) : undefined,
     workflowPath: task.workflowPath.map((part) => safeDisplayText(part, 120)),
     promptPreview: safeDisplayText(task.promptPreview, 240),
-    requestedModelId: task.requestedModelId ? safeDisplayText(task.requestedModelId, 120) : undefined,
+    requestedModelId: task.requestedModelId
+      ? safeDisplayText(task.requestedModelId, 120)
+      : undefined,
     modelId: task.modelId ? safeDisplayText(task.modelId, 120) : undefined,
     resultPreview: task.resultPreview ? safeDisplayText(task.resultPreview, 512) : undefined,
     error: task.error ? safeDisplayText(task.error, 512) : undefined,
@@ -1135,7 +1257,9 @@ function snapshotForManifest(snapshot: WorkflowSnapshot): WorkflowSnapshot {
       workflowPath: agent.workflowPath?.map((part) => safeDisplayText(part, 120)),
       resultPreview: agent.resultPreview ? safeDisplayText(agent.resultPreview, 512) : undefined,
       error: agent.error ? safeDisplayText(agent.error, 512) : undefined,
-      requestedModelId: agent.requestedModelId ? safeDisplayText(agent.requestedModelId, 120) : undefined,
+      requestedModelId: agent.requestedModelId
+        ? safeDisplayText(agent.requestedModelId, 120)
+        : undefined,
       modelId: agent.modelId ? safeDisplayText(agent.modelId, 120) : undefined,
       agentType: agent.agentType ? safeDisplayText(agent.agentType, 80) : undefined,
       isolation: agent.isolation ? safeDisplayText(agent.isolation, 40) : undefined,
@@ -1162,7 +1286,8 @@ class RunArtifactBudget {
     this.dir = dir;
     this.maxBytes = maxBytes;
     try {
-      this.usedBytes = fs.readdirSync(dir)
+      this.usedBytes = fs
+        .readdirSync(dir)
         .filter((name) => /\.(?:jsonl|head|tail)$/.test(name))
         .reduce((sum, name) => sum + fileSize(path.join(dir, name)), 0);
     } catch {
@@ -1256,22 +1381,24 @@ class BoundedTaskTranscriptWriter {
     const head = readText(this.headPath);
     const tail = readText(this.tailPath);
     if (!head && !tail && fs.existsSync(this.finalPath)) return true;
-    const markerCandidate = this.omittedBytes > 0
-      ? `${JSON.stringify({
-          version: RUN_DETAILS_VERSION,
-          recordType: "omitted",
-          runId: this.runId,
-          taskId: this.taskId,
-          callPath: this.callPath,
-          ts: Date.now(),
-          omittedBytes: this.omittedBytes,
-          message: `… ${formatBytes(this.omittedBytes)} of middle transcript omitted …`,
-        })}\n`
-      : "";
+    const markerCandidate =
+      this.omittedBytes > 0
+        ? `${JSON.stringify({
+            version: RUN_DETAILS_VERSION,
+            recordType: "omitted",
+            runId: this.runId,
+            taskId: this.taskId,
+            callPath: this.callPath,
+            ts: Date.now(),
+            omittedBytes: this.omittedBytes,
+            message: `… ${formatBytes(this.omittedBytes)} of middle transcript omitted …`,
+          })}\n`
+        : "";
     const markerBytes = Buffer.byteLength(markerCandidate, "utf8");
-    const marker = markerBytes <= TRANSCRIPT_MARKER_BYTES && this.budget.reserve(markerBytes)
-      ? markerCandidate
-      : "";
+    const marker =
+      markerBytes <= TRANSCRIPT_MARKER_BYTES && this.budget.reserve(markerBytes)
+        ? markerCandidate
+        : "";
     const combined = `${head}${marker}${tail}`;
     try {
       ensurePrivateArtifactDirectory(path.dirname(this.finalPath));

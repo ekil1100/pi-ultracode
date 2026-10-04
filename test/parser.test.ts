@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test } from "vite-plus/test";
 import assert from "node:assert/strict";
 import { parseWorkflowScript, normalizeScript } from "../src/workflow/parser.ts";
 import { runWorkflow } from "../src/workflow/runtime.ts";
@@ -17,7 +17,10 @@ test("parses meta.phases array of literals", () => {
   const { meta } = parseWorkflowScript(
     `export const meta = { name: 'd', description: 'x', phases: [{ title: 'Scan' }, { title: 'Verify' }] }\nagent('a')`,
   );
-  assert.deepEqual(meta.phases?.map((p) => p.title), ["Scan", "Verify"]);
+  assert.deepEqual(
+    meta.phases?.map((p) => p.title),
+    ["Scan", "Verify"],
+  );
 });
 
 test("strips a markdown fence", () => {
@@ -36,7 +39,10 @@ test("rejects when meta is not the first statement", () => {
 
 test("rejects Date.now()", () => {
   assert.throws(
-    () => parseWorkflowScript(`export const meta = { name: 'd', description: 'x' }\nconst t = Date.now()`),
+    () =>
+      parseWorkflowScript(
+        `export const meta = { name: 'd', description: 'x' }\nconst t = Date.now()`,
+      ),
     /deterministic/,
   );
 });
@@ -50,7 +56,10 @@ test("rejects Math.random()", () => {
 
 test("rejects the undeclared process compatibility shim", () => {
   assert.throws(
-    () => parseWorkflowScript(`export const meta = { name: 'process_shim', description: 'x' }\nreturn process.cwd()`),
+    () =>
+      parseWorkflowScript(
+        `export const meta = { name: 'process_shim', description: 'x' }\nreturn process.cwd()`,
+      ),
     /process.*(?:not available|use.*cwd)/i,
   );
 });
@@ -71,7 +80,10 @@ test("rejects computed/function-call values in meta", () => {
 
 test("rejects spread in meta", () => {
   assert.throws(
-    () => parseWorkflowScript(`export const meta = { ...base, name: 'd', description: 'x' }\nagent('a')`),
+    () =>
+      parseWorkflowScript(
+        `export const meta = { ...base, name: 'd', description: 'x' }\nagent('a')`,
+      ),
     /spread/,
   );
 });
@@ -87,7 +99,10 @@ test("rejects native promise chains and combinators without reserving ordinary m
     "const P = Promise; P.any([])",
   ]) {
     assert.throws(
-      () => parseWorkflowScript(`export const meta = { name: 'promise_policy', description: 'x' }\n${body}`),
+      () =>
+        parseWorkflowScript(
+          `export const meta = { name: 'promise_policy', description: 'x' }\n${body}`,
+        ),
       /promise|await|parallel|pipeline/i,
       body,
     );
@@ -99,7 +114,10 @@ test("rejects native promise chains and combinators without reserving ordinary m
     "const values = { allSettled() { return [] }, any() { return 1 } }; return [values.allSettled(), values.any()]",
   ]) {
     assert.doesNotThrow(
-      () => parseWorkflowScript(`export const meta = { name: 'ordinary_methods', description: 'x' }\n${body}`),
+      () =>
+        parseWorkflowScript(
+          `export const meta = { name: 'ordinary_methods', description: 'x' }\n${body}`,
+        ),
       body,
     );
   }
@@ -130,16 +148,21 @@ test("rejects dynamic and aliased promise method access", () => {
     "function unwrap(_strings, pending) { const key = 'then'; return Reflect.apply(pending[key], pending, [(value) => value]) }; return await unwrap`${agent('x')}`",
   ]) {
     assert.throws(
-      () => parseWorkflowScript(`export const meta = { name: 'dynamic_chain', description: 'x' }\n${body}`),
+      () =>
+        parseWorkflowScript(
+          `export const meta = { name: 'dynamic_chain', description: 'x' }\n${body}`,
+        ),
       /promise|dynamic method|await|globalThis|call sites|helper|declared identifier/i,
       body,
     );
   }
-  assert.doesNotThrow(() => parseWorkflowScript(
-    `export const meta = { name: 'dynamic_data', description: 'x' }
+  assert.doesNotThrow(() =>
+    parseWorkflowScript(
+      `export const meta = { name: 'dynamic_data', description: 'x' }
      const key = 'value'
      return args[key]`,
-  ));
+    ),
+  );
 });
 
 test("unsupported orchestration helper receivers and aliases fail closed", () => {
@@ -186,7 +209,10 @@ test("unsupported orchestration helper receivers and aliases fail closed", () =>
   ];
   for (const body of scripts) {
     assert.throws(
-      () => parseWorkflowScript(`export const meta = { name: 'unsupported_helper', description: 'x' }\n${body}`),
+      () =>
+        parseWorkflowScript(
+          `export const meta = { name: 'unsupported_helper', description: 'x' }\n${body}`,
+        ),
       /helper|orchestration|loop|classes|dynamic method|promise checks|declared identifier|assigned/i,
     );
   }
@@ -213,7 +239,11 @@ test("safe parallel map uses an internal intrinsic instead of a mutable receiver
       runner: {
         run: async (call: any) => {
           prompts.push(call.prompt);
-          return { value: `echo:${call.prompt}`, usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: process.cwd() };
+          return {
+            value: `echo:${call.prompt}`,
+            usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+            cwd: process.cwd(),
+          };
         },
       },
     },
@@ -230,7 +260,11 @@ test("safe parallel map uses an internal intrinsic instead of a mutable receiver
         runner: {
           run: async () => {
             eagerRunnerCalls++;
-            return { value: "unsafe", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: process.cwd() };
+            return {
+              value: "unsafe",
+              usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+              cwd: process.cwd(),
+            };
           },
         },
       },
@@ -249,7 +283,8 @@ test("DSL arguments cannot eagerly start orchestration before admission", async 
   ];
   for (const body of bodies) {
     assert.throws(
-      () => parseWorkflowScript(`export const meta = { name: 'eager_dsl', description: 'x' }\n${body}`),
+      () =>
+        parseWorkflowScript(`export const meta = { name: 'eager_dsl', description: 'x' }\n${body}`),
       /dynamic method|orchestration|promise checks/i,
       body,
     );
@@ -263,7 +298,11 @@ test("DSL arguments cannot eagerly start orchestration before admission", async 
         runner: {
           run: async () => {
             runnerCalls++;
-            return { value: "unsafe", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: process.cwd() };
+            return {
+              value: "unsafe",
+              usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+              cwd: process.cwd(),
+            };
           },
         },
       },
@@ -285,29 +324,39 @@ test("factory objects retain ordinary data-property access", () => {
 
 test("large alias chains are rejected without a quadratic taint scan", () => {
   const aliases = ["const value0 = agent"];
-  for (let index = 1; index < 4_000; index++) aliases.push(`const value${index} = value${index - 1}`);
+  for (let index = 1; index < 4_000; index++)
+    aliases.push(`const value${index} = value${index - 1}`);
   const started = performance.now();
   assert.throws(
-    () => parseWorkflowScript(
-      `export const meta = { name: 'alias_chain', description: 'x' }\n${aliases.join("\n")}\nreturn null`,
-    ),
+    () =>
+      parseWorkflowScript(
+        `export const meta = { name: 'alias_chain', description: 'x' }\n${aliases.join("\n")}\nreturn null`,
+      ),
     /dynamic method|called directly|promise checks/i,
   );
-  assert.ok(performance.now() - started < 2_000, "taint propagation should stay bounded on long alias chains");
+  assert.ok(
+    performance.now() - started < 2_000,
+    "taint propagation should stay bounded on long alias chains",
+  );
 });
 
 test("allows directly awaited local promise construction and resolution", () => {
-  assert.doesNotThrow(() => parseWorkflowScript(
-    `export const meta = { name: 'local_promise', description: 'x' }
+  assert.doesNotThrow(() =>
+    parseWorkflowScript(
+      `export const meta = { name: 'local_promise', description: 'x' }
      await Promise.resolve(1)
      await new Promise(() => {})`,
-  ));
+    ),
+  );
 });
 
 test("rejects excessive workflow AST nesting", () => {
   const nested = `${"[".repeat(160)}0${"]".repeat(160)}`;
   assert.throws(
-    () => parseWorkflowScript(`export const meta = { name: 'deep', description: 'x' }\nreturn ${nested}`),
+    () =>
+      parseWorkflowScript(
+        `export const meta = { name: 'deep', description: 'x' }\nreturn ${nested}`,
+      ),
     /nesting depth|too deeply nested/i,
   );
 });

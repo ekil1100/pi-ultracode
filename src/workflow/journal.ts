@@ -9,11 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ThinkingLevel } from "./agent-runner.ts";
-import {
-  DEFAULT_MAX_AGENTS,
-  WorkflowPolicyError,
-  normalizeMaxAgents,
-} from "./admission.ts";
+import { DEFAULT_MAX_AGENTS, WorkflowPolicyError, normalizeMaxAgents } from "./admission.ts";
 import {
   assertRegularArtifactFile,
   ensurePrivateArtifactDirectory,
@@ -237,7 +233,11 @@ export class RunJournal {
     const filePath = path.join(dir, `${meta.runId}.jsonl`);
     const fd = fs.openSync(
       filePath,
-      fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_APPEND | NO_FOLLOW,
+      fs.constants.O_CREAT |
+        fs.constants.O_EXCL |
+        fs.constants.O_WRONLY |
+        fs.constants.O_APPEND |
+        NO_FOLLOW,
       0o600,
     );
     const journal = new RunJournal(filePath, fd, {
@@ -287,16 +287,24 @@ export class RunJournal {
         throw new WorkflowPolicyError(`workflow journal runId mismatch for ${runId}`);
       }
       if (loaded.header.scriptHash !== meta.scriptHash) {
-        throw new WorkflowPolicyError(`workflow ${runId} has an immutable script; start a new run for changed source`);
+        throw new WorkflowPolicyError(
+          `workflow ${runId} has an immutable script; start a new run for changed source`,
+        );
       }
       if (JSON.stringify(loaded.header.args) !== JSON.stringify(meta.args)) {
-        throw new WorkflowPolicyError(`workflow ${runId} has immutable args; start a new run for changed args`);
+        throw new WorkflowPolicyError(
+          `workflow ${runId} has immutable args; start a new run for changed args`,
+        );
       }
       if (loaded.header.projectTrusted !== meta.projectTrusted) {
-        throw new WorkflowPolicyError(`workflow ${runId} has an immutable project trust context; start a new run after trust changes`);
+        throw new WorkflowPolicyError(
+          `workflow ${runId} has an immutable project trust context; start a new run after trust changes`,
+        );
       }
       if (loaded.header.targetIdentity !== meta.targetIdentity) {
-        throw new WorkflowPolicyError(`workflow ${runId} has an immutable repository/cwd target; start a new run after changing location`);
+        throw new WorkflowPolicyError(
+          `workflow ${runId} has an immutable repository/cwd target; start a new run after changing location`,
+        );
       }
       if (loaded.pendingDeliveries.size > 0) {
         const pending = [...loaded.pendingDeliveries.values()][0]!;
@@ -310,9 +318,10 @@ export class RunJournal {
         }
       }
 
-      const requested = meta.maxAgents === undefined
-        ? loaded.effectiveMaxAgents
-        : normalizeMaxAgents(meta.maxAgents);
+      const requested =
+        meta.maxAgents === undefined
+          ? loaded.effectiveMaxAgents
+          : normalizeMaxAgents(meta.maxAgents);
       if (requested < loaded.effectiveMaxAgents) {
         throw new WorkflowPolicyError(
           `workflow resume maxAgents cannot decrease from ${loaded.effectiveMaxAgents} to ${requested}`,
@@ -361,7 +370,9 @@ export class RunJournal {
     const prior = this.priorAgents.get(callPath);
     if (!prior) return undefined;
     if (prior.key !== key) {
-      throw new WorkflowPolicyError(`workflow resume diverged at ${callPath}; immutable agent input changed`);
+      throw new WorkflowPolicyError(
+        `workflow resume diverged at ${callPath}; immutable agent input changed`,
+      );
     }
     return prior;
   }
@@ -370,10 +381,14 @@ export class RunJournal {
   recordAdmission(callPath: string, inputHash: string, ordinal: number): void {
     const priorHash = this.admissionHashes.get(callPath);
     if (priorHash !== undefined && priorHash !== inputHash) {
-      throw new WorkflowPolicyError(`workflow resume diverged at ${callPath}; immutable agent input changed`);
+      throw new WorkflowPolicyError(
+        `workflow resume diverged at ${callPath}; immutable agent input changed`,
+      );
     }
     if (this._agentsUsed >= this.effectiveMaxAgents) {
-      throw new WorkflowPolicyError(`workflow exceeded maxAgents=${this.effectiveMaxAgents} (no agent slots remain)`);
+      throw new WorkflowPolicyError(
+        `workflow exceeded maxAgents=${this.effectiveMaxAgents} (no agent slots remain)`,
+      );
     }
     this.append({ type: "admit", callPath, inputHash, ordinal });
     for (const [panelPath, admissions] of this.openPanelAdmissions) {
@@ -388,7 +403,9 @@ export class RunJournal {
     const prior = this.nestedSources.get(callPath);
     if (prior !== undefined) {
       if (prior !== sourceHash) {
-        throw new WorkflowPolicyError(`immutable nested workflow source or args changed at ${callPath}`);
+        throw new WorkflowPolicyError(
+          `immutable nested workflow source or args changed at ${callPath}`,
+        );
       }
       return;
     }
@@ -397,7 +414,12 @@ export class RunJournal {
   }
 
   recordPanelOpen(callPath: string, reserveAgents: number, branchCount: number): void {
-    const record: JournalPanelOpenRecord = { type: "panel-open", callPath, reserveAgents, branchCount };
+    const record: JournalPanelOpenRecord = {
+      type: "panel-open",
+      callPath,
+      reserveAgents,
+      branchCount,
+    };
     const prior = this.panelOpens.get(callPath);
     if (prior && (prior.reserveAgents !== reserveAgents || prior.branchCount !== branchCount)) {
       throw new WorkflowPolicyError(`immutable panel definition changed at ${callPath}`);
@@ -425,14 +447,17 @@ export class RunJournal {
     };
     const current = this.openPanelBranches.get(callPath);
     if (!current || current.has(branchIndex)) {
-      throw new WorkflowPolicyError(`invalid duplicate or unopened panel branch at ${callPath}/b:${branchIndex}`);
+      throw new WorkflowPolicyError(
+        `invalid duplicate or unopened panel branch at ${callPath}/b:${branchIndex}`,
+      );
     }
     assertPanelBranchCoversDurableCalls(
       record,
       this.openPanelAdmissions.get(callPath),
       this.priorAgents,
     );
-    const branches = this.panelBranches.get(callPath) ?? new Map<number, JournalPanelBranchRecord>();
+    const branches =
+      this.panelBranches.get(callPath) ?? new Map<number, JournalPanelBranchRecord>();
     this.append(record);
     current.set(branchIndex, record);
     branches.set(branchIndex, record);
@@ -473,7 +498,10 @@ export class RunJournal {
    * failed admission retain their full potential because retry success can
    * reveal later calls that did not run in the prior attempt.
    */
-  panelReplayPlan(callPath: string, branchCount: number): {
+  panelReplayPlan(
+    callPath: string,
+    branchCount: number,
+  ): {
     branchNeedsSlot: boolean[];
     slotCredit: number;
   } {
@@ -483,14 +511,14 @@ export class RunJournal {
     let slotCredit = 0;
     for (let index = 0; index < branchCount; index++) {
       const prefix = `${callPath}/b:${index}/`;
-      const completedCalls = completed?.branchCount === branchCount
-        ? completed.calls.filter((call) => call.callPath.startsWith(prefix))
-        : undefined;
+      const completedCalls =
+        completed?.branchCount === branchCount
+          ? completed.calls.filter((call) => call.callPath.startsWith(prefix))
+          : undefined;
       const branch = partial?.get(index);
       const calls = completedCalls ?? branch?.calls;
-      const outcome = completed?.branchCount === branchCount
-        ? completed.branchOutcomes[index]
-        : branch?.outcome;
+      const outcome =
+        completed?.branchCount === branchCount ? completed.branchOutcomes[index] : branch?.outcome;
       if (calls && outcome) {
         const firstFailure = calls.findIndex((call) => call.status === "failed");
         if (firstFailure < 0 && outcome === "success") {
@@ -541,7 +569,12 @@ export class RunJournal {
     if (this.pendingDeliveries.has(callPath) || this.priorAgents.has(callPath)) {
       throw new WorkflowPolicyError(`workflow delivery already started at ${callPath}`);
     }
-    const record: JournalDeliveryStartRecord = { type: "delivery-start", callPath, patchPath, patchHash };
+    const record: JournalDeliveryStartRecord = {
+      type: "delivery-start",
+      callPath,
+      patchPath,
+      patchHash,
+    };
     validateDeliveryStartRecord(record);
     this.append(record);
     this.pendingDeliveries.set(callPath, record);
@@ -636,13 +669,16 @@ export class RunJournal {
     if (record.type === "resume") this.resultRecorded = false;
     if (this.writeFailure) throw this.writeFailure;
     if (this.closeFailure) throw this.closeFailure;
-    if (this.closed || this.fdClosed) throw new WorkflowPolicyError("workflow journal is already closed");
+    if (this.closed || this.fdClosed)
+      throw new WorkflowPolicyError("workflow journal is already closed");
     validateJournalRecordForWrite(record);
     let line: string;
     try {
       line = `${JSON.stringify(record)}\n`;
     } catch (error) {
-      throw new WorkflowPolicyError(`workflow journal serialization failed: ${errorMessage(error)}`);
+      throw new WorkflowPolicyError(
+        `workflow journal serialization failed: ${errorMessage(error)}`,
+      );
     }
     const lineBytes = Buffer.byteLength(line, "utf8");
     if (this.bytes + lineBytes > MAX_JOURNAL_BYTES) {
@@ -655,7 +691,9 @@ export class RunJournal {
       fs.fsyncSync(this.fd);
       this.bytes += lineBytes;
     } catch (error) {
-      const failure = new WorkflowPolicyError(`workflow journal write failed: ${errorMessage(error)}`);
+      const failure = new WorkflowPolicyError(
+        `workflow journal write failed: ${errorMessage(error)}`,
+      );
       this.writeFailure = failure;
       try {
         fs.closeSync(this.fd);
@@ -677,12 +715,16 @@ function loadJournal(filePath: string): LoadedJournal {
     try {
       records.push(JSON.parse(line) as JournalRecord);
     } catch (error) {
-      throw new WorkflowPolicyError(`workflow journal contains invalid JSON on line ${index + 1}: ${errorMessage(error)}`);
+      throw new WorkflowPolicyError(
+        `workflow journal contains invalid JSON on line ${index + 1}: ${errorMessage(error)}`,
+      );
     }
   }
   const header = records[0];
   if (header?.type !== "run" || header.journalVersion !== RUN_JOURNAL_VERSION) {
-    throw new WorkflowPolicyError(`unsupported workflow journal version; expected ${RUN_JOURNAL_VERSION}`);
+    throw new WorkflowPolicyError(
+      `unsupported workflow journal version; expected ${RUN_JOURNAL_VERSION}`,
+    );
   }
   validateRunRecord(header);
 
@@ -701,7 +743,9 @@ function loadJournal(filePath: string): LoadedJournal {
   let generationTerminated = false;
   for (const record of records.slice(1)) {
     if (generationTerminated && record.type !== "resume") {
-      throw new WorkflowPolicyError("workflow journal contains a record after a generation terminal result");
+      throw new WorkflowPolicyError(
+        "workflow journal contains a record after a generation terminal result",
+      );
     }
     if (record.type === "resume") generationTerminated = false;
     switch (record.type) {
@@ -709,23 +753,28 @@ function loadJournal(filePath: string): LoadedJournal {
         if (!isNonNegativeFinite(record.startedAt)) invalidJournalRecord("resume");
         const next = normalizeMaxAgents(record.maxAgents);
         if (next < effectiveMaxAgents) {
-          throw new WorkflowPolicyError("workflow journal contains a decreasing maxAgents resume record");
+          throw new WorkflowPolicyError(
+            "workflow journal contains a decreasing maxAgents resume record",
+          );
         }
         effectiveMaxAgents = next;
         break;
       }
       case "admit":
         if (
-          !isNonEmptyString(record.callPath)
-          || !isNonEmptyString(record.inputHash)
-          || !Number.isInteger(record.ordinal)
-          || record.ordinal < 1
-        ) invalidJournalRecord("admission");
+          !isNonEmptyString(record.callPath) ||
+          !isNonEmptyString(record.inputHash) ||
+          !Number.isInteger(record.ordinal) ||
+          record.ordinal < 1
+        )
+          invalidJournalRecord("admission");
         if (
-          admissionHashes.has(record.callPath)
-          && admissionHashes.get(record.callPath) !== record.inputHash
+          admissionHashes.has(record.callPath) &&
+          admissionHashes.get(record.callPath) !== record.inputHash
         ) {
-          throw new WorkflowPolicyError(`workflow journal has conflicting admissions for ${record.callPath}`);
+          throw new WorkflowPolicyError(
+            `workflow journal has conflicting admissions for ${record.callPath}`,
+          );
         }
         for (const [panelPath, admissions] of openPanelAdmissions) {
           if (record.callPath.startsWith(`${panelPath}/`)) admissions.add(record.callPath);
@@ -737,14 +786,18 @@ function loadJournal(filePath: string): LoadedJournal {
       case "delivery-start":
         validateDeliveryStartRecord(record);
         if (pendingDeliveries.has(record.callPath) || agents.has(record.callPath)) {
-          throw new WorkflowPolicyError(`workflow journal contains duplicate delivery start: ${record.callPath}`);
+          throw new WorkflowPolicyError(
+            `workflow journal contains duplicate delivery start: ${record.callPath}`,
+          );
         }
         pendingDeliveries.set(record.callPath, record);
         break;
       case "agent":
         validateAgentRecord(record);
         if (agents.has(record.callPath)) {
-          throw new WorkflowPolicyError(`workflow journal contains duplicate agent result: ${record.callPath}`);
+          throw new WorkflowPolicyError(
+            `workflow journal contains duplicate agent result: ${record.callPath}`,
+          );
         }
         assertDeliveryCompletionMatches(pendingDeliveries.get(record.callPath), record);
         agents.set(record.callPath, record);
@@ -752,19 +805,21 @@ function loadJournal(filePath: string): LoadedJournal {
         break;
       case "panel-open":
         if (
-          !isNonEmptyString(record.callPath)
-          || !isBoundedNonNegativeInteger(record.reserveAgents, 1024)
-          || !isBoundedNonNegativeInteger(record.branchCount, 1024)
-          || record.reserveAgents < record.branchCount
+          !isNonEmptyString(record.callPath) ||
+          !isBoundedNonNegativeInteger(record.reserveAgents, 1024) ||
+          !isBoundedNonNegativeInteger(record.branchCount, 1024) ||
+          record.reserveAgents < record.branchCount
         ) {
           throw new WorkflowPolicyError("workflow journal contains an invalid panel-open record");
         }
         const prior = panelOpens.get(record.callPath);
         if (
-          prior
-          && (prior.reserveAgents !== record.reserveAgents || prior.branchCount !== record.branchCount)
+          prior &&
+          (prior.reserveAgents !== record.reserveAgents || prior.branchCount !== record.branchCount)
         ) {
-          throw new WorkflowPolicyError(`workflow journal has conflicting panel-open records at ${record.callPath}`);
+          throw new WorkflowPolicyError(
+            `workflow journal has conflicting panel-open records at ${record.callPath}`,
+          );
         }
         panelOpens.set(record.callPath, record);
         completePanels.delete(record.callPath);
@@ -774,20 +829,26 @@ function loadJournal(filePath: string): LoadedJournal {
         break;
       case "panel-branch": {
         if (
-          !isNonEmptyString(record.callPath)
-          || !isBoundedNonNegativeInteger(record.branchIndex, 1023)
-          || (record.outcome !== "success" && record.outcome !== "failed")
-          || !validPanelCalls(record.calls)
-        ) invalidJournalRecord("panel-branch");
+          !isNonEmptyString(record.callPath) ||
+          !isBoundedNonNegativeInteger(record.branchIndex, 1023) ||
+          (record.outcome !== "success" && record.outcome !== "failed") ||
+          !validPanelCalls(record.calls)
+        )
+          invalidJournalRecord("panel-branch");
         const panelOpen = panelOpens.get(record.callPath);
-        if (!panelOpen || record.branchIndex >= panelOpen.branchCount) invalidJournalRecord("panel-branch");
+        if (!panelOpen || record.branchIndex >= panelOpen.branchCount)
+          invalidJournalRecord("panel-branch");
         const branchPrefix = `${record.callPath}/b:${record.branchIndex}/`;
         if (
-          record.calls.some((call) =>
-            !call.callPath.startsWith(branchPrefix)
-            || (call.status === "success" ? !agents.has(call.callPath) : !admittedPaths.has(call.callPath))
+          record.calls.some(
+            (call) =>
+              !call.callPath.startsWith(branchPrefix) ||
+              (call.status === "success"
+                ? !agents.has(call.callPath)
+                : !admittedPaths.has(call.callPath)),
           )
-        ) invalidJournalRecord("panel-branch");
+        )
+          invalidJournalRecord("panel-branch");
         assertPanelBranchCoversDurableCalls(
           record,
           openPanelAdmissions.get(record.callPath),
@@ -796,35 +857,44 @@ function loadJournal(filePath: string): LoadedJournal {
         const current = openPanelBranches.get(record.callPath);
         if (!current || current.has(record.branchIndex)) invalidJournalRecord("panel-branch");
         current.set(record.branchIndex, record);
-        const branches = panelBranches.get(record.callPath) ?? new Map<number, JournalPanelBranchRecord>();
+        const branches =
+          panelBranches.get(record.callPath) ?? new Map<number, JournalPanelBranchRecord>();
         branches.set(record.branchIndex, record);
         panelBranches.set(record.callPath, branches);
         break;
       }
       case "panel-complete":
         if (
-          !isNonEmptyString(record.callPath)
-          || !isBoundedNonNegativeInteger(record.branchCount, 1024)
-          || !Array.isArray(record.branchOutcomes)
-          || record.branchOutcomes.length !== record.branchCount
-          || record.branchOutcomes.some((outcome) => outcome !== "success" && outcome !== "failed")
-          || !validPanelCalls(record.calls)
+          !isNonEmptyString(record.callPath) ||
+          !isBoundedNonNegativeInteger(record.branchCount, 1024) ||
+          !Array.isArray(record.branchOutcomes) ||
+          record.branchOutcomes.length !== record.branchCount ||
+          record.branchOutcomes.some((outcome) => outcome !== "success" && outcome !== "failed") ||
+          !validPanelCalls(record.calls)
         ) {
           throw new WorkflowPolicyError("workflow journal contains an invalid panel record");
         }
         const panelOpen = panelOpens.get(record.callPath);
-        if (!panelOpen || panelOpen.branchCount !== record.branchCount) invalidJournalRecord("panel");
-        if (record.calls.some((call) => {
-          let inBranch = false;
-          for (let index = 0; index < record.branchCount; index++) {
-            if (call.callPath.startsWith(`${record.callPath}/b:${index}/`)) {
-              inBranch = true;
-              break;
+        if (!panelOpen || panelOpen.branchCount !== record.branchCount)
+          invalidJournalRecord("panel");
+        if (
+          record.calls.some((call) => {
+            let inBranch = false;
+            for (let index = 0; index < record.branchCount; index++) {
+              if (call.callPath.startsWith(`${record.callPath}/b:${index}/`)) {
+                inBranch = true;
+                break;
+              }
             }
-          }
-          return !inBranch
-            || (call.status === "success" ? !agents.has(call.callPath) : !admittedPaths.has(call.callPath));
-        })) invalidJournalRecord("panel");
+            return (
+              !inBranch ||
+              (call.status === "success"
+                ? !agents.has(call.callPath)
+                : !admittedPaths.has(call.callPath))
+            );
+          })
+        )
+          invalidJournalRecord("panel");
         const currentBranches = openPanelBranches.get(record.callPath);
         for (const branch of currentBranches?.values() ?? []) {
           assertPanelBranchCoversDurableCalls(
@@ -840,11 +910,15 @@ function loadJournal(filePath: string): LoadedJournal {
         break;
       case "nested-source": {
         if (!isNonEmptyString(record.callPath) || !isNonEmptyString(record.sourceHash)) {
-          throw new WorkflowPolicyError("workflow journal contains an invalid nested-source record");
+          throw new WorkflowPolicyError(
+            "workflow journal contains an invalid nested-source record",
+          );
         }
         const prior = nestedSources.get(record.callPath);
         if (prior !== undefined && prior !== record.sourceHash) {
-          throw new WorkflowPolicyError(`workflow journal has conflicting nested source at ${record.callPath}`);
+          throw new WorkflowPolicyError(
+            `workflow journal has conflicting nested source at ${record.callPath}`,
+          );
         }
         nestedSources.set(record.callPath, record.sourceHash);
         break;
@@ -871,10 +945,14 @@ function loadJournal(filePath: string): LoadedJournal {
   }
   for (const [callPath, agent] of agents) {
     if (!admittedPaths.has(callPath)) {
-      throw new WorkflowPolicyError(`workflow journal contains an agent result without admission: ${callPath}`);
+      throw new WorkflowPolicyError(
+        `workflow journal contains an agent result without admission: ${callPath}`,
+      );
     }
     if (admissionHashes.get(callPath) !== agent.key) {
-      throw new WorkflowPolicyError(`workflow journal agent input does not match admission: ${callPath}`);
+      throw new WorkflowPolicyError(
+        `workflow journal agent input does not match admission: ${callPath}`,
+      );
     }
   }
   return {
@@ -903,37 +981,41 @@ function validateJournalRecordForWrite(record: JournalRecord): void {
       return;
     case "admit":
       if (
-        !isNonEmptyString(record.callPath)
-        || !isNonEmptyString(record.inputHash)
-        || !Number.isSafeInteger(record.ordinal)
-        || record.ordinal < 1
-      ) invalidJournalRecord("admission");
+        !isNonEmptyString(record.callPath) ||
+        !isNonEmptyString(record.inputHash) ||
+        !Number.isSafeInteger(record.ordinal) ||
+        record.ordinal < 1
+      )
+        invalidJournalRecord("admission");
       return;
     case "panel-open":
       if (
-        !isNonEmptyString(record.callPath)
-        || !isBoundedNonNegativeInteger(record.reserveAgents, 1024)
-        || !isBoundedNonNegativeInteger(record.branchCount, 1024)
-        || record.reserveAgents < record.branchCount
-      ) invalidJournalRecord("panel-open");
+        !isNonEmptyString(record.callPath) ||
+        !isBoundedNonNegativeInteger(record.reserveAgents, 1024) ||
+        !isBoundedNonNegativeInteger(record.branchCount, 1024) ||
+        record.reserveAgents < record.branchCount
+      )
+        invalidJournalRecord("panel-open");
       return;
     case "panel-branch":
       if (
-        !isNonEmptyString(record.callPath)
-        || !isBoundedNonNegativeInteger(record.branchIndex, 1023)
-        || (record.outcome !== "success" && record.outcome !== "failed")
-        || !validPanelCalls(record.calls)
-      ) invalidJournalRecord("panel-branch");
+        !isNonEmptyString(record.callPath) ||
+        !isBoundedNonNegativeInteger(record.branchIndex, 1023) ||
+        (record.outcome !== "success" && record.outcome !== "failed") ||
+        !validPanelCalls(record.calls)
+      )
+        invalidJournalRecord("panel-branch");
       return;
     case "panel-complete":
       if (
-        !isNonEmptyString(record.callPath)
-        || !isBoundedNonNegativeInteger(record.branchCount, 1024)
-        || !Array.isArray(record.branchOutcomes)
-        || record.branchOutcomes.length !== record.branchCount
-        || record.branchOutcomes.some((outcome) => outcome !== "success" && outcome !== "failed")
-        || !validPanelCalls(record.calls)
-      ) invalidJournalRecord("panel");
+        !isNonEmptyString(record.callPath) ||
+        !isBoundedNonNegativeInteger(record.branchCount, 1024) ||
+        !Array.isArray(record.branchOutcomes) ||
+        record.branchOutcomes.length !== record.branchCount ||
+        record.branchOutcomes.some((outcome) => outcome !== "success" && outcome !== "failed") ||
+        !validPanelCalls(record.calls)
+      )
+        invalidJournalRecord("panel");
       return;
     case "nested-source":
       if (!isNonEmptyString(record.callPath) || !isNonEmptyString(record.sourceHash)) {
@@ -959,13 +1041,14 @@ function validateResumeRecord(record: JournalResumeRecord): void {
 
 function validateRunRecord(record: JournalRunMeta): void {
   if (
-    !isNonEmptyString(record.runId)
-    || !isNonEmptyString(record.name)
-    || !isNonEmptyString(record.scriptHash)
-    || !isNonNegativeFinite(record.startedAt)
-    || typeof record.projectTrusted !== "boolean"
-    || !isNonEmptyString(record.targetIdentity)
-  ) invalidJournalRecord("run header");
+    !isNonEmptyString(record.runId) ||
+    !isNonEmptyString(record.name) ||
+    !isNonEmptyString(record.scriptHash) ||
+    !isNonNegativeFinite(record.startedAt) ||
+    typeof record.projectTrusted !== "boolean" ||
+    !isNonEmptyString(record.targetIdentity)
+  )
+    invalidJournalRecord("run header");
   if (record.journalVersion !== undefined && record.journalVersion !== RUN_JOURNAL_VERSION) {
     invalidJournalRecord("run header");
   }
@@ -979,10 +1062,11 @@ function validateRunRecord(record: JournalRunMeta): void {
 
 function validateDeliveryStartRecord(record: JournalDeliveryStartRecord): void {
   if (
-    !isNonEmptyString(record.callPath)
-    || !isNonEmptyString(record.patchPath)
-    || !isNonEmptyString(record.patchHash)
-  ) invalidJournalRecord("delivery-start");
+    !isNonEmptyString(record.callPath) ||
+    !isNonEmptyString(record.patchPath) ||
+    !isNonEmptyString(record.patchHash)
+  )
+    invalidJournalRecord("delivery-start");
 }
 
 function assertDeliveryCompletionMatches(
@@ -997,10 +1081,12 @@ function assertDeliveryCompletionMatches(
     return;
   }
   if (
-    agent.deliveryPatchPath !== pending.patchPath
-    || agent.deliveryPatchHash !== pending.patchHash
+    agent.deliveryPatchPath !== pending.patchPath ||
+    agent.deliveryPatchHash !== pending.patchHash
   ) {
-    throw new WorkflowPolicyError(`workflow journal agent delivery does not match intent: ${agent.callPath}`);
+    throw new WorkflowPolicyError(
+      `workflow journal agent delivery does not match intent: ${agent.callPath}`,
+    );
   }
 }
 
@@ -1020,15 +1106,16 @@ function validateAgentRecord(record: JournalAgentRecord): void {
     "durationMs",
   ];
   if (
-    !isNonEmptyString(record.callPath)
-    || !isNonEmptyString(record.key)
-    || typeof record.label !== "string"
-    || !Object.hasOwn(record, "value")
-    || !Number.isSafeInteger(record.seq)
-    || record.seq < 1
-    || !Number.isSafeInteger(record.outputTokens)
-    || record.outputTokens < 0
-  ) invalidJournalRecord("agent");
+    !isNonEmptyString(record.callPath) ||
+    !isNonEmptyString(record.key) ||
+    typeof record.label !== "string" ||
+    !Object.hasOwn(record, "value") ||
+    !Number.isSafeInteger(record.seq) ||
+    record.seq < 1 ||
+    !Number.isSafeInteger(record.outputTokens) ||
+    record.outputTokens < 0
+  )
+    invalidJournalRecord("agent");
   for (const field of integerFields) {
     const value = record[field];
     if (value !== undefined && (!Number.isSafeInteger(value) || (value as number) < 0)) {
@@ -1047,7 +1134,8 @@ function validateAgentRecord(record: JournalAgentRecord): void {
     "deliveryPatchHash",
     "transcriptPath",
   ] as const) {
-    if (record[field] !== undefined && typeof record[field] !== "string") invalidJournalRecord("agent");
+    if (record[field] !== undefined && typeof record[field] !== "string")
+      invalidJournalRecord("agent");
   }
   if (record.structuredOutput !== undefined && typeof record.structuredOutput !== "boolean") {
     invalidJournalRecord("agent");
@@ -1061,11 +1149,12 @@ function validateAgentRecord(record: JournalAgentRecord): void {
 
 function validateResultRecord(record: JournalResultRecord): void {
   if (
-    typeof record.ok !== "boolean"
-    || !Number.isInteger(record.agentCount)
-    || record.agentCount < 0
-    || !isNonNegativeFinite(record.durationMs)
-  ) invalidJournalRecord("result");
+    typeof record.ok !== "boolean" ||
+    !Number.isInteger(record.agentCount) ||
+    record.agentCount < 0 ||
+    !isNonNegativeFinite(record.durationMs)
+  )
+    invalidJournalRecord("result");
   if (record.ok) {
     if (!Object.hasOwn(record, "result")) invalidJournalRecord("result");
     try {
@@ -1121,10 +1210,14 @@ function assertPanelCompletionMatchesBranches(
 function validPanelCalls(
   value: unknown,
 ): value is Array<{ callPath: string; status: "success" | "failed" }> {
-  return Array.isArray(value) && value.every((call) =>
-    !!call
-    && isNonEmptyString(call.callPath)
-    && (call.status === "success" || call.status === "failed")
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (call) =>
+        !!call &&
+        isNonEmptyString(call.callPath) &&
+        (call.status === "success" || call.status === "failed"),
+    )
   );
 }
 
@@ -1157,7 +1250,9 @@ function readAndRepairJournal(filePath: string): string {
     JSON.parse(tail);
   } catch (error) {
     if (lastNewline < 0) {
-      throw new WorkflowPolicyError(`workflow journal contains invalid JSON on line 1: ${errorMessage(error)}`);
+      throw new WorkflowPolicyError(
+        `workflow journal contains invalid JSON on line 1: ${errorMessage(error)}`,
+      );
     }
     const repaired = content.slice(0, lastNewline + 1);
     truncateRegularFile(filePath, Buffer.byteLength(repaired, "utf8"));

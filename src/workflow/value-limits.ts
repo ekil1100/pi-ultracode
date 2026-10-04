@@ -19,7 +19,15 @@ const NUMBER_SCHEMA_KEYS = [
   "exclusiveMaximum",
   "multipleOf",
 ] as const;
-const JSON_SCHEMA_TYPES = new Set(["object", "array", "string", "number", "integer", "boolean", "null"]);
+const JSON_SCHEMA_TYPES = new Set([
+  "object",
+  "array",
+  "string",
+  "number",
+  "integer",
+  "boolean",
+  "null",
+]);
 const REFERENCE_KEYWORDS = new Set(["$ref", "$recursiveRef", "$dynamicRef"]);
 
 export function assertWorkflowArgsLimit(args: unknown): void {
@@ -61,7 +69,9 @@ function assertSchemaTreeBounds(root: unknown): void {
     const { value, depth } = stack.pop()!;
     nodes++;
     if (nodes > MAX_WORKFLOW_SCHEMA_NODES) {
-      throw new WorkflowPolicyError(`workflow schema exceeds ${MAX_WORKFLOW_SCHEMA_NODES} JSON nodes`);
+      throw new WorkflowPolicyError(
+        `workflow schema exceeds ${MAX_WORKFLOW_SCHEMA_NODES} JSON nodes`,
+      );
     }
     if (depth > MAX_WORKFLOW_SCHEMA_DEPTH) {
       throw new WorkflowPolicyError(
@@ -78,7 +88,9 @@ function assertSchemaTreeBounds(root: unknown): void {
 function validateSchemaNode(node: Record<string, unknown>): void {
   for (const key of Object.keys(node)) {
     if (REFERENCE_KEYWORDS.has(key)) {
-      throw new WorkflowPolicyError(`workflow schema ${key} is not supported; inline the referenced schema`);
+      throw new WorkflowPolicyError(
+        `workflow schema ${key} is not supported; inline the referenced schema`,
+      );
     }
     if (key === "pattern" || key === "patternProperties") {
       throw new WorkflowPolicyError(
@@ -91,10 +103,14 @@ function validateSchemaNode(node: Record<string, unknown>): void {
   const declaredTypes = validateSchemaTypes(node.type);
   const composites = ["anyOf", "allOf"].filter((key) => Object.hasOwn(node, key));
   if (Object.hasOwn(node, "oneOf")) {
-    throw new WorkflowPolicyError("workflow schema oneOf is not supported; use non-overlapping anyOf branches");
+    throw new WorkflowPolicyError(
+      "workflow schema oneOf is not supported; use non-overlapping anyOf branches",
+    );
   }
   if (composites.length > 1) {
-    throw new WorkflowPolicyError("workflow schema may use only one of anyOf or allOf at each node");
+    throw new WorkflowPolicyError(
+      "workflow schema may use only one of anyOf or allOf at each node",
+    );
   }
 
   const hasEnum = Object.hasOwn(node, "enum");
@@ -128,7 +144,9 @@ function validateSchemaNode(node: Record<string, unknown>): void {
     if (declaredTypes.length > 0) {
       for (const value of values) {
         if (!declaredTypes.some((type) => matchesJsonType(value, type))) {
-          throw new WorkflowPolicyError("workflow schema enum/const value does not match its declared type");
+          throw new WorkflowPolicyError(
+            "workflow schema enum/const value does not match its declared type",
+          );
         }
       }
     }
@@ -141,7 +159,8 @@ function validateSchemaNode(node: Record<string, unknown>): void {
     if (type === "object") for (const key of OBJECT_SCHEMA_KEYS) allowed.add(key);
     if (type === "array") for (const key of ARRAY_SCHEMA_KEYS) allowed.add(key);
     if (type === "string") for (const key of STRING_SCHEMA_KEYS) allowed.add(key);
-    if (type === "number" || type === "integer") for (const key of NUMBER_SCHEMA_KEYS) allowed.add(key);
+    if (type === "number" || type === "integer")
+      for (const key of NUMBER_SCHEMA_KEYS) allowed.add(key);
   }
   assertOnlySchemaKeys(node, allowed);
 
@@ -178,7 +197,9 @@ function validateObjectSchema(node: Record<string, unknown>): void {
     }
     for (const key of required) {
       if (!properties || !Object.hasOwn(properties, key)) {
-        throw new WorkflowPolicyError(`workflow schema required property ${JSON.stringify(key)} is not defined`);
+        throw new WorkflowPolicyError(
+          `workflow schema required property ${JSON.stringify(key)} is not defined`,
+        );
       }
     }
   }
@@ -215,7 +236,10 @@ function validateSchemaChild(value: unknown, keyword: string): void {
 function validateSchemaTypes(value: unknown): string[] {
   if (value === undefined) return [];
   const values = Array.isArray(value) ? value : [value];
-  if (values.length === 0 || values.some((type) => typeof type !== "string" || !JSON_SCHEMA_TYPES.has(type))) {
+  if (
+    values.length === 0 ||
+    values.some((type) => typeof type !== "string" || !JSON_SCHEMA_TYPES.has(type))
+  ) {
     throw new WorkflowPolicyError("workflow schema type must contain supported JSON type names");
   }
   if (new Set(values).size !== values.length) {
@@ -227,7 +251,9 @@ function validateSchemaTypes(value: unknown): string[] {
 function inferSchemaTypes(node: Record<string, unknown>): string[] {
   const object = OBJECT_SCHEMA_KEYS.some((key) => Object.hasOwn(node, key));
   const array = ARRAY_SCHEMA_KEYS.some((key) => Object.hasOwn(node, key));
-  const scalar = [...STRING_SCHEMA_KEYS, ...NUMBER_SCHEMA_KEYS].find((key) => Object.hasOwn(node, key));
+  const scalar = [...STRING_SCHEMA_KEYS, ...NUMBER_SCHEMA_KEYS].find((key) =>
+    Object.hasOwn(node, key),
+  );
   if (scalar) {
     throw new WorkflowPolicyError(`workflow schema ${scalar} requires an explicit type`);
   }
@@ -271,14 +297,22 @@ function assertOnlySchemaKeys(node: Record<string, unknown>, allowedKeys: Iterab
 
 function matchesJsonType(value: unknown, type: string): boolean {
   switch (type) {
-    case "null": return value === null;
-    case "boolean": return typeof value === "boolean";
-    case "string": return typeof value === "string";
-    case "number": return typeof value === "number" && Number.isFinite(value);
-    case "integer": return typeof value === "number" && Number.isInteger(value);
-    case "array": return Array.isArray(value);
-    case "object": return isRecord(value);
-    default: return false;
+    case "null":
+      return value === null;
+    case "boolean":
+      return typeof value === "boolean";
+    case "string":
+      return typeof value === "string";
+    case "number":
+      return typeof value === "number" && Number.isFinite(value);
+    case "integer":
+      return typeof value === "number" && Number.isInteger(value);
+    case "array":
+      return Array.isArray(value);
+    case "object":
+      return isRecord(value);
+    default:
+      return false;
   }
 }
 
@@ -301,16 +335,22 @@ function assertPlainJsonValue(root: unknown, label: string): void {
     if (value === null || typeof value === "string" || typeof value === "boolean") continue;
     if (typeof value === "number") {
       if (Number.isFinite(value) && !Object.is(value, -0)) continue;
-      throw new WorkflowPolicyError(`${label} must contain only durable finite JSON numbers (negative zero is unsupported)`);
+      throw new WorkflowPolicyError(
+        `${label} must contain only durable finite JSON numbers (negative zero is unsupported)`,
+      );
     }
     if (!value || typeof value !== "object") {
       throw new WorkflowPolicyError(`${label} must be a plain JSON value`);
     }
     if (visit.depth > MAX_JSON_VALUE_DEPTH) {
-      throw new WorkflowPolicyError(`${label} exceeds the ${MAX_JSON_VALUE_DEPTH}-level JSON nesting limit`);
+      throw new WorkflowPolicyError(
+        `${label} exceeds the ${MAX_JSON_VALUE_DEPTH}-level JSON nesting limit`,
+      );
     }
     if (seen.has(value)) {
-      throw new WorkflowPolicyError(`${label} must be a JSON tree without repeated object references`);
+      throw new WorkflowPolicyError(
+        `${label} must be a JSON tree without repeated object references`,
+      );
     }
     seen.add(value);
 
@@ -323,16 +363,24 @@ function assertPlainJsonValue(root: unknown, label: string): void {
       const detail = error instanceof Error ? error.message : String(error);
       throw new WorkflowPolicyError(`${label} must be a plain JSON value: ${detail}`);
     }
-    if (symbols.length > 0) throw new WorkflowPolicyError(`${label} must not contain symbol properties`);
+    if (symbols.length > 0)
+      throw new WorkflowPolicyError(`${label} must not contain symbol properties`);
 
     if (Array.isArray(value)) {
       const entries = Object.entries(descriptors).filter(([key]) => key !== "length");
       if (entries.length !== value.length) {
-        throw new WorkflowPolicyError(`${label} arrays must not be sparse or contain extra properties`);
+        throw new WorkflowPolicyError(
+          `${label} arrays must not be sparse or contain extra properties`,
+        );
       }
       for (const [key, descriptor] of entries) {
         const index = Number(key);
-        if (!Number.isInteger(index) || index < 0 || String(index) !== key || index >= value.length) {
+        if (
+          !Number.isInteger(index) ||
+          index < 0 ||
+          String(index) !== key ||
+          index >= value.length
+        ) {
           throw new WorkflowPolicyError(`${label} arrays must not contain extra properties`);
         }
         if (!("value" in descriptor) || !descriptor.enumerable) {

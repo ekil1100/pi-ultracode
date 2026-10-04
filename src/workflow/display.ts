@@ -130,14 +130,29 @@ export function createSnapshot(meta: WorkflowMeta, runId: string): WorkflowSnaps
 
 export function recompute(snapshot: WorkflowSnapshot): WorkflowSnapshot {
   const runningCount = snapshot.agents.filter((a) => a.status === "running").length;
-  const doneCount = snapshot.agents.filter((a) => a.status === "done" || a.status === "cached").length;
+  const doneCount = snapshot.agents.filter(
+    (a) => a.status === "done" || a.status === "cached",
+  ).length;
   const errorCount = snapshot.agents.filter((a) => a.status === "error").length;
-  const cancelledCount = snapshot.agents.filter((a) => a.status === "cancelled" || a.status === "skipped").length;
+  const cancelledCount = snapshot.agents.filter(
+    (a) => a.status === "cancelled" || a.status === "skipped",
+  ).length;
   const cachedCount = snapshot.agents.filter((a) => a.status === "cached").length;
-  return { ...snapshot, agentCount: snapshot.agents.length, runningCount, doneCount, errorCount, cancelledCount, cachedCount };
+  return {
+    ...snapshot,
+    agentCount: snapshot.agents.length,
+    runningCount,
+    doneCount,
+    errorCount,
+    cancelledCount,
+    cachedCount,
+  };
 }
 
-export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderOptions = {}): string[] {
+export function renderWorkflowLines(
+  snapshot: WorkflowSnapshot,
+  options: RenderOptions = {},
+): string[] {
   const maxAgentRows = options.maxAgentRows ?? 6;
   const maxLogs = options.maxLogs ?? 2;
   const showResultPreviews = options.showResultPreviews ?? false;
@@ -176,24 +191,28 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
     const done = agents.filter((a) => a.status === "done" || a.status === "cached").length;
     const running = agents.filter((a) => a.status === "running").length;
     const errors = agents.filter((a) => a.status === "error").length;
-    const cancelled = agents.filter((a) => a.status === "cancelled" || a.status === "skipped").length;
+    const cancelled = agents.filter(
+      (a) => a.status === "cancelled" || a.status === "skipped",
+    ).length;
     const complete = agents.length > 0 && running === 0;
-    const marker = running > 0 || (!complete && snapshot.currentPhase === phase)
-      ? "▶"
-      : errors
-        ? "✗"
-        : cancelled
-          ? "■"
-          : complete
-            ? "✓"
-            : " ";
+    const marker =
+      running > 0 || (!complete && snapshot.currentPhase === phase)
+        ? "▶"
+        : errors
+          ? "✗"
+          : cancelled
+            ? "■"
+            : complete
+              ? "✓"
+              : " ";
     lines.push(
       `  ${marker} ${shorten(phase, 60)} ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}${cancelled ? ` · ${cancelled} cancelled` : ""}`,
     );
     for (const agent of agents.slice(-maxAgentRows)) {
       lines.push(...renderAgentLines(agent, { showResultPreviews, now }));
     }
-    if (agents.length > maxAgentRows) lines.push(`    … ${agents.length - maxAgentRows} earlier agents`);
+    if (agents.length > maxAgentRows)
+      lines.push(`    … ${agents.length - maxAgentRows} earlier agents`);
   }
 
   const unphased = snapshot.agents.filter((a) => !rendered.has(a));
@@ -202,14 +221,18 @@ export function renderWorkflowLines(snapshot: WorkflowSnapshot, options: RenderO
     for (const agent of unphased.slice(-maxAgentRows)) {
       lines.push(...renderAgentLines(agent, { showResultPreviews, now }));
     }
-    if (unphased.length > maxAgentRows) lines.push(`    … ${unphased.length - maxAgentRows} earlier agents`);
+    if (unphased.length > maxAgentRows)
+      lines.push(`    … ${unphased.length - maxAgentRows} earlier agents`);
   }
 
   for (const log of snapshot.logs.slice(-maxLogs)) lines.push(`  log: ${shorten(log, 100)}`);
   return lines;
 }
 
-export function renderWorkflowText(snapshot: WorkflowSnapshot, options: RenderOptions = {}): string {
+export function renderWorkflowText(
+  snapshot: WorkflowSnapshot,
+  options: RenderOptions = {},
+): string {
   return renderWorkflowLines(snapshot, options).join("\n");
 }
 
@@ -274,9 +297,8 @@ function boundedProjection(value: unknown, _max: number): string {
   try {
     if (value === null) return "null";
     if (typeof value === "string") {
-      const bounded = value.length > PREVIEW_MAX_STRING
-        ? `${value.slice(0, PREVIEW_MAX_STRING)}…`
-        : value;
+      const bounded =
+        value.length > PREVIEW_MAX_STRING ? `${value.slice(0, PREVIEW_MAX_STRING)}…` : value;
       return JSON.stringify(bounded);
     }
     if (typeof value === "number" || typeof value === "boolean" || typeof value === "undefined") {
@@ -302,9 +324,10 @@ function renderAgentLines(
   },
 ): string[] {
   const meta = agentMeta(agent, opts.now);
-  const result = opts.showResultPreviews && agent.resultPreview
-    ? ` — ${safeDisplayText(agent.resultPreview, 80)}`
-    : "";
+  const result =
+    opts.showResultPreviews && agent.resultPreview
+      ? ` — ${safeDisplayText(agent.resultPreview, 80)}`
+      : "";
   return [
     `    #${agent.id} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${meta}${result}`,
     `      ${agentStats(agent)}`,
@@ -313,10 +336,16 @@ function renderAgentLines(
 
 function agentStats(agent: WorkflowAgentSnapshot): string {
   const running = agent.status === "running";
-  const model = agent.modelId
-    ?? (running ? "resolving model…" : agent.legacyCache ? "model unavailable" : "model unresolved");
-  const effort = agent.effort
-    ?? (running ? "resolving effort…" : agent.legacyCache ? "effort unavailable" : "effort unresolved");
+  const model =
+    agent.modelId ??
+    (running ? "resolving model…" : agent.legacyCache ? "model unavailable" : "model unresolved");
+  const effort =
+    agent.effort ??
+    (running
+      ? "resolving effort…"
+      : agent.legacyCache
+        ? "effort unavailable"
+        : "effort unresolved");
   if (agent.legacyCache) {
     return `${shorten(model, 48)} • ${shorten(effort, 24)} · metrics unavailable · cached legacy entry`;
   }
@@ -332,7 +361,10 @@ function agentStats(agent: WorkflowAgentSnapshot): string {
     retries: 0,
     compactions: 0,
   };
-  const partial = agent.status === "cancelled" || agent.status === "error" || (running && agent.currentTurn != null);
+  const partial =
+    agent.status === "cancelled" ||
+    agent.status === "error" ||
+    (running && agent.currentTurn != null);
   const cache = agent.status === "cached" ? " · cached" : "";
   return `${shorten(model, 48)} • ${shorten(effort, 24)} · ${usage.turns} turn${usage.turns === 1 ? "" : "s"} · ${usage.toolUses} tool use${usage.toolUses === 1 ? "" : "s"} · ${formatTokens(usage.totalTokens)}${partial ? "+" : ""} token${partial ? " · partial" : ""}${cache}`;
 }
@@ -353,7 +385,8 @@ function agentMeta(agent: WorkflowAgentSnapshot, now: number): string {
       const args = tool.args ? `: ${shorten(tool.args, 60)}` : "";
       const others = activeTools.length > 1 ? ` +${activeTools.length - 1} more` : "";
       const noToolEvents = Math.max(0, Math.floor((now - tool.lastUpdateAt) / 1000));
-      const warning = noToolEvents >= IDLE_THRESHOLD_S ? ` · ⚠ no tool events ${noToolEvents}s` : "";
+      const warning =
+        noToolEvents >= IDLE_THRESHOLD_S ? ` · ⚠ no tool events ${noToolEvents}s` : "";
       return ` · ${elapsed}s · running ${toolName}${args} (${toolDuration})${others}${warning}`;
     }
 
@@ -364,12 +397,15 @@ function agentMeta(agent: WorkflowAgentSnapshot, now: number): string {
     const activity = agent.activity ? ` · ${shorten(agent.activity, 64)}` : "";
     return ` · ${elapsed}s${activity}`;
   }
-  if (agent.durationMs != null && agent.durationMs > 0) return ` · ${formatDuration(agent.durationMs)}`;
+  if (agent.durationMs != null && agent.durationMs > 0)
+    return ` · ${formatDuration(agent.durationMs)}`;
   return "";
 }
 
 function visibleTool(tools: WorkflowActiveToolSnapshot[]): WorkflowActiveToolSnapshot {
-  return tools.reduce((stalest, tool) => tool.lastUpdateAt < stalest.lastUpdateAt ? tool : stalest);
+  return tools.reduce((stalest, tool) =>
+    tool.lastUpdateAt < stalest.lastUpdateAt ? tool : stalest,
+  );
 }
 
 function formatDuration(ms: number): string {

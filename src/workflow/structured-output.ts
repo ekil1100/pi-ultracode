@@ -6,6 +6,7 @@
  */
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Effect } from "effect";
 import type { Static, TSchema } from "typebox";
 import { assertStructuredOutputLimit } from "./value-limits.ts";
 
@@ -36,15 +37,22 @@ export function createStructuredOutputTool<TSchemaDef extends TSchema>({
       `If you need to inspect files or run commands first, do so, then call ${name} exactly once.`,
     ],
     parameters: schema,
-    async execute(_toolCallId, params) {
-      assertStructuredOutputLimit(params);
-      capture.value = params;
-      capture.called = true;
-      return {
-        content: [{ type: "text", text: "Structured output received." }],
-        details: params,
-        terminate: true,
-      };
+    execute(_toolCallId, params) {
+      return Effect.runPromise(
+        Effect.try({
+          try: () => {
+            assertStructuredOutputLimit(params);
+            capture.value = params;
+            capture.called = true;
+            return {
+              content: [{ type: "text" as const, text: "Structured output received." }],
+              details: params,
+              terminate: true,
+            };
+          },
+          catch: (error) => error,
+        }),
+      );
     },
   });
 }

@@ -25,7 +25,10 @@ export class UltracodePreferences implements UltracodePreferenceStore {
     mkdirSync(dirname(this.path), { recursive: true });
     const temporaryPath = `${this.path}.${randomUUID()}.tmp`;
     try {
-      writeFileSync(temporaryPath, `${JSON.stringify(settings, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+      writeFileSync(temporaryPath, `${JSON.stringify(settings, null, 2)}\n`, {
+        flag: "wx",
+        mode: 0o600,
+      });
       renameSync(temporaryPath, this.path);
     } finally {
       rmSync(temporaryPath, { force: true });
@@ -41,9 +44,15 @@ export class UltracodePreferences implements UltracodePreferenceStore {
       throw error;
     }
     const value: unknown = JSON.parse(content);
-    if (!value || typeof value !== "object" || Array.isArray(value)
-      || ("defaultEnabled" in value && typeof value.defaultEnabled !== "boolean")) {
-      throw new Error(`Invalid Ultracode preferences in ${this.path}: expected an object with a boolean defaultEnabled.`);
+    if (
+      !value ||
+      typeof value !== "object" ||
+      Array.isArray(value) ||
+      ("defaultEnabled" in value && typeof value.defaultEnabled !== "boolean")
+    ) {
+      throw new Error(
+        `Invalid Ultracode preferences in ${this.path}: expected an object with a boolean defaultEnabled.`,
+      );
     }
     return value as Record<string, unknown>;
   }

@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, vi } from "vite-plus/test";
 import assert from "node:assert/strict";
 import * as os from "node:os";
 import * as fs from "node:fs";
@@ -26,7 +26,9 @@ function extension(pi: any, extraDeps: Record<string, unknown> = {}): void {
   ultracodeExtension(pi, {
     preferences: {
       getDefaultEnabled: () => defaultEnabled,
-      setDefaultEnabled: (enabled: boolean) => { defaultEnabled = enabled; },
+      setDefaultEnabled: (enabled: boolean) => {
+        defaultEnabled = enabled;
+      },
     },
     createThinkingPreferenceStore: () => undefined,
     ...extraDeps,
@@ -64,7 +66,8 @@ function makeMockPi(flagValues: Record<string, unknown> = {}) {
     setActiveTools: (t: string[]) => {
       state.activeTools = t;
     },
-    appendEntry: (type: string, data: unknown) => state.entries.push({ type: "custom", customType: type, data }),
+    appendEntry: (type: string, data: unknown) =>
+      state.entries.push({ type: "custom", customType: type, data }),
     sendMessage: () => {},
     sendUserMessage: () => {},
   };
@@ -81,35 +84,67 @@ async function runPromptHooks(
   const handlers = new Map(state.events);
   handlers.set("before_agent_start", [
     ...(handlers.get("before_agent_start") ?? []),
-    (event: BeforeAgentStartEvent) => { systemPrompt = event.systemPrompt; },
+    (event: BeforeAgentStartEvent) => {
+      systemPrompt = event.systemPrompt;
+    },
   ]);
-  const runner = new ExtensionRunner([{
-    path: "test-ultracode",
-    resolvedPath: "test-ultracode",
-    sourceInfo: { path: "test-ultracode", source: "test", scope: "temporary", origin: "top-level" },
-    handlers,
-    tools: new Map(),
-    messageRenderers: new Map(),
-    commands: new Map(),
-    flags: new Map(),
-    shortcuts: new Map(),
-  }], createExtensionRuntime(), process.cwd(), SessionManager.inMemory(), {
-    getAvailable: () => modelContext.models ?? [],
-    getAvailableOfType: () => { throw new Error("Prompt hooks must not check classifiers"); },
-    classify: () => { throw new Error("Prompt hooks must not classify"); },
-  } as unknown as ModelRegistry);
-  runner.bindCore({ getThinkingLevel: () => state.thinking } as any, {
-    getModel: () => modelContext.model,
-    getSignal: () => undefined,
-  } as any);
+  const runner = new ExtensionRunner(
+    [
+      {
+        path: "test-ultracode",
+        resolvedPath: "test-ultracode",
+        sourceInfo: {
+          path: "test-ultracode",
+          source: "test",
+          scope: "temporary",
+          origin: "top-level",
+        },
+        handlers,
+        tools: new Map(),
+        messageRenderers: new Map(),
+        commands: new Map(),
+        flags: new Map(),
+        shortcuts: new Map(),
+      },
+    ],
+    createExtensionRuntime(),
+    process.cwd(),
+    SessionManager.inMemory(),
+    {
+      getAvailable: () => modelContext.models ?? [],
+      getAvailableOfType: () => {
+        throw new Error("Prompt hooks must not check classifiers");
+      },
+      classify: () => {
+        throw new Error("Prompt hooks must not classify");
+      },
+    } as unknown as ModelRegistry,
+  );
+  runner.bindCore(
+    { getThinkingLevel: () => state.thinking } as any,
+    {
+      getModel: () => modelContext.model,
+      getSignal: () => undefined,
+    } as any,
+  );
   const errors: unknown[] = [];
   runner.onError((error) => errors.push(error));
   const result = await runner.emitBeforeAgentStart("test", undefined, {
-    cwd: process.cwd(), customPrompt: base, sections,
+    cwd: process.cwd(),
+    customPrompt: base,
+    sections,
   });
   assert.deepEqual(errors, [], "Pi must dispatch the prompt hooks without errors");
-  assert.equal(result.systemPromptOptions.forceSystemPrompt, undefined, "the extension must not force a full prompt replacement");
-  assert.equal(result.systemPromptOptions.customPrompt, base, "the base prompt must remain unchanged");
+  assert.equal(
+    result.systemPromptOptions.forceSystemPrompt,
+    undefined,
+    "the extension must not force a full prompt replacement",
+  );
+  assert.equal(
+    result.systemPromptOptions.customPrompt,
+    base,
+    "the base prompt must remain unchanged",
+  );
   return { ...result, systemPrompt };
 }
 
@@ -165,18 +200,45 @@ test("extension registers the workflow tool, commands, and flag", () => {
   const removedParameter = "bud" + "get";
   assert.equal(state.tools[0].exposure, "model-only");
   assert.deepEqual(state.tools[0].annotations, {
-    readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true,
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: true,
   });
   assert.equal(state.tools[0].outputSchema, undefined);
-  assert.equal(state.tools[0].parameters.additionalProperties, false, "workflow tool schema rejects removed and unknown parameters");
-  assert.equal(removedParameter in state.tools[0].parameters.properties, false, "workflow tool schema no longer exposes the removed parameter");
+  assert.equal(
+    state.tools[0].parameters.additionalProperties,
+    false,
+    "workflow tool schema rejects removed and unknown parameters",
+  );
+  assert.equal(
+    removedParameter in state.tools[0].parameters.properties,
+    false,
+    "workflow tool schema no longer exposes the removed parameter",
+  );
   assert.equal(state.tools[0].parameters.properties.maxAgents?.minimum, 1);
   assert.equal(state.tools[0].parameters.properties.maxAgents?.maximum, 1024);
   assert.ok(state.commands.has("ultracode"));
-  const depthCompletions = state.commands.get("ultracode").getArgumentCompletions("").map((item: any) => item.value);
-  assert.deepEqual(depthCompletions, ["auto", "focused", "standard", "deep", "off", "status", "default", "default on", "default off"]);
+  const depthCompletions = state.commands
+    .get("ultracode")
+    .getArgumentCompletions("")
+    .map((item: any) => item.value);
+  assert.deepEqual(depthCompletions, [
+    "auto",
+    "focused",
+    "standard",
+    "deep",
+    "off",
+    "status",
+    "default",
+    "default on",
+    "default off",
+  ]);
   assert.deepEqual(
-    state.commands.get("ultracode").getArgumentCompletions("default o").map((item: any) => item.value),
+    state.commands
+      .get("ultracode")
+      .getArgumentCompletions("default o")
+      .map((item: any) => item.value),
     ["default on", "default off"],
   );
   assert.equal(depthCompletions.includes("on"), false);
@@ -185,8 +247,16 @@ test("extension registers the workflow tool, commands, and flag", () => {
   assert.ok(state.shortcuts.has("f6"));
   assert.ok(state.events.has("session_start"));
   assert.ok(state.events.has("session_tree"));
-  assert.equal(state.events.has("model_select"), false, "depth routing needs no model-change lifecycle handler");
-  assert.equal(state.events.has("thinking_level_select"), false, "parent effort remains user-controlled");
+  assert.equal(
+    state.events.has("model_select"),
+    false,
+    "depth routing needs no model-change lifecycle handler",
+  );
+  assert.equal(
+    state.events.has("thinking_level_select"),
+    false,
+    "parent effort remains user-controlled",
+  );
   assert.ok(state.events.has("session_shutdown"));
   assert.ok(state.events.has("input"));
   assert.ok(state.events.has("tool_call"));
@@ -208,12 +278,20 @@ test("SDK-style prompt barriers keep workflow disabled without session_start", a
   state.activeTools = ["read", "workflow"];
 
   await state.events.get("input")![0]({ type: "input", text: "test", source: "interactive" });
-  assert.deepEqual(state.activeTools, ["read"], "input preflight removes auto-activated extension tools");
+  assert.deepEqual(
+    state.activeTools,
+    ["read"],
+    "input preflight removes auto-activated extension tools",
+  );
 
   // Simulate a later input handler restoring a stale active-tools snapshot.
   state.activeTools = ["read", "grep", "workflow"];
   const turn = await runPromptHooks(state);
-  assert.equal(turn.systemPromptOptions.sections.ultracode, undefined, "a disabled turn injects no Ultracode prompt");
+  assert.equal(
+    turn.systemPromptOptions.sections.ultracode,
+    undefined,
+    "a disabled turn injects no Ultracode prompt",
+  );
   assert.deepEqual(state.activeTools, ["read", "grep"], "the final barrier removes only workflow");
 
   const blocked = await state.events.get("tool_call")![0]({
@@ -287,7 +365,9 @@ test("prompt sections replace modes without duplicating wrappers and clear on of
   await state.commands.get("ultracode").handler("deep", ctx);
   await state.events.get("session_shutdown")![0]({ reason: "reload" }, ctx);
   const suspended = await runPromptHooks(state, "BASE", sections);
-  assert.deepEqual(suspended.systemPromptOptions.sections, { other_extension: "Keep this instruction." });
+  assert.deepEqual(suspended.systemPromptOptions.sections, {
+    other_extension: "Keep this instruction.",
+  });
   await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
   const restored = await runPromptHooks(state, "BASE", suspended.systemPromptOptions.sections);
   assert.match(restored.systemPromptOptions.sections.ultracode, /Configured mode: deep\./);
@@ -301,21 +381,44 @@ test("parent capability context follows model switches on the next prompt withou
   state.thinking = "low";
   const modelContext = {
     model: {
-      provider: "test", id: "three", reasoning: true,
+      provider: "test",
+      id: "three",
+      reasoning: true,
       thinkingLevelMap: { off: null, minimal: null, xhigh: null, max: null },
     } as ModelLike,
     models: [] as ModelLike[],
   };
   const first = await runPromptHooks(state, "BASE", {}, modelContext);
   assert.match(first.systemPrompt, /<ultracode_effort>/);
-  assert.match(first.systemPromptOptions.sections.ultracode_effort, /Default child: .*"model":"test\/three","supportedEfforts":\["low","medium","high"\]/);
+  assert.match(
+    first.systemPromptOptions.sections.ultracode_effort,
+    /Default child: .*"model":"test\/three","supportedEfforts":\["low","medium","high"\]/,
+  );
 
   modelContext.model = { provider: "test", id: "no-thinking", reasoning: false };
-  modelContext.models = [{ provider: "override", id: "seven", reasoning: true, thinkingLevelMap: { xhigh: "xhigh", max: "max" } }];
-  const next = await runPromptHooks(state, "BASE", first.systemPromptOptions.sections, modelContext);
+  modelContext.models = [
+    {
+      provider: "override",
+      id: "seven",
+      reasoning: true,
+      thinkingLevelMap: { xhigh: "xhigh", max: "max" },
+    },
+  ];
+  const next = await runPromptHooks(
+    state,
+    "BASE",
+    first.systemPromptOptions.sections,
+    modelContext,
+  );
   const capabilities = next.systemPromptOptions.sections.ultracode_effort;
-  assert.match(capabilities, /Default child: .*"model":"test\/no-thinking","supportedEfforts":\["off"\]/);
-  assert.match(capabilities, /"model":"override\/seven","supportedEfforts":\["off","minimal","low","medium","high","xhigh","max"\]/);
+  assert.match(
+    capabilities,
+    /Default child: .*"model":"test\/no-thinking","supportedEfforts":\["off"\]/,
+  );
+  assert.match(
+    capabilities,
+    /"model":"override\/seven","supportedEfforts":\["off","minimal","low","medium","high","xhigh","max"\]/,
+  );
   assert.doesNotMatch(capabilities, /test\/three/);
   assert.equal((next.systemPrompt.match(/<ultracode_effort>/g) ?? []).length, 1);
   assert.equal(state.thinking, "low");
@@ -332,9 +435,14 @@ test("extension capability context uses an injected execution runtime", async ()
   extension(pi, { modelRuntime: { getModel: () => resolved } });
   const { ctx } = makeCtx(state);
   await state.commands.get("ultracode").handler("auto", ctx);
-  const turn = await runPromptHooks(state, "BASE", {}, {
-    model: { ...resolved, reasoning: true, thinkingLevelMap: { max: "max" } },
-  });
+  const turn = await runPromptHooks(
+    state,
+    "BASE",
+    {},
+    {
+      model: { ...resolved, reasoning: true, thinkingLevelMap: { max: "max" } },
+    },
+  );
   assert.match(turn.systemPromptOptions.sections.ultracode_effort, /"supportedEfforts":\["off"\]/);
 });
 
@@ -438,8 +546,16 @@ test("mode state is restored from persisted entries on a fresh load", async () =
 
   await state.commands.get("ultracode").handler("off", ctx);
   assert.equal(state.entries.at(-1)?.data.mode, "off");
-  assert.equal("enabled" in (state.entries.at(-1)?.data ?? {}), false, "new entries persist the mode enum");
-  assert.equal("budgetTotal" in (state.entries.at(-1)?.data ?? {}), false, "new persisted mode entries omit legacy budgetTotal");
+  assert.equal(
+    "enabled" in (state.entries.at(-1)?.data ?? {}),
+    false,
+    "new entries persist the mode enum",
+  );
+  assert.equal(
+    "budgetTotal" in (state.entries.at(-1)?.data ?? {}),
+    false,
+    "new persisted mode entries omit legacy budgetTotal",
+  );
 });
 
 test("session restore ignores mode entries from discarded branches", async () => {
@@ -505,7 +621,7 @@ test("--ultracode flag enables auto mode at session_start", async () => {
 
 test("/ultracode default on enables the current session and persists across extension instances", async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-default-"));
-  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  t.onTestFinished(() => fs.rmSync(dir, { recursive: true, force: true }));
   const file = path.join(dir, "agent", "ultracode.json");
   const { pi, state } = makeMockPi();
   extension(pi, { preferences: new UltracodePreferences(file) });
@@ -536,10 +652,17 @@ test("/ultracode default on enables the current session and persists across exte
   assert.match(turn.systemPrompt, /Configured mode: auto/);
 
   await next.state.commands.get("ultracode").handler("default off", nextCtx);
-  assert.equal(next.state.activeTools.includes("workflow"), true, "changing the default does not disable this session");
+  assert.equal(
+    next.state.activeTools.includes("workflow"),
+    true,
+    "changing the default does not disable this session",
+  );
   const third = makeMockPi();
   extension(third.pi, { preferences: new UltracodePreferences(file) });
-  await third.state.events.get("session_start")![0]({ reason: "startup" }, makeCtx(third.state).ctx);
+  await third.state.events.get("session_start")![0](
+    { reason: "startup" },
+    makeCtx(third.state).ctx,
+  );
   assert.equal(third.state.activeTools.includes("workflow"), false);
 });
 
@@ -552,7 +675,10 @@ test("startup defaults respect saved modes across reload, resume, and fork", asy
       const { ctx } = makeCtx(state);
       await state.events.get("session_start")![0]({ reason }, ctx);
       assert.equal(state.activeTools.includes("workflow"), mode !== "off");
-      assert.equal(state.statuses.ultracode, mode === "off" ? undefined : `<accent>ultracode</accent> · <dim>${mode}</dim>`);
+      assert.equal(
+        state.statuses.ultracode,
+        mode === "off" ? undefined : `<accent>ultracode</accent> · <dim>${mode}</dim>`,
+      );
       assert.equal(state.entries.length, 1, "restoration must not replace a saved choice");
     }
   }
@@ -572,7 +698,11 @@ test("default on overrides explicit off immediately, but later off survives relo
 
   await command.handler("off", ctx);
   await command.handler("default", ctx);
-  assert.equal(state.activeTools.includes("workflow"), false, "querying the default must not enable the session");
+  assert.equal(
+    state.activeTools.includes("workflow"),
+    false,
+    "querying the default must not enable the session",
+  );
   await state.events.get("session_start")![0]({ reason: "reload" }, ctx);
   assert.equal(state.activeTools.includes("workflow"), false);
   assert.deepEqual(state.entries.at(-1).data, { mode: "off" });
@@ -592,7 +722,11 @@ test("default on preserves the current active depth and parent effort", async ()
     assert.equal(state.activeTools.includes("workflow"), true);
     assert.equal(state.statuses.ultracode, `<accent>ultracode</accent> · <dim>${selected}</dim>`);
     assert.equal(state.thinking, "high");
-    assert.equal(state.entries.length, entryCount, "repeated default on does not rewrite an active mode");
+    assert.equal(
+      state.entries.length,
+      entryCount,
+      "repeated default on does not rewrite an active mode",
+    );
     assert.ok(notifications.at(-1)!.m.includes(`current session: ${selected}`));
   }
 });
@@ -602,8 +736,13 @@ test("/ultracode default rejects invalid arguments and reports preference failur
   let writes = 0;
   extension(pi, {
     preferences: {
-      getDefaultEnabled: () => { throw new Error("read failed"); },
-      setDefaultEnabled: () => { writes++; throw new Error("write failed"); },
+      getDefaultEnabled: () => {
+        throw new Error("read failed");
+      },
+      setDefaultEnabled: () => {
+        writes++;
+        throw new Error("write failed");
+      },
     },
   });
   const { ctx, notifications } = makeCtx(state);
@@ -648,7 +787,9 @@ test("/workflows and F6 use the extension session's registry; abort remains isol
 
   let otherAborted = false;
   const other = createSnapshot({ name: "other", description: "x" }, "wf_other");
-  otherRegistry.register("wf_other", other, () => { otherAborted = true; });
+  otherRegistry.register("wf_other", other, () => {
+    otherAborted = true;
+  });
   const snap = createSnapshot({ name: "demo", description: "x" }, "wf_overlaytest");
   snap.status = "completed";
   registry.register("wf_overlaytest", snap, () => {});
@@ -663,7 +804,9 @@ test("/workflows and F6 use the extension session's registry; abort remains isol
 
   let aborted = false;
   const active = createSnapshot({ name: "active", description: "x" }, "wf_aborttest");
-  registry.register("wf_aborttest", active, () => { aborted = true; });
+  registry.register("wf_aborttest", active, () => {
+    aborted = true;
+  });
   await handler("abort", ctx);
   assert.equal(aborted, true);
   assert.equal(otherAborted, false, "abort cannot cross an extension-session registry");
@@ -711,7 +854,13 @@ test("workflow tool executes a script end-to-end with an injected runner", async
     const b = await agent('task b', { label: 'b' })
     return { a, b }`;
 
-  const result = await tool.execute("tc1", { script } as any, undefined, (u) => updates.push(u), ctx);
+  const result = await tool.execute(
+    "tc1",
+    { script } as any,
+    undefined,
+    (u) => updates.push(u),
+    ctx,
+  );
   const text = (result.content[0] as any).text as string;
   assert.match(text, /Workflow smoke completed/);
   assert.match(text, /2 agent/);
@@ -753,7 +902,11 @@ test("workflow tool resumes a prior run from its journal", async () => {
   const runner = {
     run: async (call: any) => {
       calls++;
-      return { value: `r:${call.label}`, usage: { outputTokens: 2, totalTokens: 2, cost: 0 }, cwd: process.cwd() };
+      return {
+        value: `r:${call.label}`,
+        usage: { outputTokens: 2, totalTokens: 2, cost: 0 },
+        cwd: process.cwd(),
+      };
     },
   };
   const tool = createWorkflowTool({ testRunner: runner });
@@ -768,7 +921,13 @@ test("workflow tool resumes a prior run from its journal", async () => {
   assert.equal(calls, 2);
 
   calls = 0;
-  const second = await tool.execute("t2", { script, resumeFromRunId: runId } as any, undefined, undefined, ctx);
+  const second = await tool.execute(
+    "t2",
+    { script, resumeFromRunId: runId } as any,
+    undefined,
+    undefined,
+    ctx,
+  );
   assert.equal(calls, 0, "resume should replay cached results without calling the runner");
   assert.match((second.content[0] as any).text, /cached from resume/);
 
@@ -785,7 +944,11 @@ test("workflow resume cannot replay across repository or cwd targets", async () 
       testRunner: {
         run: async () => {
           runnerCalls++;
-          return { value: "done", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: firstCwd };
+          return {
+            value: "done",
+            usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+            cwd: firstCwd,
+          };
         },
       },
     });
@@ -830,19 +993,35 @@ test("workflow tool validates completed worktree effects before resume", async (
         run: async (call: any) => {
           runnerCalls++;
           fs.writeFileSync(path.join(call.cwd, "f.txt"), "agent\n");
-          return { value: "done", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: call.cwd };
+          return {
+            value: "done",
+            usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+            cwd: call.cwd,
+          };
         },
       },
     });
     const ctx: any = { cwd: repo, sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'resume_delivery', description: 'x' }\nreturn await agent('write', { isolation: 'worktree' })`;
-    const first = await tool.execute("delivery-first", { script } as any, undefined, undefined, ctx);
+    const first = await tool.execute(
+      "delivery-first",
+      { script } as any,
+      undefined,
+      undefined,
+      ctx,
+    );
     const runId = (first.details as any).runId as string;
     assert.equal(runnerCalls, 1);
     git(["checkout", "--", "f.txt"]);
 
     await assert.rejects(
-      tool.execute("delivery-resume", { script, resumeFromRunId: runId } as any, undefined, undefined, ctx),
+      tool.execute(
+        "delivery-resume",
+        { script, resumeFromRunId: runId } as any,
+        undefined,
+        undefined,
+        ctx,
+      ),
       /delivery.*no longer present|verif/i,
     );
     assert.equal(runnerCalls, 1);
@@ -859,7 +1038,10 @@ test("saved workflow names cannot traverse outside the workflows directory", asy
   try {
     const outside = path.join(cwd, ".pi", "ultracode", "outside.workflow.js");
     fs.mkdirSync(path.dirname(outside), { recursive: true });
-    fs.writeFileSync(outside, `export const meta = { name: 'outside', description: 'x' }\nreturn 1`);
+    fs.writeFileSync(
+      outside,
+      `export const meta = { name: 'outside', description: 'x' }\nreturn 1`,
+    );
     const tool = createWorkflowTool({
       runWorkflowFn: (async () => {
         runtimeCalls++;
@@ -868,7 +1050,13 @@ test("saved workflow names cannot traverse outside the workflows directory", asy
     });
     const ctx: any = { cwd, sessionManager: { getSessionDir: () => sessionDir } };
     await assert.rejects(
-      tool.execute("saved-name-traversal", { name: "../outside" } as any, undefined, undefined, ctx),
+      tool.execute(
+        "saved-name-traversal",
+        { name: "../outside" } as any,
+        undefined,
+        undefined,
+        ctx,
+      ),
       /workflow name.*letters|invalid workflow name/i,
     );
     assert.equal(runtimeCalls, 0);
@@ -894,9 +1082,18 @@ test("project saved workflows require project trust", async () => {
       runWorkflowFn: (async (_script: string, options: any) => {
         runtimeCalls++;
         return {
-          meta: { name, description: "x" }, result: 1, logs: [], phases: [],
-          agentCount: 0, agentsUsed: 0, cachedCount: 0, spentTokens: 0,
-          newTokens: 0, replayedTokens: 0, durationMs: 1, maxAgents: options.maxAgents,
+          meta: { name, description: "x" },
+          result: 1,
+          logs: [],
+          phases: [],
+          agentCount: 0,
+          agentsUsed: 0,
+          cachedCount: 0,
+          spentTokens: 0,
+          newTokens: 0,
+          replayedTokens: 0,
+          durationMs: 1,
+          maxAgents: options.maxAgents,
         };
       }) as any,
     });
@@ -926,7 +1123,10 @@ test("saved workflow names reject symlinked source files", async () => {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-workflow-symlink-session-"));
   try {
     const outside = path.join(cwd, "outside.workflow.js");
-    fs.writeFileSync(outside, `export const meta = { name: 'outside', description: 'x' }\nreturn 1`);
+    fs.writeFileSync(
+      outside,
+      `export const meta = { name: 'outside', description: 'x' }\nreturn 1`,
+    );
     const workflowsDir = path.join(cwd, ".pi", "ultracode", "workflows");
     fs.mkdirSync(workflowsDir, { recursive: true });
     fs.symlinkSync(outside, path.join(workflowsDir, "linked.workflow.js"));
@@ -1014,13 +1214,25 @@ test("workflow resume rejects changed scripts before runtime side effects", asyn
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const original = `export const meta = { name: 'immutable_resume', description: 'x' }\nreturn 1`;
     const changed = `export const meta = { name: 'immutable_resume', description: 'x' }\nreturn 2`;
-    const first = await tool.execute("immutable-1", { script: original } as any, undefined, undefined, ctx);
+    const first = await tool.execute(
+      "immutable-1",
+      { script: original } as any,
+      undefined,
+      undefined,
+      ctx,
+    );
     const runId = (first.details as any).runId as string;
     const scriptPath = path.join(sessionDir, "ultracode-runs", `${runId}.workflow.js`);
     const before = fs.readFileSync(scriptPath, "utf8");
 
     await assert.rejects(
-      tool.execute("immutable-2", { script: changed, resumeFromRunId: runId } as any, undefined, undefined, ctx),
+      tool.execute(
+        "immutable-2",
+        { script: changed, resumeFromRunId: runId } as any,
+        undefined,
+        undefined,
+        ctx,
+      ),
       /immutable|does not match|changed script/i,
     );
     assert.equal(runtimeCalls, 1);
@@ -1038,15 +1250,29 @@ test("workflow resume rejects changed args before runtime side effects", async (
       runWorkflowFn: (async (_script: string, options: any) => {
         runtimeCalls++;
         return {
-          meta: { name: "immutable_args", description: "x" }, result: options.args,
-          logs: [], phases: [], agentCount: 0, cachedCount: 0,
-          spentTokens: 0, newTokens: 0, replayedTokens: 0, durationMs: 1, maxAgents: options.maxAgents,
+          meta: { name: "immutable_args", description: "x" },
+          result: options.args,
+          logs: [],
+          phases: [],
+          agentCount: 0,
+          cachedCount: 0,
+          spentTokens: 0,
+          newTokens: 0,
+          replayedTokens: 0,
+          durationMs: 1,
+          maxAgents: options.maxAgents,
         };
       }) as any,
     });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'immutable_args', description: 'x' }\nreturn args`;
-    const first = await tool.execute("immutable-args-1", { script, args: { value: 1 } } as any, undefined, undefined, ctx);
+    const first = await tool.execute(
+      "immutable-args-1",
+      { script, args: { value: 1 } } as any,
+      undefined,
+      undefined,
+      ctx,
+    );
     const runId = (first.details as any).runId as string;
     await assert.rejects(
       tool.execute(
@@ -1066,7 +1292,11 @@ test("workflow resume rejects changed args before runtime side effects", async (
       undefined,
       ctx,
     );
-    assert.equal(runtimeCalls, 2, "rejected immutable args must release the process-local workflow lease");
+    assert.equal(
+      runtimeCalls,
+      2,
+      "rejected immutable args must release the process-local workflow lease",
+    );
   } finally {
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
@@ -1108,9 +1338,21 @@ test("workflow tool forwards an explicit host child-effort fallback and injected
     };
     const script = `export const meta = { name: 'x', description: 'x' }\nagent('a', { label: 'a' })`;
     await tool.execute("tc1", { script } as any, undefined, undefined, ctx);
-    assert.equal(captured.thinkingLevel, "max", "explicit host fallback is forwarded to runWorkflow");
-    assert.equal(captured.modelRuntime, modelRuntime, "SDK hosts can share their canonical runtime");
-    assert.equal(captured.projectTrusted, false, "the parent project trust decision is forwarded unchanged");
+    assert.equal(
+      captured.thinkingLevel,
+      "max",
+      "explicit host fallback is forwarded to runWorkflow",
+    );
+    assert.equal(
+      captured.modelRuntime,
+      modelRuntime,
+      "SDK hosts can share their canonical runtime",
+    );
+    assert.equal(
+      captured.projectTrusted,
+      false,
+      "the parent project trust decision is forwarded unchanged",
+    );
     assert.equal(trustReads, 1, "project trust is captured once per tool invocation");
   } finally {
     fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -1169,7 +1411,10 @@ test("registered workflow execution fails closed off and leaves child effort sel
     extension(pi, { runWorkflowFn: fakeRun as any });
     const { ctx } = makeCtx(state);
     const tool = state.tools[0];
-    const execCtx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+    const execCtx: any = {
+      cwd: process.cwd(),
+      sessionManager: { getSessionDir: () => sessionDir },
+    };
     const script = `export const meta = { name: 'x', description: 'x' }\nreturn 1`;
 
     await assert.rejects(
@@ -1181,7 +1426,11 @@ test("registered workflow execution fails closed off and leaves child effort sel
     for (const selectedMode of ["auto", "focused", "standard", "deep"] as const) {
       await state.commands.get("ultracode").handler(selectedMode, ctx);
       await tool.execute(`tc-${selectedMode}`, { script } as any, undefined, undefined, execCtx);
-      assert.equal(capturedThinking.at(-1), undefined, "mode does not supply a child effort default");
+      assert.equal(
+        capturedThinking.at(-1),
+        undefined,
+        "mode does not supply a child effort default",
+      );
     }
     assert.equal(runCalls, 4);
   } finally {
@@ -1192,15 +1441,31 @@ test("registered workflow execution fails closed off and leaves child effort sel
 test("workflow tool rejects missing resumeFromRunId without creating artifacts", async () => {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-missing-resume-"));
   try {
-    const tool = createWorkflowTool({ testRunner: { run: async () => { throw new Error("runner should not start"); } } });
+    const tool = createWorkflowTool({
+      testRunner: {
+        run: async () => {
+          throw new Error("runner should not start");
+        },
+      },
+    });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'missing_resume', description: 'x' }\nreturn await agent('a')`;
     await assert.rejects(
-      tool.execute("missing-resume", { script, resumeFromRunId: "wf_missing" } as any, undefined, undefined, ctx),
+      tool.execute(
+        "missing-resume",
+        { script, resumeFromRunId: "wf_missing" } as any,
+        undefined,
+        undefined,
+        ctx,
+      ),
       /resumeFromRunId wf_missing was not found/,
     );
     const runsDir = path.join(sessionDir, "ultracode-runs");
-    assert.equal(fs.existsSync(runsDir), false, "missing resume must not write script/journal/details artifacts");
+    assert.equal(
+      fs.existsSync(runsDir),
+      false,
+      "missing resume must not write script/journal/details artifacts",
+    );
   } finally {
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
@@ -1215,23 +1480,34 @@ test("workflow resume rejects symlink artifacts without overwriting their target
     const target = path.join(sessionDir, "victim.txt");
     fs.writeFileSync(target, "sentinel");
     fs.symlinkSync(target, path.join(runsDir, `${runId}.workflow.js`));
-    fs.writeFileSync(path.join(runsDir, `${runId}.jsonl`), `${JSON.stringify({
-      type: "run",
-      journalVersion: 2,
-      runId,
-      name: "resume_symlink",
-      scriptHash: "legacy",
-      startedAt: 0,
-      maxAgents: 128,
-    })}\n`);
+    fs.writeFileSync(
+      path.join(runsDir, `${runId}.jsonl`),
+      `${JSON.stringify({
+        type: "run",
+        journalVersion: 2,
+        runId,
+        name: "resume_symlink",
+        scriptHash: "legacy",
+        startedAt: 0,
+        maxAgents: 128,
+      })}\n`,
+    );
 
     const tool = createWorkflowTool({
-      runWorkflowFn: (async () => { throw new Error("runtime should not start"); }) as any,
+      runWorkflowFn: (async () => {
+        throw new Error("runtime should not start");
+      }) as any,
     });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'resume_symlink', description: 'x' }\nreturn 1`;
     await assert.rejects(
-      tool.execute("resume-symlink", { script, resumeFromRunId: runId } as any, undefined, undefined, ctx),
+      tool.execute(
+        "resume-symlink",
+        { script, resumeFromRunId: runId } as any,
+        undefined,
+        undefined,
+        ctx,
+      ),
       /symlink|regular file|unsupported journal/i,
     );
     assert.equal(fs.readFileSync(target, "utf8"), "sentinel");
@@ -1245,14 +1521,28 @@ test("workflow resume rejects a symlinked journal without appending to its targe
   try {
     const tool = createWorkflowTool({
       runWorkflowFn: (async (_script: string, options: any) => ({
-        meta: { name: "journal_symlink", description: "x" }, result: 1,
-        logs: [], phases: [], agentCount: 0, cachedCount: 0,
-        spentTokens: 0, newTokens: 0, replayedTokens: 0, durationMs: 1, maxAgents: options.maxAgents,
+        meta: { name: "journal_symlink", description: "x" },
+        result: 1,
+        logs: [],
+        phases: [],
+        agentCount: 0,
+        cachedCount: 0,
+        spentTokens: 0,
+        newTokens: 0,
+        replayedTokens: 0,
+        durationMs: 1,
+        maxAgents: options.maxAgents,
       })) as any,
     });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'journal_symlink', description: 'x' }\nreturn 1`;
-    const first = await tool.execute("journal-symlink-1", { script } as any, undefined, undefined, ctx);
+    const first = await tool.execute(
+      "journal-symlink-1",
+      { script } as any,
+      undefined,
+      undefined,
+      ctx,
+    );
     const runId = (first.details as any).runId as string;
     const runsDir = path.join(sessionDir, "ultracode-runs");
     const journalPath = path.join(runsDir, `${runId}.jsonl`);
@@ -1262,7 +1552,13 @@ test("workflow resume rejects a symlinked journal without appending to its targe
     fs.symlinkSync(victim, journalPath);
 
     await assert.rejects(
-      tool.execute("journal-symlink-2", { script, resumeFromRunId: runId } as any, undefined, undefined, ctx),
+      tool.execute(
+        "journal-symlink-2",
+        { script, resumeFromRunId: runId } as any,
+        undefined,
+        undefined,
+        ctx,
+      ),
       /journal.*regular file|journal.*symlink/i,
     );
     assert.equal(fs.readFileSync(victim, "utf8"), "sentinel");
@@ -1280,15 +1576,29 @@ test("workflow resume rejects symlinked details and task directories", async () 
         runWorkflowFn: (async (_script: string, options: any) => {
           runtimeCalls++;
           return {
-            meta: { name: "artifact_symlink", description: "x" }, result: 1,
-            logs: [], phases: [], agentCount: 0, cachedCount: 0,
-            spentTokens: 0, newTokens: 0, replayedTokens: 0, durationMs: 1, maxAgents: options.maxAgents,
+            meta: { name: "artifact_symlink", description: "x" },
+            result: 1,
+            logs: [],
+            phases: [],
+            agentCount: 0,
+            cachedCount: 0,
+            spentTokens: 0,
+            newTokens: 0,
+            replayedTokens: 0,
+            durationMs: 1,
+            maxAgents: options.maxAgents,
           };
         }) as any,
       });
       const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
       const script = `export const meta = { name: 'artifact_symlink', description: 'x' }\nreturn 1`;
-      const first = await tool.execute(`artifact-${artifact}-1`, { script } as any, undefined, undefined, ctx);
+      const first = await tool.execute(
+        `artifact-${artifact}-1`,
+        { script } as any,
+        undefined,
+        undefined,
+        ctx,
+      );
       const runId = (first.details as any).runId as string;
       const runsDir = path.join(sessionDir, "ultracode-runs");
       const victim = path.join(sessionDir, `${artifact}-victim`);
@@ -1305,7 +1615,13 @@ test("workflow resume rejects symlinked details and task directories", async () 
       }
 
       await assert.rejects(
-        tool.execute(`artifact-${artifact}-2`, { script, resumeFromRunId: runId } as any, undefined, undefined, ctx),
+        tool.execute(
+          `artifact-${artifact}-2`,
+          { script, resumeFromRunId: runId } as any,
+          undefined,
+          undefined,
+          ctx,
+        ),
         /symlink|real directory|regular file/i,
       );
       assert.equal(runtimeCalls, 1);
@@ -1325,7 +1641,11 @@ test("workflow resume rejects symlinked details and task directories", async () 
         undefined,
         ctx,
       );
-      assert.equal(runtimeCalls, 2, "setup failure must release the workflow lease and journal descriptor");
+      assert.equal(
+        runtimeCalls,
+        2,
+        "setup failure must release the workflow lease and journal descriptor",
+      );
     } finally {
       fs.rmSync(sessionDir, { recursive: true, force: true });
     }
@@ -1335,7 +1655,13 @@ test("workflow resume rejects symlinked details and task directories", async () 
 test("workflow tool rejects an already-aborted signal before artifacts", async () => {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-abort-before-"));
   try {
-    const tool = createWorkflowTool({ testRunner: { run: async () => { throw new Error("runner should not start"); } } });
+    const tool = createWorkflowTool({
+      testRunner: {
+        run: async () => {
+          throw new Error("runner should not start");
+        },
+      },
+    });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const ac = new AbortController();
     ac.abort();
@@ -1359,7 +1685,11 @@ test("workflow tool abort listener observes a synchronous getThinkingLevel abort
         ac.abort();
         return "max";
       },
-      testRunner: { run: async () => { throw new Error("runner should not start"); } },
+      testRunner: {
+        run: async () => {
+          throw new Error("runner should not start");
+        },
+      },
     });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'thinking_abort', description: 'x' }\nreturn await agent('a')`;
@@ -1402,14 +1732,28 @@ test("workflow tool releases active-run lease after update callback exceptions",
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'lease_callback', description: 'x' }\nreturn 1`;
     await assert.rejects(
-      tool.execute("lease-callback-1", { script } as any, undefined, () => { throw new Error("update failed"); }, ctx),
+      tool.execute(
+        "lease-callback-1",
+        { script } as any,
+        undefined,
+        () => {
+          throw new Error("update failed");
+        },
+        ctx,
+      ),
       /update failed/,
     );
     const runsDir = path.join(sessionDir, "ultracode-runs");
     assert.equal(activeWorkflowCount(runsDir), 0, "failed callback released its lease");
     const [journal] = fs.readdirSync(runsDir).filter((name) => name.endsWith(".jsonl"));
     const runId = path.basename(journal, ".jsonl");
-    const second = await tool.execute("lease-callback-2", { script, resumeFromRunId: runId } as any, undefined, undefined, ctx);
+    const second = await tool.execute(
+      "lease-callback-2",
+      { script, resumeFromRunId: runId } as any,
+      undefined,
+      undefined,
+      ctx,
+    );
     assert.match((second.content[0] as any).text, /Workflow lease_callback completed/);
     assert.equal(activeWorkflowCount(runsDir), 0);
   } finally {
@@ -1444,10 +1788,16 @@ test("workflow tool contains heartbeat callback failures and releases the lease"
     const script = `export const meta = { name: 'heartbeat_callback', description: 'x' }\nreturn 1`;
     let updates = 0;
     await assert.rejects(
-      tool.execute("heartbeat-callback", { script } as any, undefined, () => {
-        updates++;
-        if (updates === 1) throw new Error("heartbeat update failed");
-      }, ctx),
+      tool.execute(
+        "heartbeat-callback",
+        { script } as any,
+        undefined,
+        () => {
+          updates++;
+          if (updates === 1) throw new Error("heartbeat update failed");
+        },
+        ctx,
+      ),
       /heartbeat update failed/,
     );
     assert.equal(updates, 1, "the first heartbeat fails once and disables the observer");
@@ -1456,46 +1806,62 @@ test("workflow tool contains heartbeat callback failures and releases the lease"
     const manifestPath = fs.readdirSync(runsDir).find((name) => name.endsWith(".details.json"));
     assert.ok(manifestPath);
     const manifest = JSON.parse(fs.readFileSync(path.join(runsDir, manifestPath), "utf8"));
-    assert.equal(manifest.snapshot.status, "failed", "runtime success cannot overwrite heartbeat failure");
+    assert.equal(
+      manifest.snapshot.status,
+      "failed",
+      "runtime success cannot overwrite heartbeat failure",
+    );
   } finally {
     clearWorkflowLeasesForTests();
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
 });
 
-test("workflow tool releases its lease after bounded cleanup of an uncooperative runner", { timeout: 2_000 }, async () => {
-  clearWorkflowLeasesForTests();
-  const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-tool-cleanup-timeout-"));
-  let markStarted!: () => void;
-  const runnerStarted = new Promise<void>((resolve) => { markStarted = resolve; });
-  try {
-    const tool = createWorkflowTool({
-      cleanupTimeoutMs: 30,
-      testRunner: {
-        run: async () => {
-          markStarted();
-          await new Promise(() => {});
-          throw new Error("unreachable");
-        },
-      },
-    });
-    const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
-    const script = `export const meta = { name: 'tool_cleanup_timeout', description: 'x' }\nreturn await agent('slow')`;
-    const ac = new AbortController();
-    const execution = tool.execute("tool-cleanup-timeout", { script } as any, ac.signal, undefined, ctx);
-    await runnerStarted;
-    ac.abort();
-    await assert.rejects(execution, (error: any) => {
-      assert.match(error.message, /was aborted/);
-      assert.match(error.cause?.message ?? "", /cleanup.*30ms|drain.*30ms/i);
-      return true;
-    });
-    assert.equal(activeWorkflowCount(path.join(sessionDir, "ultracode-runs")), 0);
-  } finally {
+test(
+  "workflow tool releases its lease after bounded cleanup of an uncooperative runner",
+  { timeout: 2_000 },
+  async () => {
     clearWorkflowLeasesForTests();
-    fs.rmSync(sessionDir, { recursive: true, force: true });
-  }
-});
+    const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-tool-cleanup-timeout-"));
+    let markStarted!: () => void;
+    const runnerStarted = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    try {
+      const tool = createWorkflowTool({
+        cleanupTimeoutMs: 30,
+        testRunner: {
+          run: async () => {
+            markStarted();
+            await new Promise(() => {});
+            throw new Error("unreachable");
+          },
+        },
+      });
+      const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
+      const script = `export const meta = { name: 'tool_cleanup_timeout', description: 'x' }\nreturn await agent('slow')`;
+      const ac = new AbortController();
+      const execution = tool.execute(
+        "tool-cleanup-timeout",
+        { script } as any,
+        ac.signal,
+        undefined,
+        ctx,
+      );
+      await runnerStarted;
+      ac.abort();
+      await assert.rejects(execution, (error: any) => {
+        assert.match(error.message, /was aborted/);
+        assert.match(error.cause?.message ?? "", /cleanup.*30ms|drain.*30ms/i);
+        return true;
+      });
+      assert.equal(activeWorkflowCount(path.join(sessionDir, "ultracode-runs")), 0);
+    } finally {
+      clearWorkflowLeasesForTests();
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    }
+  },
+);
 
 test("detached promise chains are rejected before lease or journal acquisition", async () => {
   clearWorkflowLeasesForTests();
@@ -1507,7 +1873,11 @@ test("detached promise chains are rejected before lease or journal acquisition",
       testRunner: {
         run: async () => {
           runnerStarts++;
-          return { value: "unexpected", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: process.cwd() };
+          return {
+            value: "unexpected",
+            usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+            cwd: process.cwd(),
+          };
         },
       },
     });
@@ -1524,7 +1894,11 @@ return 'done'`;
     assert.equal(runnerStarts, 0);
     const runsDir = path.join(sessionDir, "ultracode-runs");
     assert.equal(activeWorkflowCount(runsDir), 0);
-    assert.equal(fs.existsSync(runsDir), false, "parse rejection happens before run artifacts are created");
+    assert.equal(
+      fs.existsSync(runsDir),
+      false,
+      "parse rejection happens before run artifacts are created",
+    );
   } finally {
     clearWorkflowLeasesForTests();
     fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -1537,7 +1911,9 @@ test("workflow tool cannot commit success after an external abort race", async (
   try {
     const tool = createWorkflowTool({
       runWorkflowFn: (async (_script: string, options: any) => {
-        await new Promise<void>((resolve) => options.signal.addEventListener("abort", () => resolve(), { once: true }));
+        await new Promise<void>((resolve) =>
+          options.signal.addEventListener("abort", () => resolve(), { once: true }),
+        );
         return {
           meta: { name: "abort_success_race", description: "x" },
           result: "must not commit",
@@ -1556,7 +1932,13 @@ test("workflow tool cannot commit success after an external abort race", async (
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'abort_success_race', description: 'x' }\nreturn 1`;
     const ac = new AbortController();
-    const execution = tool.execute("abort-success-race", { script } as any, ac.signal, undefined, ctx);
+    const execution = tool.execute(
+      "abort-success-race",
+      { script } as any,
+      ac.signal,
+      undefined,
+      ctx,
+    );
     setImmediate(() => ac.abort());
     await assert.rejects(execution, /was aborted/);
     assert.equal(activeWorkflowCount(path.join(sessionDir, "ultracode-runs")), 0);
@@ -1585,9 +1967,18 @@ test("workflow tool publishes completed only after terminal journal commit", asy
           return recordResult(record);
         };
         return {
-          meta: { name: "terminal_publication", description: "x" }, result: 1,
-          logs: [], phases: [], agentCount: 0, agentsUsed: 0, cachedCount: 0,
-          spentTokens: 0, newTokens: 0, replayedTokens: 0, durationMs: 1, maxAgents: 128,
+          meta: { name: "terminal_publication", description: "x" },
+          result: 1,
+          logs: [],
+          phases: [],
+          agentCount: 0,
+          agentsUsed: 0,
+          cachedCount: 0,
+          spentTokens: 0,
+          newTokens: 0,
+          replayedTokens: 0,
+          durationMs: 1,
+          maxAgents: 128,
         };
       }) as any,
     });
@@ -1617,9 +2008,18 @@ test("workflow tool isolates observer mutations from its durable completed resul
     const tool = createWorkflowTool({
       registry,
       runWorkflowFn: (async () => ({
-        meta: { name: "terminal_observer_isolation", description: "x" }, result: { ok: true },
-        logs: [], phases: [], agentCount: 0, agentsUsed: 0, cachedCount: 0,
-        spentTokens: 0, newTokens: 0, replayedTokens: 0, durationMs: 1, maxAgents: 128,
+        meta: { name: "terminal_observer_isolation", description: "x" },
+        result: { ok: true },
+        logs: [],
+        phases: [],
+        agentCount: 0,
+        agentsUsed: 0,
+        cachedCount: 0,
+        spentTokens: 0,
+        newTokens: 0,
+        replayedTokens: 0,
+        durationMs: 1,
+        maxAgents: 128,
       })) as any,
     });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
@@ -1637,10 +2037,14 @@ test("workflow tool isolates observer mutations from its durable completed resul
     assert.deepEqual(output.details.result, { ok: true });
     assert.match(output.content[0].text, /"ok": true/);
     assert.deepEqual(registry.get(output.details.runId)?.snapshot.result, { ok: true });
-    const records = fs.readFileSync(
-      path.join(sessionDir, "ultracode-runs", `${output.details.runId}.jsonl`),
-      "utf8",
-    ).trim().split("\n").map((line) => JSON.parse(line));
+    const records = fs
+      .readFileSync(
+        path.join(sessionDir, "ultracode-runs", `${output.details.runId}.jsonl`),
+        "utf8",
+      )
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line));
     assert.deepEqual(records.findLast((record) => record.type === "result")?.result, { ok: true });
   } finally {
     clearWorkflowLeasesForTests();
@@ -1653,12 +2057,18 @@ test("workflow tool preserves primary failure across failed-state observers", as
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-failure-observer-"));
   try {
     const tool = createWorkflowTool({
-      runWorkflowFn: (async () => { throw new Error("PRIMARY failure"); }) as any,
+      runWorkflowFn: (async () => {
+        throw new Error("PRIMARY failure");
+      }) as any,
     });
     const ctx: any = {
       cwd: process.cwd(),
       sessionManager: { getSessionDir: () => sessionDir },
-      ui: { notify: () => { throw new Error("NOTIFY secondary"); } },
+      ui: {
+        notify: () => {
+          throw new Error("NOTIFY secondary");
+        },
+      },
     };
     const script = `export const meta = { name: 'failure_observer', description: 'x' }\nreturn 1`;
     await assert.rejects(
@@ -1666,7 +2076,9 @@ test("workflow tool preserves primary failure across failed-state observers", as
         "failure-observer",
         { script } as any,
         undefined,
-        () => { throw new Error("UPDATE secondary"); },
+        () => {
+          throw new Error("UPDATE secondary");
+        },
         ctx,
       ),
       /PRIMARY failure/i,
@@ -1689,15 +2101,30 @@ test("workflow tool keeps a durable success when final journal close reports an 
           throw new Error("synthetic journal close failure");
         };
         return {
-          meta: { name: "journal_close_fail", description: "x" }, result: 1,
-          logs: [], phases: [], agentCount: 0, agentsUsed: 0, cachedCount: 0,
-          spentTokens: 0, newTokens: 0, replayedTokens: 0, durationMs: 1, maxAgents: 128,
+          meta: { name: "journal_close_fail", description: "x" },
+          result: 1,
+          logs: [],
+          phases: [],
+          agentCount: 0,
+          agentsUsed: 0,
+          cachedCount: 0,
+          spentTokens: 0,
+          newTokens: 0,
+          replayedTokens: 0,
+          durationMs: 1,
+          maxAgents: 128,
         };
       }) as any,
     });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'journal_close_fail', description: 'x' }\nreturn 1`;
-    const result = await tool.execute("journal-close-fail", { script } as any, undefined, undefined, ctx);
+    const result = await tool.execute(
+      "journal-close-fail",
+      { script } as any,
+      undefined,
+      undefined,
+      ctx,
+    );
     assert.match((result.content[0] as any).text, /Workflow journal_close_fail completed/);
     assert.equal(activeWorkflowCount(path.join(sessionDir, "ultracode-runs")), 0);
   } finally {
@@ -1760,7 +2187,9 @@ test("workflow tool caps active top-level runs at four and releases slots for la
       durationMs: 1,
       maxAgents: 128,
     });
-    const runs = [0, 1, 2, 3].map((i) => tool.execute(`lease-${i}`, { script } as any, undefined, undefined, ctx));
+    const runs = [0, 1, 2, 3].map((i) =>
+      tool.execute(`lease-${i}`, { script } as any, undefined, undefined, ctx),
+    );
     while (controls.length < 4) await new Promise((resolve) => setImmediate(resolve));
     const runsDir = path.join(sessionDir, "ultracode-runs");
     assert.equal(activeWorkflowCount(runsDir), 4);
@@ -1782,19 +2211,20 @@ test("workflow tool caps active top-level runs at four and releases slots for la
     await Promise.all(runs.slice(1));
     assert.equal(activeWorkflowCount(runsDir), 0);
   } finally {
-    for (const control of controls) control.resolve?.({
-      meta: { name: "lease_cap", description: "x" },
-      result: 1,
-      logs: [],
-      phases: [],
-      agentCount: 0,
-      cachedCount: 0,
-      spentTokens: 0,
-      newTokens: 0,
-      replayedTokens: 0,
-      durationMs: 1,
-      maxAgents: 128,
-    });
+    for (const control of controls)
+      control.resolve?.({
+        meta: { name: "lease_cap", description: "x" },
+        result: 1,
+        logs: [],
+        phases: [],
+        agentCount: 0,
+        cachedCount: 0,
+        spentTokens: 0,
+        newTokens: 0,
+        replayedTokens: 0,
+        durationMs: 1,
+        maxAgents: 128,
+      });
     clearWorkflowLeasesForTests();
     fs.rmSync(sessionDir, { recursive: true, force: true });
   }
@@ -1815,10 +2245,16 @@ test("workflow tool rejects oversized args before artifacts", async () => {
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'args_limit', description: 'x' }\nreturn 1`;
     await assert.rejects(
-      tool.execute("args-limit", {
-        script,
-        args: "x".repeat(MAX_WORKFLOW_ARGS_BYTES),
-      } as any, undefined, undefined, ctx),
+      tool.execute(
+        "args-limit",
+        {
+          script,
+          args: "x".repeat(MAX_WORKFLOW_ARGS_BYTES),
+        } as any,
+        undefined,
+        undefined,
+        ctx,
+      ),
       /workflow args exceeds 1048576 bytes/,
     );
     assert.equal(runnerStarts, 0);
@@ -1831,7 +2267,13 @@ test("workflow tool rejects oversized args before artifacts", async () => {
 test("workflow tool rejects invalid maxAgents before artifacts", async () => {
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-bad-max-"));
   try {
-    const tool = createWorkflowTool({ testRunner: { run: async () => { throw new Error("runner should not start"); } } });
+    const tool = createWorkflowTool({
+      testRunner: {
+        run: async () => {
+          throw new Error("runner should not start");
+        },
+      },
+    });
     const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
     const script = `export const meta = { name: 'bad_max_tool', description: 'x' }\nreturn await agent('a')`;
     await assert.rejects(
@@ -1844,22 +2286,29 @@ test("workflow tool rejects invalid maxAgents before artifacts", async () => {
   }
 });
 
-
 test("Pi ExtensionRunner always injects parent depth routing without network requests", async (t) => {
-  const fetch = t.mock.method(globalThis, "fetch", async () => {
+  const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
     throw new Error("Depth selection must not use the network");
   });
   const { pi, state } = makeMockPi();
   extension(pi);
   const { ctx } = makeCtx(state);
   await state.commands.get("ultracode").handler("auto", ctx);
-  const result = await runPromptHooks(state, "BASE PROMPT", { other_extension: "Keep this instruction." });
-  assert.match(result.systemPromptOptions.sections.ultracode, /silently route this task to focused, standard, or deep/);
+  const result = await runPromptHooks(state, "BASE PROMPT", {
+    other_extension: "Keep this instruction.",
+  });
+  assert.match(
+    result.systemPromptOptions.sections.ultracode,
+    /silently route this task to focused, standard, or deep/,
+  );
   assert.match(result.systemPrompt, /Configured mode: auto/);
   assert.equal(result.systemPromptOptions.sections.other_extension, "Keep this instruction.");
   assert.equal(result.systemPrompt.split("<ultracode>").length - 1, 1);
   assert.equal(state.thinking, "medium");
   const next = await runPromptHooks(state, "BASE PROMPT");
-  assert.match(next.systemPromptOptions.sections.ultracode, /relevant conversation and repository context/);
-  assert.equal(fetch.mock.callCount(), 0);
+  assert.match(
+    next.systemPromptOptions.sections.ultracode,
+    /relevant conversation and repository context/,
+  );
+  assert.equal(fetch.mock.calls.length, 0);
 });

@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test } from "vite-plus/test";
 import assert from "node:assert/strict";
 import * as os from "node:os";
 import * as fs from "node:fs";
@@ -12,7 +12,11 @@ import { createWorkflowTool } from "../src/workflow/tool.ts";
 import { RunJournal } from "../src/workflow/journal.ts";
 import { resolveRepositoryContext } from "../src/workflow/repository-context.ts";
 import type { AgentSessionEvent } from "@earendil-works/pi-coding-agent";
-import { forwardActivity, toolArgsPreview, type AgentActivityInput } from "../src/workflow/agent-runner.ts";
+import {
+  forwardActivity,
+  toolArgsPreview,
+  type AgentActivityInput,
+} from "../src/workflow/agent-runner.ts";
 import {
   DISPLAY_INPUT_LIMIT,
   DISPLAY_OMITTED_TEXT,
@@ -35,7 +39,13 @@ import {
 test("onAgentStart/onAgentEnd fire with timing; onAgentActivity is forwarded with id/label/phase", async () => {
   const starts: Array<{ id: number; label: string; phase?: string; cached: boolean }> = [];
   const ends: Array<{ id: number; label: string; status: string }> = [];
-  const activity: Array<{ id: number; label: string; phase?: string; kind: string; detail?: string }> = [];
+  const activity: Array<{
+    id: number;
+    label: string;
+    phase?: string;
+    kind: string;
+    detail?: string;
+  }> = [];
 
   const runner = {
     run: async (call: any) => {
@@ -43,7 +53,11 @@ test("onAgentStart/onAgentEnd fire with timing; onAgentActivity is forwarded wit
       call.onActivity?.({ kind: "text", detail: "responding" });
       call.onActivity?.({ kind: "thinking" });
       call.onActivity?.({ kind: "tool", detail: "bash" });
-      return { value: `v:${call.label}`, usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: "/tmp" };
+      return {
+        value: `v:${call.label}`,
+        usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+        cwd: "/tmp",
+      };
     },
   };
 
@@ -53,9 +67,11 @@ test("onAgentStart/onAgentEnd fire with timing; onAgentActivity is forwarded wit
      return await agent('p', { label: 'lbl' })`,
     {
       runner,
-      onAgentStart: (e) => starts.push({ id: e.id, label: e.label, phase: e.phase, cached: e.cached }),
+      onAgentStart: (e) =>
+        starts.push({ id: e.id, label: e.label, phase: e.phase, cached: e.cached }),
       onAgentEnd: (e) => ends.push({ id: e.id, label: e.label, status: e.status }),
-      onAgentActivity: (e) => activity.push({ id: e.id, label: e.label, phase: e.phase, kind: e.kind, detail: e.detail }),
+      onAgentActivity: (e) =>
+        activity.push({ id: e.id, label: e.label, phase: e.phase, kind: e.kind, detail: e.detail }),
     },
   );
 
@@ -68,9 +84,27 @@ test("onAgentStart/onAgentEnd fire with timing; onAgentActivity is forwarded wit
   assert.equal(ends[0].status, "done");
 
   assert.equal(activity.length, 3, "all three activity signals forwarded");
-  assert.deepEqual(activity[0], { id: 1, label: "lbl", phase: "Work", kind: "text", detail: "responding" });
-  assert.deepEqual(activity[1], { id: 1, label: "lbl", phase: "Work", kind: "thinking", detail: undefined });
-  assert.deepEqual(activity[2], { id: 1, label: "lbl", phase: "Work", kind: "tool", detail: "bash" });
+  assert.deepEqual(activity[0], {
+    id: 1,
+    label: "lbl",
+    phase: "Work",
+    kind: "text",
+    detail: "responding",
+  });
+  assert.deepEqual(activity[1], {
+    id: 1,
+    label: "lbl",
+    phase: "Work",
+    kind: "thinking",
+    detail: undefined,
+  });
+  assert.deepEqual(activity[2], {
+    id: 1,
+    label: "lbl",
+    phase: "Work",
+    kind: "tool",
+    detail: "bash",
+  });
 });
 
 test("cached (resumed) agents do not emit onAgentActivity", async () => {
@@ -88,8 +122,21 @@ test("cached (resumed) agents do not emit onAgentActivity", async () => {
       return { value: "x", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: "/tmp" };
     },
   };
-  const j1 = RunJournal.create(dir, { type: "run", projectTrusted: false, targetIdentity: resolveRepositoryContext(process.cwd()).identity, runId, name: "c", scriptHash: "1", startedAt: 0 });
-  await runWorkflow(script, { projectTrusted: false, runner: liveRunner, journal: j1, onAgentActivity: () => liveActivity++ });
+  const j1 = RunJournal.create(dir, {
+    type: "run",
+    projectTrusted: false,
+    targetIdentity: resolveRepositoryContext(process.cwd()).identity,
+    runId,
+    name: "c",
+    scriptHash: "1",
+    startedAt: 0,
+  });
+  await runWorkflow(script, {
+    projectTrusted: false,
+    runner: liveRunner,
+    journal: j1,
+    onAgentActivity: () => liveActivity++,
+  });
   j1.close();
   assert.equal(liveCalls, 1, "live run calls the runner once");
   assert.equal(liveActivity, 1, "live run emits one activity event");
@@ -104,8 +151,21 @@ test("cached (resumed) agents do not emit onAgentActivity", async () => {
       return { value: "y", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: "/tmp" };
     },
   };
-  const j2 = RunJournal.resume(dir, runId, { type: "run", projectTrusted: false, targetIdentity: resolveRepositoryContext(process.cwd()).identity, runId, name: "c", scriptHash: "1", startedAt: 1 });
-  await runWorkflow(script, { projectTrusted: false, runner: cachedRunner, journal: j2, onAgentActivity: () => cachedActivity++ });
+  const j2 = RunJournal.resume(dir, runId, {
+    type: "run",
+    projectTrusted: false,
+    targetIdentity: resolveRepositoryContext(process.cwd()).identity,
+    runId,
+    name: "c",
+    scriptHash: "1",
+    startedAt: 1,
+  });
+  await runWorkflow(script, {
+    projectTrusted: false,
+    runner: cachedRunner,
+    journal: j2,
+    onAgentActivity: () => cachedActivity++,
+  });
   j2.close();
   assert.equal(cachedCalls, 0, "cached replay must not call the runner");
   assert.equal(cachedActivity, 0, "cached replay must not emit activity");
@@ -123,7 +183,15 @@ test("journal records per-agent startedAt/durationMs in the .jsonl log", async (
       return { value: "v", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: "/tmp" };
     },
   };
-  const j = RunJournal.create(dir, { type: "run", projectTrusted: false, targetIdentity: resolveRepositoryContext(process.cwd()).identity, runId, name: "jt", scriptHash: "1", startedAt: 0 });
+  const j = RunJournal.create(dir, {
+    type: "run",
+    projectTrusted: false,
+    targetIdentity: resolveRepositoryContext(process.cwd()).identity,
+    runId,
+    name: "jt",
+    scriptHash: "1",
+    startedAt: 0,
+  });
   await runWorkflow(script, { projectTrusted: false, runner, journal: j });
   j.close();
 
@@ -136,7 +204,10 @@ test("journal records per-agent startedAt/durationMs in the .jsonl log", async (
   assert.ok(agentRec, "agent record present");
   assert.equal(agentRec.label, "a");
   assert.ok(agentRec.startedAt != null, "startedAt persisted to journal");
-  assert.ok(agentRec.durationMs != null && agentRec.durationMs >= 0, "durationMs persisted to journal");
+  assert.ok(
+    agentRec.durationMs != null && agentRec.durationMs >= 0,
+    "durationMs persisted to journal",
+  );
 
   fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -197,34 +268,39 @@ test("renderWorkflowLines keeps the last known state visible when an agent stops
 test("renderWorkflowLines surfaces the stalest concurrent tool", () => {
   const now = 400_000;
   const snap = createSnapshot({ name: "tool", description: "x" }, "wf_tool");
-  snap.agents = [{
-    id: 1,
-    label: "tests",
-    status: "running",
-    startedAt: now - 337_000,
-    // A newer tool keeps the agent-level activity fresh while an older tool is stuck.
-    lastActivityAt: now - 1_000,
-    activity: "running tool",
-    activeTools: [
-      {
-        id: "stuck",
-        name: "bash",
-        args: "npm test",
-        startedAt: now - 300_000,
-        lastUpdateAt: now - 259_000,
-      },
-      {
-        id: "active",
-        name: "read",
-        args: "README.md",
-        startedAt: now - 10_000,
-        lastUpdateAt: now - 1_000,
-      },
-    ],
-  }];
+  snap.agents = [
+    {
+      id: 1,
+      label: "tests",
+      status: "running",
+      startedAt: now - 337_000,
+      // A newer tool keeps the agent-level activity fresh while an older tool is stuck.
+      lastActivityAt: now - 1_000,
+      activity: "running tool",
+      activeTools: [
+        {
+          id: "stuck",
+          name: "bash",
+          args: "npm test",
+          startedAt: now - 300_000,
+          lastUpdateAt: now - 259_000,
+        },
+        {
+          id: "active",
+          name: "read",
+          args: "README.md",
+          startedAt: now - 10_000,
+          lastUpdateAt: now - 1_000,
+        },
+      ],
+    },
+  ];
 
   const text = renderWorkflowLines(recompute(snap), { now }).join("\n");
-  assert.match(text, /tests · 337s · running bash: npm test \(5m\) \+1 more · ⚠ no tool events 259s/);
+  assert.match(
+    text,
+    /tests · 337s · running bash: npm test \(5m\) \+1 more · ⚠ no tool events 259s/,
+  );
   assert.doesNotMatch(text, /⚠ idle/);
 
   snap.agents[0].activeTools![0].lastUpdateAt = now - 20_000;
@@ -235,7 +311,10 @@ test("renderWorkflowLines surfaces the stalest concurrent tool", () => {
 
 test("renderWorkflowLines strips terminal controls and ignores deprecated stream tails", () => {
   const now = 40_000;
-  const snap = createSnapshot({ name: "tail\u001b]52;c;name-spoof\u0007", description: "x" }, "wf_tail");
+  const snap = createSnapshot(
+    { name: "tail\u001b]52;c;name-spoof\u0007", description: "x" },
+    "wf_tail",
+  );
   snap.agents = [
     {
       id: 1,
@@ -253,12 +332,14 @@ test("renderWorkflowLines strips terminal controls and ignores deprecated stream
       startedAt: 0,
       lastActivityAt: now,
       activity: "running tool",
-      activeTools: [{
-        id: "tool",
-        name: "bash\u001b]0;tool-spoof\u0007",
-        startedAt: now - 1_000,
-        lastUpdateAt: now,
-      }],
+      activeTools: [
+        {
+          id: "tool",
+          name: "bash\u001b]0;tool-spoof\u0007",
+          startedAt: now - 1_000,
+          lastUpdateAt: now,
+        },
+      ],
     },
   ];
 
@@ -283,11 +364,11 @@ test("display safety consumes structured, escaped, and unterminated secrets", ()
     redactCommand('failed(Authorization:"Bearer PAREN_SECRET")'),
     redactCommand("{'Authorization':'Bearer SINGLE_KEY_SECRET'}"),
     redactCommand('Authorization: Digest username="alice", realm="r", response="DIGEST_SECRET"'),
-    redactCommand('_postgres://alice:PREFIX_URI_SECRET@db.example/app'),
-    redactCommand('X-Auth-Token: X_AUTH_SECRET'),
-    redactCommand('Cookie: session=COOKIE_SECRET'),
-    redactCommand('Set-Cookie: session=SET_COOKIE_SECRET'),
-    redactCommand('?refresh_token=REFRESH_SECRET&id_token=ID_SECRET'),
+    redactCommand("_postgres://alice:PREFIX_URI_SECRET@db.example/app"),
+    redactCommand("X-Auth-Token: X_AUTH_SECRET"),
+    redactCommand("Cookie: session=COOKIE_SECRET"),
+    redactCommand("Set-Cookie: session=SET_COOKIE_SECRET"),
+    redactCommand("?refresh_token=REFRESH_SECRET&id_token=ID_SECRET"),
     redactCommand("curl -HAuthorization: Bearer CURL_HEADER_SECRET"),
     redactCommand("curl -H 'Authorization: Bearer QUOTED_CURL_SECRET'"),
   ].join(" ");
@@ -329,12 +410,14 @@ test("public rendering redacts snapshot fields even when callers bypass construc
   const snap = createSnapshot({ name: "safe", description: "x" }, "wf_public");
   snap.name = "visible\u202Espoof";
   snap.logs = ['Authorization: "Bearer logsecret"'];
-  snap.agents = [{
-    id: 1,
-    label: "agent\u001b]0;label-spoof\u0007",
-    status: "done",
-    resultPreview: '{"x-api-key":"previewsecret"}',
-  }];
+  snap.agents = [
+    {
+      id: 1,
+      label: "agent\u001b]0;label-spoof\u0007",
+      status: "done",
+      resultPreview: '{"x-api-key":"previewsecret"}',
+    },
+  ];
   const text = renderWorkflowLines(recompute(snap), { showResultPreviews: true }).join("\n");
   assert.doesNotMatch(text, /logsecret|previewsecret|label-spoof|\u202E|\u001b|\u0007/);
   assert.match(text, /\*\*\*/);
@@ -399,20 +482,23 @@ test("result previews never inspect object hooks or expand hostile primitives", 
       throw new Error("descriptor trap");
     },
   });
-  const objectProxy = new Proxy({}, {
-    ownKeys() {
-      trapCalls++;
-      throw new Error("ownKeys trap");
+  const objectProxy = new Proxy(
+    {},
+    {
+      ownKeys() {
+        trapCalls++;
+        throw new Error("ownKeys trap");
+      },
+      getOwnPropertyDescriptor() {
+        trapCalls++;
+        throw new Error("descriptor trap");
+      },
+      getPrototypeOf() {
+        trapCalls++;
+        throw new Error("prototype trap");
+      },
     },
-    getOwnPropertyDescriptor() {
-      trapCalls++;
-      throw new Error("descriptor trap");
-    },
-    getPrototypeOf() {
-      trapCalls++;
-      throw new Error("prototype trap");
-    },
-  });
+  );
   assert.equal(preview(arrayProxy, 80), "[Array]");
   assert.equal(preview(objectProxy, 80), "[Object]");
   assert.equal(trapCalls, 0);
@@ -442,7 +528,8 @@ test("workflow tool wires text and tool lifecycle into live snapshots", async ()
   const runner = {
     run: async (call: any) => {
       // Burst of text deltas (throttle coalesces re-renders, but fields mutate).
-      for (let i = 0; i < 60; i++) call.onActivity?.({ kind: "text", detail: "x", streamDelta: "x" });
+      for (let i = 0; i < 60; i++)
+        call.onActivity?.({ kind: "text", detail: "x", streamDelta: "x" });
       call.onActivity?.({
         kind: "tool",
         detail: "bash: npm test",
@@ -468,7 +555,11 @@ test("workflow tool wires text and tool lifecycle into live snapshots", async ()
         toolName: "bash",
         toolState: "end",
       });
-      return { value: "done", usage: { outputTokens: 1, totalTokens: 1, cost: 0 }, cwd: process.cwd() };
+      return {
+        value: "done",
+        usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+        cwd: process.cwd(),
+      };
     },
   };
   const tool = createWorkflowTool({ testRunner: runner });
@@ -497,7 +588,11 @@ test("workflow tool wires text and tool lifecycle into live snapshots", async ()
   assert.ok(agent.durationMs != null && agent.durationMs >= 0, "durationMs stamped on end");
   assert.equal(agent.activity, "bash finished");
   assert.equal(agent.activeTools, undefined, "finished agents do not retain active tools");
-  assert.equal(agent.streamTail, undefined, "live output is removed before final details are persisted");
+  assert.equal(
+    agent.streamTail,
+    undefined,
+    "live output is removed before final details are persisted",
+  );
   assert.equal((result.details as any).agents[0].streamTail, undefined);
 
   fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -559,10 +654,14 @@ test("workflow tool never exposes raw assistant text deltas", async () => {
   const serialized = JSON.stringify([updates, result.details]);
   assert.doesNotMatch(serialized, /PRIVATE_STREAM_SECRET|split-private-suffix/);
   assert.equal(
-    updates.every((update) => update.details?.agents?.every((agent: any) => agent.streamTail == null) ?? true),
+    updates.every(
+      (update) => update.details?.agents?.every((agent: any) => agent.streamTail == null) ?? true,
+    ),
     true,
   );
-  const responding = updates.find((update) => update.details?.agents?.[0]?.activity === "responding");
+  const responding = updates.find(
+    (update) => update.details?.agents?.[0]?.activity === "responding",
+  );
   assert.ok(responding, "text events still expose a fixed lifecycle state");
   assert.equal(typeof responding.details.agents[0].lastActivityAt, "number");
 
@@ -629,7 +728,12 @@ test("completed agents reject late activity while peer agents are still running"
   assert.equal(first.activeTools, undefined);
   assert.equal(first.streamTail, undefined);
   assert.doesNotMatch(JSON.stringify(result.details), /late-secret/);
-  assert.equal(updates.at(-1).agents.every((agent: any) => agent.activeTools == null && agent.streamTail == null), true);
+  assert.equal(
+    updates
+      .at(-1)
+      .agents.every((agent: any) => agent.activeTools == null && agent.streamTail == null),
+    true,
+  );
   fs.rmSync(sessionDir, { recursive: true, force: true });
 });
 
@@ -647,15 +751,25 @@ test("toolArgsPreview uses a safe command synopsis and ignores free-form payload
     assert.doesNotMatch(preview, /alice|s3cret|user|qwerty|hidden|sk-secret|example/);
   }
   assert.equal(
-    toolArgsPreview("bash", { command: "OPENAI_API_KEY='sk-secret value' curl https://example.test" }, 200),
+    toolArgsPreview(
+      "bash",
+      { command: "OPENAI_API_KEY='sk-secret value' curl https://example.test" },
+      200,
+    ),
     "environment-prefixed command",
   );
   assert.equal(toolArgsPreview("bash", { command: "npm test -- --runInBand" }), "npm test");
-  assert.equal(toolArgsPreview("bash", { command: "https://user:pass@example.test/?token=hidden --flag" }), "command");
+  assert.equal(
+    toolArgsPreview("bash", { command: "https://user:pass@example.test/?token=hidden --flag" }),
+    "command",
+  );
   assert.equal(toolArgsPreview("bash", { command: "constructor anything" }), "command");
   assert.equal(toolArgsPreview("bash", { command: "./sk-abcdefgh" }), "command");
   assert.equal(toolArgsPreview("bash", { query: "private search text" }), undefined);
-  assert.equal(toolArgsPreview("read", { path: "/Users/alice/private/project/README.md" }), "README.md");
+  assert.equal(
+    toolArgsPreview("read", { path: "/Users/alice/private/project/README.md" }),
+    "README.md",
+  );
   assert.equal(
     toolArgsPreview("read", { path: "https://user:pass@example.test/file?token=hidden" }),
     "path",
@@ -671,16 +785,20 @@ test("late activity cannot repopulate a failed workflow snapshot", async () => {
   const notifications: string[] = [];
   const runWorkflowFn = (async (_script: string, options: any) => {
     options.onAgentStart?.({ id: 1, label: "late", prompt: "p", cached: false });
-    setTimeout(() => options.onAgentActivity?.({
-      id: 1,
-      label: "late",
-      kind: "tool",
-      detail: "bash: late",
-      toolCallId: "late-call",
-      toolName: "bash",
-      toolArgs: "late",
-      toolState: "start",
-    }), 10);
+    setTimeout(
+      () =>
+        options.onAgentActivity?.({
+          id: 1,
+          label: "late",
+          kind: "tool",
+          detail: "bash: late",
+          toolCallId: "late-call",
+          toolName: "bash",
+          toolArgs: "late",
+          toolState: "start",
+        }),
+      10,
+    );
     throw new Error("script failed \u001b]52;c;error-spoof\u0007");
   }) as any;
   const tool = createWorkflowTool({ runWorkflowFn });
@@ -693,7 +811,13 @@ test("late activity cannot repopulate a failed workflow snapshot", async () => {
   const script = `export const meta = { name: 'late', description: 'x' }\nreturn await agent('p')`;
 
   await assert.rejects(
-    tool.execute("tc-late", { script } as any, undefined, (update) => updates.push(structuredClone(update.details)), ctx),
+    tool.execute(
+      "tc-late",
+      { script } as any,
+      undefined,
+      (update) => updates.push(structuredClone(update.details)),
+      ctx,
+    ),
     /script failed/,
   );
   await new Promise((resolve) => setTimeout(resolve, 30));
@@ -734,7 +858,10 @@ test("runWorkflow routes log, console, and nested workflow messages through one 
     JSON.stringify(result.logs),
     /LOG_SECRET|CONSOLE_LOG_SECRET|CONSOLE_INFO_SECRET|CONSOLE_WARN_SECRET|CONSOLE_ERROR_SECRET|NESTED_NAME_SECRET|NESTED_LOG_SECRET/,
   );
-  assert.equal(result.logs.every((entry) => entry.length <= 512), true);
+  assert.equal(
+    result.logs.every((entry) => entry.length <= 512),
+    true,
+  );
 });
 
 test("runWorkflow bounds log retention and callback volume with one omission marker", async () => {
@@ -831,7 +958,10 @@ test("workflow tool bounds logs from an injected runtime", async () => {
   assert.equal(logs.length, MAX_WORKFLOW_LOGS + 1);
   assert.equal(logs.at(-1), WORKFLOW_LOG_OMITTED_TEXT);
   assert.equal(logs.filter((entry) => entry === WORKFLOW_LOG_OMITTED_TEXT).length, 1);
-  assert.equal(updates.every((update) => update.logs.length <= MAX_WORKFLOW_LOGS + 1), true);
+  assert.equal(
+    updates.every((update) => update.logs.length <= MAX_WORKFLOW_LOGS + 1),
+    true,
+  );
   fs.rmSync(sessionDir, { recursive: true, force: true });
 });
 
@@ -886,17 +1016,28 @@ test("raw structured results are preserved while UI result previews stay safe an
   const tool = createWorkflowTool({ runWorkflowFn });
   const ctx: any = { cwd: process.cwd(), sessionManager: { getSessionDir: () => sessionDir } };
   const script = `export const meta = { name: 'result_contract', description: 'x' }\nreturn await agent('p')`;
-  const result = await tool.execute("tc-result-contract", { script } as any, undefined, undefined, ctx);
+  const result = await tool.execute(
+    "tc-result-contract",
+    { script } as any,
+    undefined,
+    undefined,
+    ctx,
+  );
   const details = result.details as any;
   const rendered = renderWorkflowLines(details, { showResultPreviews: true }).join("\n");
 
   assert.deepEqual(details.result, rawResult, "snapshot result keeps the exact structured value");
-  assert.match((result.content[0] as any).text, /RESULT_SECRET/, "parent tool content keeps the raw result");
+  assert.match(
+    (result.content[0] as any).text,
+    /RESULT_SECRET/,
+    "parent tool content keeps the raw result",
+  );
   assert.doesNotMatch(details.agents[0].resultPreview, /RESULT_SECRET/);
   assert.doesNotMatch(rendered, /RESULT_SECRET/);
   assert.ok(details.agents[0].resultPreview.length <= 80);
 
-  const journal = fs.readdirSync(path.join(sessionDir, "ultracode-runs"))
+  const journal = fs
+    .readdirSync(path.join(sessionDir, "ultracode-runs"))
     .find((entry) => entry.endsWith(".jsonl"));
   assert.ok(journal);
   assert.match(
@@ -966,7 +1107,13 @@ return await agent('p')`;
   assert.doesNotMatch((result.details as any).name, /name-spoof|\u001b|\u0007/);
 
   await assert.rejects(
-    tool.execute("tc-id", { script, resumeFromRunId: "../escape\u001b]0;x\u0007" } as any, undefined, undefined, ctx),
+    tool.execute(
+      "tc-id",
+      { script, resumeFromRunId: "../escape\u001b]0;x\u0007" } as any,
+      undefined,
+      undefined,
+      ctx,
+    ),
     /resumeFromRunId must contain only/,
   );
   fs.rmSync(sessionDir, { recursive: true, force: true });
@@ -1030,8 +1177,16 @@ test("forwardActivity preserves provider, tool, retry, and compaction state from
   assert.ok(toolEnd.kind === "tool");
   assert.equal(toolUpdate.toolState, "update");
   assert.equal(toolEnd.toolState, "end");
-  assert.equal("streamSnapshot" in toolUpdate, false, "raw tool output must not enter activity status");
-  assert.equal("streamSnapshot" in toolEnd, false, "raw tool output must not enter activity status");
+  assert.equal(
+    "streamSnapshot" in toolUpdate,
+    false,
+    "raw tool output must not enter activity status",
+  );
+  assert.equal(
+    "streamSnapshot" in toolEnd,
+    false,
+    "raw tool output must not enter activity status",
+  );
   assert.deepEqual(events[5], {
     kind: "retry",
     detail: "retry 2/3 in 8s: overloaded_error",
@@ -1047,11 +1202,17 @@ test("forwardActivity maps streaming message blocks using the installed SDK fiel
   const onActivity = (event: AgentActivityInput) => events.push(event);
 
   forwardActivity(
-    { type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi" } },
+    {
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: "hi" },
+    },
     onActivity,
   );
   forwardActivity(
-    { type: "message_update", assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "..." } },
+    {
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", contentIndex: 0, delta: "..." },
+    },
     onActivity,
   );
   // toolcall_start has no toolName in the installed Pi SDK; the completed tool call does.

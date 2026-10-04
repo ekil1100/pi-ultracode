@@ -141,7 +141,9 @@ export function createWorktree(cwd: string, runId: string, index: number): Workt
     rootIdentity = { device: rootStat.dev, inode: rootStat.ino };
     registrationIdentity = discoverRegistrationAtPath(worktreePath, context.gitCommonDir);
     if (!registrationIdentity) {
-      throw new Error("created worktree Git metadata is not a verified linked-worktree registration");
+      throw new Error(
+        "created worktree Git metadata is not a verified linked-worktree registration",
+      );
     }
     const gitDir = registrationIdentity.gitDir;
     const gitCommonDir = context.gitCommonDir;
@@ -203,14 +205,14 @@ export function createWorktree(cwd: string, runId: string, index: number): Workt
       rawBaselineExtras,
     };
   } catch (error) {
-    registrationIdentity ??= discoverRegistrationAtPath(
-      worktreePath,
-      context.gitCommonDir,
-    );
+    registrationIdentity ??= discoverRegistrationAtPath(worktreePath, context.gitCommonDir);
     if (!rootIdentity && registrationIdentity) {
       rootIdentity = directoryIdentity(worktreePath);
     }
-    if (registrationIdentity && unregisterRegistration(repoRoot, registrationIdentity, worktreePath)) {
+    if (
+      registrationIdentity &&
+      unregisterRegistration(repoRoot, registrationIdentity, worktreePath)
+    ) {
       if (rootIdentity) tryRemoveOwnedDirectory(worktreePath, rootIdentity);
       if (rawCreated && rawIdentity) tryRemoveOwnedDirectory(rawObjectDirectory, rawIdentity);
     }
@@ -237,30 +239,39 @@ export function captureWorktreeDiff(
     allowTrackedDeletion: true,
     timeoutMs: remainingTimeout(deadline),
   });
-  const objectEnv = rawObjectEnvironment(worktree.rawObjectDirectory, worktree.repositoryObjectDirectory);
-  const syntheticBasePathsToRemove = new Set(worktree.rawBaselineExtras
-    .filter((baseline) => {
-      const entry = current.entries.get(baseline.key);
-      if (!entry) return true;
-      return entry.mode !== baseline.mode
-        || entry.type !== baseline.type
-        || entry.oid !== baseline.oid
-        || (!baseline.tracked && current.trackedPathKeys.has(baseline.key));
-    })
-    .map((entry) => entry.key));
-  const comparisonBaseTree = syntheticBasePathsToRemove.size > 0
-    ? filterRawTree(
-        worktree.path,
-        worktree.rawBaseTree,
-        syntheticBasePathsToRemove,
-        objectEnv,
-        deadline,
-      )
-    : worktree.rawBaseTree;
-  const run = (args: string[]): Buffer => gitBuffer(worktree.path, args, {
-    timeoutMs: remainingTimeout(deadline),
-    env: objectEnv,
-  });
+  const objectEnv = rawObjectEnvironment(
+    worktree.rawObjectDirectory,
+    worktree.repositoryObjectDirectory,
+  );
+  const syntheticBasePathsToRemove = new Set(
+    worktree.rawBaselineExtras
+      .filter((baseline) => {
+        const entry = current.entries.get(baseline.key);
+        if (!entry) return true;
+        return (
+          entry.mode !== baseline.mode ||
+          entry.type !== baseline.type ||
+          entry.oid !== baseline.oid ||
+          (!baseline.tracked && current.trackedPathKeys.has(baseline.key))
+        );
+      })
+      .map((entry) => entry.key),
+  );
+  const comparisonBaseTree =
+    syntheticBasePathsToRemove.size > 0
+      ? filterRawTree(
+          worktree.path,
+          worktree.rawBaseTree,
+          syntheticBasePathsToRemove,
+          objectEnv,
+          deadline,
+        )
+      : worktree.rawBaseTree;
+  const run = (args: string[]): Buffer =>
+    gitBuffer(worktree.path, args, {
+      timeoutMs: remainingTimeout(deadline),
+      env: objectEnv,
+    });
   const sharedDiffArgs = [
     "--no-renames",
     "--no-ext-diff",
@@ -270,14 +281,21 @@ export function captureWorktreeDiff(
     comparisonBaseTree,
     current.tree,
   ];
-  const numstat = run([
-    "-c", "core.quotepath=false", "diff", "--numstat", "-z", ...sharedDiffArgs,
-  ]);
+  const numstat = run(["-c", "core.quotepath=false", "diff", "--numstat", "-z", ...sharedDiffArgs]);
   const diffStat = run([
-    "-c", "core.quotepath=false", "diff", "--stat", ...sharedDiffArgs,
+    "-c",
+    "core.quotepath=false",
+    "diff",
+    "--stat",
+    ...sharedDiffArgs,
   ]).toString("utf8");
   const patch = run([
-    "-c", "core.quotepath=false", "diff", "--binary", "--full-index", ...sharedDiffArgs,
+    "-c",
+    "core.quotepath=false",
+    "diff",
+    "--binary",
+    "--full-index",
+    ...sharedDiffArgs,
   ]);
 
   const parsed = parseNumstat(numstat);
@@ -326,11 +344,12 @@ interface RawTreeEntry {
 function buildRawTree(input: RawTreeInput): RawTreeResult {
   const deadline = Date.now() + normalizeTimeout(input.timeoutMs);
   const objectEnv = rawObjectEnvironment(input.objectDirectory, input.repositoryObjectDirectory);
-  const baseEntries = parseLsTree(gitBuffer(
-    input.cwd,
-    ["ls-tree", "-r", "-z", "--full-tree", input.baseCommit],
-    { timeoutMs: remainingTimeout(deadline), env: objectEnv },
-  ));
+  const baseEntries = parseLsTree(
+    gitBuffer(input.cwd, ["ls-tree", "-r", "-z", "--full-tree", input.baseCommit], {
+      timeoutMs: remainingTimeout(deadline),
+      env: objectEnv,
+    }),
+  );
   const basePathKeys = new Set(baseEntries.map((entry) => entry.path.toString("base64")));
   const trackedPaths = listCurrentTrackedPaths(input.cwd, objectEnv, deadline);
   const trackedPathKeys = new Set(trackedPaths.keys());
@@ -379,18 +398,17 @@ function listCurrentTrackedPaths(
   deadline: number,
 ): Map<string, Buffer> {
   const paths = new Map<string, Buffer>();
-  for (const entry of parseLsTree(gitBuffer(
-    cwd,
-    ["ls-tree", "-r", "-z", "--full-tree", "HEAD"],
-    { timeoutMs: remainingTimeout(deadline), env: objectEnv },
-  ))) {
+  for (const entry of parseLsTree(
+    gitBuffer(cwd, ["ls-tree", "-r", "-z", "--full-tree", "HEAD"], {
+      timeoutMs: remainingTimeout(deadline),
+      env: objectEnv,
+    }),
+  )) {
     if (entry.mode !== "160000") paths.set(entry.path.toString("base64"), entry.path);
   }
-  for (const entry of parseIndexEntries(gitBuffer(
-    cwd,
-    ["ls-files", "--stage", "-z"],
-    { timeoutMs: remainingTimeout(deadline) },
-  ))) {
+  for (const entry of parseIndexEntries(
+    gitBuffer(cwd, ["ls-files", "--stage", "-z"], { timeoutMs: remainingTimeout(deadline) }),
+  )) {
     if (entry.stage !== "0") {
       throw new Error("worktree index contains unmerged entries; worktree must be preserved");
     }
@@ -405,7 +423,10 @@ function writeRawTree(
   objectEnv: NodeJS.ProcessEnv,
   deadline: number,
 ): string {
-  const indexPath = path.join(os.tmpdir(), `ultracode-index-${process.pid}-${randomBytes(8).toString("hex")}`);
+  const indexPath = path.join(
+    os.tmpdir(),
+    `ultracode-index-${process.pid}-${randomBytes(8).toString("hex")}`,
+  );
   const indexEnv = { ...objectEnv, GIT_INDEX_FILE: indexPath };
   try {
     gitBuffer(cwd, ["read-tree", "--empty"], {
@@ -414,11 +435,13 @@ function writeRawTree(
     });
     const indexInfo = [...values]
       .sort((left, right) => Buffer.compare(left.path, right.path))
-      .map((entry) => Buffer.concat([
-        Buffer.from(`${entry.mode} ${entry.oid}\t`, "ascii"),
-        entry.path,
-        Buffer.from([0]),
-      ]));
+      .map((entry) =>
+        Buffer.concat([
+          Buffer.from(`${entry.mode} ${entry.oid}\t`, "ascii"),
+          entry.path,
+          Buffer.from([0]),
+        ]),
+      );
     if (indexInfo.length > 0) {
       gitBuffer(cwd, ["update-index", "-z", "--index-info"], {
         timeoutMs: remainingTimeout(deadline),
@@ -446,11 +469,12 @@ function filterRawTree(
   objectEnv: NodeJS.ProcessEnv,
   deadline: number,
 ): string {
-  const entries = parseLsTree(gitBuffer(
-    cwd,
-    ["ls-tree", "-r", "-z", "--full-tree", tree],
-    { timeoutMs: remainingTimeout(deadline), env: objectEnv },
-  )).filter((entry) => !excludedPathKeys.has(entry.path.toString("base64")));
+  const entries = parseLsTree(
+    gitBuffer(cwd, ["ls-tree", "-r", "-z", "--full-tree", tree], {
+      timeoutMs: remainingTimeout(deadline),
+      env: objectEnv,
+    }),
+  ).filter((entry) => !excludedPathKeys.has(entry.path.toString("base64")));
   return writeRawTree(cwd, entries, objectEnv, deadline);
 }
 
@@ -459,18 +483,22 @@ function listUntrackedFromBase(
   objectEnv: NodeJS.ProcessEnv,
   deadline: number,
 ): Buffer[] {
-  const indexPath = path.join(os.tmpdir(), `ultracode-base-index-${process.pid}-${randomBytes(8).toString("hex")}`);
+  const indexPath = path.join(
+    os.tmpdir(),
+    `ultracode-base-index-${process.pid}-${randomBytes(8).toString("hex")}`,
+  );
   const env = { ...objectEnv, GIT_INDEX_FILE: indexPath };
   try {
     gitBuffer(input.cwd, ["read-tree", input.baseCommit], {
       timeoutMs: remainingTimeout(deadline),
       env,
     });
-    return splitNul(gitBuffer(
-      input.cwd,
-      ["ls-files", "--others", "--exclude-standard", "-z"],
-      { timeoutMs: remainingTimeout(deadline), env },
-    ));
+    return splitNul(
+      gitBuffer(input.cwd, ["ls-files", "--others", "--exclude-standard", "-z"], {
+        timeoutMs: remainingTimeout(deadline),
+        env,
+      }),
+    );
   } finally {
     try {
       fs.rmSync(indexPath, { force: true });
@@ -555,9 +583,11 @@ function setRawTreeEntry(entries: Map<string, RawTreeEntry>, entry: RawTreeEntry
 }
 
 function isDescendantPath(candidate: Buffer, parent: Buffer): boolean {
-  return candidate.length > parent.length
-    && candidate.subarray(0, parent.length).equals(parent)
-    && candidate[parent.length] === 0x2f;
+  return (
+    candidate.length > parent.length &&
+    candidate.subarray(0, parent.length).equals(parent) &&
+    candidate[parent.length] === 0x2f
+  );
 }
 
 function parseLsTree(value: Buffer): RawTreeEntry[] {
@@ -591,10 +621,10 @@ function parseIndexEntries(value: Buffer): IndexEntry[] {
     if (tab < 0) throw new Error("git ls-files returned malformed index output");
     const fields = record.subarray(0, tab).toString("ascii").split(" ");
     if (
-      fields.length !== 3
-      || !/^[0-7]{6}$/.test(fields[0] ?? "")
-      || !/^[0-9a-f]+$/.test(fields[1] ?? "")
-      || !/^[0-3]$/.test(fields[2] ?? "")
+      fields.length !== 3 ||
+      !/^[0-7]{6}$/.test(fields[0] ?? "") ||
+      !/^[0-9a-f]+$/.test(fields[1] ?? "") ||
+      !/^[0-3]$/.test(fields[2] ?? "")
     ) {
       throw new Error("git ls-files returned malformed index entry");
     }
@@ -618,7 +648,10 @@ function splitNul(value: Buffer): Buffer[] {
   return records;
 }
 
-function rawObjectEnvironment(objectDirectory: string, repositoryObjectDirectory: string): NodeJS.ProcessEnv {
+function rawObjectEnvironment(
+  objectDirectory: string,
+  repositoryObjectDirectory: string,
+): NodeJS.ProcessEnv {
   return {
     GIT_OBJECT_DIRECTORY: objectDirectory,
     GIT_ALTERNATE_OBJECT_DIRECTORIES: repositoryObjectDirectory,
@@ -627,25 +660,27 @@ function rawObjectEnvironment(objectDirectory: string, repositoryObjectDirectory
 
 function assertUnchangedGitlinks(worktree: Worktree, deadline: number): Set<string> {
   const readTreeGitlinks = (treeish: string): Map<string, { oid: string; path: Buffer }> => {
-    const entries = parseLsTree(gitBuffer(
-      worktree.path,
-      ["ls-tree", "-r", "-z", "--full-tree", treeish],
-      { timeoutMs: remainingTimeout(deadline) },
-    ));
-    return new Map(entries
-      .filter((entry) => entry.mode === "160000")
-      .map((entry) => [entry.path.toString("base64"), { oid: entry.oid, path: entry.path }]));
+    const entries = parseLsTree(
+      gitBuffer(worktree.path, ["ls-tree", "-r", "-z", "--full-tree", treeish], {
+        timeoutMs: remainingTimeout(deadline),
+      }),
+    );
+    return new Map(
+      entries
+        .filter((entry) => entry.mode === "160000")
+        .map((entry) => [entry.path.toString("base64"), { oid: entry.oid, path: entry.path }]),
+    );
   };
   const base = readTreeGitlinks(worktree.baseCommit);
   const head = readTreeGitlinks("HEAD");
   assertSameGitlinks(base, head, "committed");
 
   const index = new Map<string, { oid: string; path: Buffer }>();
-  for (const entry of parseIndexEntries(gitBuffer(
-    worktree.path,
-    ["ls-files", "--stage", "-z"],
-    { timeoutMs: remainingTimeout(deadline) },
-  ))) {
+  for (const entry of parseIndexEntries(
+    gitBuffer(worktree.path, ["ls-files", "--stage", "-z"], {
+      timeoutMs: remainingTimeout(deadline),
+    }),
+  )) {
     const key = entry.path.toString("base64");
     if (entry.stage !== "0") {
       if (entry.mode === "160000" || base.has(key)) {
@@ -658,11 +693,9 @@ function assertUnchangedGitlinks(worktree: Worktree, deadline: number): Set<stri
   assertSameGitlinks(base, index, "staged");
 
   const indexTags = new Map<string, string>();
-  for (const record of splitNul(gitBuffer(
-    worktree.path,
-    ["ls-files", "-v", "-z"],
-    { timeoutMs: remainingTimeout(deadline) },
-  ))) {
+  for (const record of splitNul(
+    gitBuffer(worktree.path, ["ls-files", "-v", "-z"], { timeoutMs: remainingTimeout(deadline) }),
+  )) {
     if (record.length < 3 || record[1] !== 0x20) {
       throw new Error("git ls-files returned malformed flag output");
     }
@@ -670,7 +703,9 @@ function assertUnchangedGitlinks(worktree: Worktree, deadline: number): Set<stri
   }
   for (const [key] of base) {
     if (indexTags.get(key) !== "H") {
-      throw new Error("gitlink index flags cannot hide submodule changes; worktree must be preserved");
+      throw new Error(
+        "gitlink index flags cannot hide submodule changes; worktree must be preserved",
+      );
     }
   }
 
@@ -710,16 +745,19 @@ function assertInitializedRepositoryClean(
   verifiedGitMetadata: Set<string>,
   relativeRepoRoot: Buffer,
 ): void {
-  if (depth > 64) throw new Error("nested submodule depth cannot be verified; worktree must be preserved");
+  if (depth > 64)
+    throw new Error("nested submodule depth cannot be verified; worktree must be preserved");
   const discoveryEnv = {
     GIT_WORK_TREE: repoRoot,
     GIT_OPTIONAL_LOCKS: "0",
     GIT_NO_REPLACE_OBJECTS: "1",
   };
-  const gitDir = fs.realpathSync(gitLine(repoRoot, ["rev-parse", "--path-format=absolute", "--git-dir"], {
-    timeoutMs: remainingTimeout(deadline),
-    env: discoveryEnv,
-  }));
+  const gitDir = fs.realpathSync(
+    gitLine(repoRoot, ["rev-parse", "--path-format=absolute", "--git-dir"], {
+      timeoutMs: remainingTimeout(deadline),
+      env: discoveryEnv,
+    }),
+  );
   recordVerifiedGitMetadata(repoRoot, gitDir, relativeRepoRoot, verifiedGitMetadata);
   const repositoryEnv = {
     GIT_DIR: gitDir,
@@ -728,24 +766,34 @@ function assertInitializedRepositoryClean(
     GIT_NO_REPLACE_OBJECTS: "1",
   };
   const fixedConfig = [
-    "-c", "core.filemode=true",
-    "-c", "core.fsmonitor=false",
-    "-c", "core.ignoreStat=false",
+    "-c",
+    "core.filemode=true",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.ignoreStat=false",
   ];
-  const run = (args: string[], input?: Buffer): Buffer => gitBuffer(
-    repoRoot,
-    [...fixedConfig, ...args],
-    { timeoutMs: remainingTimeout(deadline), env: repositoryEnv, input },
-  );
-  const line = (args: string[], input?: Buffer): string => stripOneLineEnding(run(args, input).toString("utf8"));
+  const run = (args: string[], input?: Buffer): Buffer =>
+    gitBuffer(repoRoot, [...fixedConfig, ...args], {
+      timeoutMs: remainingTimeout(deadline),
+      env: repositoryEnv,
+      input,
+    });
+  const line = (args: string[], input?: Buffer): string =>
+    stripOneLineEnding(run(args, input).toString("utf8"));
 
   if (line(["rev-parse", "HEAD"]) !== expectedHead) {
     throw new Error("changed submodule HEAD cannot be delivered; worktree must be preserved");
   }
   const expectedEntries = parseLsTree(run(["ls-tree", "-r", "-z", "--full-tree", expectedHead]));
-  const expectedByPath = new Map(expectedEntries.map((entry) => [entry.path.toString("base64"), entry]));
+  const expectedByPath = new Map(
+    expectedEntries.map((entry) => [entry.path.toString("base64"), entry]),
+  );
   const indexEntries = parseIndexEntries(run(["ls-files", "--stage", "-z"]));
-  if (indexEntries.some((entry) => entry.stage !== "0") || indexEntries.length !== expectedEntries.length) {
+  if (
+    indexEntries.some((entry) => entry.stage !== "0") ||
+    indexEntries.length !== expectedEntries.length
+  ) {
     throw new Error("changed submodule index cannot be delivered; worktree must be preserved");
   }
   for (const entry of indexEntries) {
@@ -782,7 +830,9 @@ function assertInitializedRepositoryClean(
     if (!nestedRoot || fs.readdirSync(nestedRoot).length === 0) continue;
     const nestedPath = nestedRoot.toString();
     if (!Buffer.from(nestedPath).equals(nestedRoot)) {
-      throw new Error("nested submodule path encoding cannot be verified; worktree must be preserved");
+      throw new Error(
+        "nested submodule path encoding cannot be verified; worktree must be preserved",
+      );
     }
     const nestedRelative = Buffer.concat([relativeRepoRoot, Buffer.from("/"), entry.path]);
     assertInitializedRepositoryClean(
@@ -808,8 +858,12 @@ function recordVerifiedGitMetadata(
   if (stat.isDirectory() && !stat.isSymbolicLink()) {
     resolved = fs.realpathSync(metadataPath);
   } else if (stat.isFile() && !stat.isSymbolicLink() && stat.size <= 4096) {
-    const match = fs.readFileSync(metadataPath, "utf8").trim().match(/^gitdir:\s+(.+)$/);
-    if (!match) throw new Error("submodule Git metadata cannot be verified; worktree must be preserved");
+    const match = fs
+      .readFileSync(metadataPath, "utf8")
+      .trim()
+      .match(/^gitdir:\s+(.+)$/);
+    if (!match)
+      throw new Error("submodule Git metadata cannot be verified; worktree must be preserved");
     resolved = fs.realpathSync(path.resolve(repoRoot, match[1]));
   } else {
     throw new Error("submodule Git metadata cannot be verified; worktree must be preserved");
@@ -835,7 +889,9 @@ function resolveDirectoryNoFollow(cwd: string, relative: Buffer): Buffer | undef
       throw error;
     }
     if (!stat.isDirectory() || stat.isSymbolicLink()) {
-      throw new Error("submodule path contains a non-directory ancestor; worktree must be preserved");
+      throw new Error(
+        "submodule path contains a non-directory ancestor; worktree must be preserved",
+      );
     }
   }
   return target;
@@ -846,7 +902,10 @@ function assertSameGitlinks(
   candidate: Map<string, { oid: string; path: Buffer }>,
   state: string,
 ): void {
-  if (base.size === candidate.size && [...base].every(([key, entry]) => candidate.get(key)?.oid === entry.oid)) {
+  if (
+    base.size === candidate.size &&
+    [...base].every(([key, entry]) => candidate.get(key)?.oid === entry.oid)
+  ) {
     return;
   }
   throw new Error(`${state} gitlink changes cannot be delivered; worktree must be preserved`);
@@ -859,7 +918,9 @@ function assertNoUnsupportedFilesystemNodes(
 ): void {
   const cwd = worktree.path;
   const root = Buffer.from(cwd);
-  const stack: Array<{ absolute: Buffer; relative: Buffer }> = [{ absolute: root, relative: Buffer.alloc(0) }];
+  const stack: Array<{ absolute: Buffer; relative: Buffer }> = [
+    { absolute: root, relative: Buffer.alloc(0) },
+  ];
   const special: Buffer[] = [];
   let visited = 0;
   while (stack.length > 0) {
@@ -872,15 +933,18 @@ function assertNoUnsupportedFilesystemNodes(
     for (const child of children) {
       visited++;
       if (visited > 200_000) {
-        throw new Error("worktree filesystem scan exceeds 200000 nodes; worktree must be preserved");
+        throw new Error(
+          "worktree filesystem scan exceeds 200000 nodes; worktree must be preserved",
+        );
       }
       const name = Buffer.from(child.name);
       if (directory.relative.length === 0 && name.equals(Buffer.from(".git"))) continue;
       const separator = Buffer.from(path.sep);
       const absolute = Buffer.concat([directory.absolute, separator, name]);
-      const relative = directory.relative.length === 0
-        ? name
-        : Buffer.concat([directory.relative, Buffer.from("/"), name]);
+      const relative =
+        directory.relative.length === 0
+          ? name
+          : Buffer.concat([directory.relative, Buffer.from("/"), name]);
       const stat = fs.lstatSync(absolute);
       if (name.equals(Buffer.from(".git"))) {
         if (verifiedGitMetadata.has(relative.toString("base64"))) continue;
@@ -913,23 +977,18 @@ function assertNoUnsupportedFilesystemNodes(
 }
 
 function assertCleanSubmodules(worktree: Worktree, deadline: number): void {
-  const status = gitBuffer(worktree.path, [
-    "status",
-    "--porcelain=v2",
-    "-z",
-    "--untracked-files=all",
-    "--ignore-submodules=none",
-  ], { timeoutMs: remainingTimeout(deadline) });
+  const status = gitBuffer(
+    worktree.path,
+    ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+    { timeoutMs: remainingTimeout(deadline) },
+  );
   for (const record of splitNul(status)) {
     if (record[0] !== 0x31 && record[0] !== 0x32) continue;
     const fields = record.toString("latin1").split(" ");
     const xy = fields[1];
     const submodule = fields[2];
     const touchesGitlink = fields.slice(3, 6).includes("160000");
-    if (
-      (submodule?.startsWith("S") && submodule !== "S...")
-      || (touchesGitlink && xy !== "..")
-    ) {
+    if ((submodule?.startsWith("S") && submodule !== "S...") || (touchesGitlink && xy !== "..")) {
       throw new Error("dirty or changed submodule cannot be delivered; worktree must be preserved");
     }
   }
@@ -937,7 +996,10 @@ function assertCleanSubmodules(worktree: Worktree, deadline: number): void {
 
 /** Generate a collision-resistant private patch path. */
 export function patchTmpPath(): string {
-  return path.join(os.tmpdir(), `ultracode-patch-${process.pid}-${randomBytes(8).toString("hex")}.patch`);
+  return path.join(
+    os.tmpdir(),
+    `ultracode-patch-${process.pid}-${randomBytes(8).toString("hex")}.patch`,
+  );
 }
 
 /**
@@ -1093,7 +1155,8 @@ function reorderPatchSections(patch: Buffer, paths: Buffer[]): Buffer {
     const headerEndCandidates = ["\n--- ", "\nGIT binary patch", "\n@@ "]
       .map((needle) => value.indexOf(Buffer.from(needle)))
       .filter((candidate) => candidate >= 0);
-    const headerEnd = headerEndCandidates.length > 0 ? Math.min(...headerEndCandidates) : value.length;
+    const headerEnd =
+      headerEndCandidates.length > 0 ? Math.min(...headerEndCandidates) : value.length;
     const header = value.subarray(0, headerEnd).toString("latin1");
     const deletion = /^deleted file mode /m.test(header);
     return { value, path: paths[index]!, deletion, index };
@@ -1122,10 +1185,11 @@ function preserveUnrepresentedFileModes(repoRoot: string, snapshot: ApplySnapsho
     if (entry.kind !== "file") continue;
     const actual = readFilesystemEntryNoFollow(repoRoot, entry.relative);
     if (
-      !actual
-      || !actual.path.equals(entry.relative)
-      || (actual.mode !== "100644" && actual.mode !== "100755")
-    ) continue;
+      !actual ||
+      !actual.path.equals(entry.relative) ||
+      (actual.mode !== "100644" && actual.mode !== "100755")
+    )
+      continue;
     let stat: fs.Stats;
     try {
       stat = fs.lstatSync(entry.path);
@@ -1138,9 +1202,8 @@ function preserveUnrepresentedFileModes(repoRoot: string, snapshot: ApplySnapsho
     const after = stat.mode & 0o7777;
     const beforeExecutable = (before & 0o111) !== 0;
     const afterExecutable = (after & 0o111) !== 0;
-    const desired = beforeExecutable === afterExecutable
-      ? before
-      : (before & ~0o111) | (after & 0o111);
+    const desired =
+      beforeExecutable === afterExecutable ? before : (before & ~0o111) | (after & 0o111);
     if (desired !== after) fs.chmodSync(entry.path, desired);
   }
 }
@@ -1198,11 +1261,11 @@ function assertPatchPostContents(
     if (!actual || !actual.path.equals(expectation.path)) {
       throw new Error("applied patch content postcondition is not present");
     }
-    const oid = stripOneLineEnding(runPatchGit(repository, [
-      "hash-object",
-      "--no-filters",
-      "--stdin",
-    ], actual.content).toString("ascii"));
+    const oid = stripOneLineEnding(
+      runPatchGit(repository, ["hash-object", "--no-filters", "--stdin"], actual.content).toString(
+        "ascii",
+      ),
+    );
     if (!oid.startsWith(expectation.oid)) {
       throw new Error("applied patch content postcondition changed in the target tree");
     }
@@ -1229,9 +1292,11 @@ function splitPatchSections(
   }
   return {
     prefix: starts.length > 0 ? Buffer.from(patch.subarray(0, starts[0])) : Buffer.from(patch),
-    sections: starts.map((start, index) => Buffer.from(
-      patch.subarray(start, index + 1 < starts.length ? starts[index + 1]! : patch.length),
-    )),
+    sections: starts.map((start, index) =>
+      Buffer.from(
+        patch.subarray(start, index + 1 < starts.length ? starts[index + 1]! : patch.length),
+      ),
+    ),
   };
 }
 
@@ -1275,10 +1340,11 @@ export function removeWorktree(worktree: Worktree): void {
     const discovered = discoverRegistrationAtPath(worktree.path, worktree.gitCommonDir);
     if (discovered) {
       if (
-        discovered.device !== worktree.gitDirDevice
-        || discovered.inode !== worktree.gitDirInode
-        || !samePotentialPath(path.dirname(discovered.gitDir), adminParent)
-      ) return;
+        discovered.device !== worktree.gitDirDevice ||
+        discovered.inode !== worktree.gitDirInode ||
+        !samePotentialPath(path.dirname(discovered.gitDir), adminParent)
+      )
+        return;
       registration = discovered;
     } else {
       const search = findDirectoryByIdentity(adminParent, savedAdminIdentity);
@@ -1300,14 +1366,15 @@ export function removeWorktree(worktree: Worktree): void {
     }
   }
 
-  if (registration && !unregisterRegistration(worktree.repoRoot, registration, worktree.path)) return;
+  if (registration && !unregisterRegistration(worktree.repoRoot, registration, worktree.path))
+    return;
   if (root) tryRemoveOwnedDirectory(worktree.path, root);
   const raw = directoryIdentity(worktree.rawObjectDirectory);
   if (
-    raw
-    && raw.device === worktree.rawObjectDevice
-    && raw.inode === worktree.rawObjectInode
-    && ownsRawObjectDirectory(worktree)
+    raw &&
+    raw.device === worktree.rawObjectDevice &&
+    raw.inode === worktree.rawObjectInode &&
+    ownsRawObjectDirectory(worktree)
   ) {
     tryRemoveOwnedDirectory(worktree.rawObjectDirectory, raw);
   }
@@ -1333,7 +1400,10 @@ function readWorktreeGitDirPointer(worktreePath: string): string | undefined {
     const dotGit = path.join(worktreePath, ".git");
     const stat = fs.lstatSync(dotGit);
     if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 4096) return undefined;
-    const match = fs.readFileSync(dotGit, "utf8").trim().match(/^gitdir:\s+(.+)$/);
+    const match = fs
+      .readFileSync(dotGit, "utf8")
+      .trim()
+      .match(/^gitdir:\s+(.+)$/);
     if (!match) return undefined;
     return path.resolve(worktreePath, match[1]);
   } catch {
@@ -1350,17 +1420,21 @@ function validateRegistrationDirectory(
   try {
     const stat = fs.lstatSync(gitDir);
     if (!stat.isDirectory() || stat.isSymbolicLink()) return undefined;
-    if (expectedIdentity && (
-      stat.dev !== expectedIdentity.device || stat.ino !== expectedIdentity.inode
-    )) return undefined;
+    if (
+      expectedIdentity &&
+      (stat.dev !== expectedIdentity.device || stat.ino !== expectedIdentity.inode)
+    )
+      return undefined;
     const commonFile = path.join(gitDir, "commondir");
     const commonStat = fs.lstatSync(commonFile);
-    if (!commonStat.isFile() || commonStat.isSymbolicLink() || commonStat.size > 4096) return undefined;
+    if (!commonStat.isFile() || commonStat.isSymbolicLink() || commonStat.size > 4096)
+      return undefined;
     const commonPath = fs.readFileSync(commonFile, "utf8").trim();
     const commonDir = fs.realpathSync(path.resolve(gitDir, commonPath));
     if (commonDir !== expectedCommonDir) return undefined;
     const registeredPath = readRegisteredWorktreePath(gitDir);
-    if (!registeredPath || !samePotentialPath(registeredPath, expectedWorktreePath)) return undefined;
+    if (!registeredPath || !samePotentialPath(registeredPath, expectedWorktreePath))
+      return undefined;
     return { gitDir, commonDir, device: stat.dev, inode: stat.ino, worktreePath: registeredPath };
   } catch {
     return undefined;
@@ -1385,7 +1459,10 @@ type DirectoryIdentitySearch =
   | { state: "not-found" }
   | { state: "unverifiable" };
 
-function findDirectoryByIdentity(parent: string, identity: DirectoryIdentity): DirectoryIdentitySearch {
+function findDirectoryByIdentity(
+  parent: string,
+  identity: DirectoryIdentity,
+): DirectoryIdentitySearch {
   try {
     for (const name of fs.readdirSync(parent)) {
       const candidate = path.join(parent, name);
@@ -1506,10 +1583,7 @@ function assertOwnedWorktree(worktree: Worktree, deadline: number): void {
   }
 }
 
-function ownsWorktree(
-  worktree: Worktree,
-  deadline = Date.now() + DEFAULT_GIT_TIMEOUT_MS,
-): boolean {
+function ownsWorktree(worktree: Worktree, deadline = Date.now() + DEFAULT_GIT_TIMEOUT_MS): boolean {
   try {
     if (Date.now() >= deadline) return false;
     const stat = fs.lstatSync(worktree.path);
@@ -1517,19 +1591,21 @@ function ownsWorktree(
     if (stat.dev !== worktree.device || stat.ino !== worktree.inode) return false;
     const registration = discoverRegistrationAtPath(worktree.path, worktree.gitCommonDir);
     if (
-      !registration
-      || registration.gitDir !== worktree.gitDir
-      || registration.device !== worktree.gitDirDevice
-      || registration.inode !== worktree.gitDirInode
-    ) return false;
+      !registration ||
+      registration.gitDir !== worktree.gitDir ||
+      registration.device !== worktree.gitDirDevice ||
+      registration.inode !== worktree.gitDirInode
+    )
+      return false;
     const rawObjectStat = fs.lstatSync(worktree.rawObjectDirectory);
     if (
-      !rawObjectStat.isDirectory()
-      || rawObjectStat.isSymbolicLink()
-      || rawObjectStat.dev !== worktree.rawObjectDevice
-      || rawObjectStat.ino !== worktree.rawObjectInode
-      || !ownsRawObjectDirectory(worktree)
-    ) return false;
+      !rawObjectStat.isDirectory() ||
+      rawObjectStat.isSymbolicLink() ||
+      rawObjectStat.dev !== worktree.rawObjectDevice ||
+      rawObjectStat.ino !== worktree.rawObjectInode ||
+      !ownsRawObjectDirectory(worktree)
+    )
+      return false;
     return true;
   } catch {
     return false;
@@ -1574,13 +1650,11 @@ function createPatchRepository(repoRoot: string, deadline: number): PatchReposit
   const repositoryPath = fs.mkdtempSync(path.join(os.tmpdir(), "ultracode-git-apply-"));
   const identity = directoryIdentity(repositoryPath)!;
   try {
-    gitBuffer(path.dirname(repositoryPath), [
-      "init",
-      "--bare",
-      "--quiet",
-      `--object-format=${objectFormat}`,
-      repositoryPath,
-    ], { timeoutMs: remainingTimeout(deadline) });
+    gitBuffer(
+      path.dirname(repositoryPath),
+      ["init", "--bare", "--quiet", `--object-format=${objectFormat}`, repositoryPath],
+      { timeoutMs: remainingTimeout(deadline) },
+    );
     return {
       path: repositoryPath,
       identity,
@@ -1602,11 +1676,7 @@ function removePatchRepository(repository: PatchRepository | undefined): void {
   if (repository) tryRemoveOwnedDirectory(repository.path, repository.identity);
 }
 
-function runPatchGit(
-  repository: PatchRepository,
-  args: string[],
-  input?: Uint8Array,
-): Buffer {
+function runPatchGit(repository: PatchRepository, args: string[], input?: Uint8Array): Buffer {
   return gitBuffer(repository.path, args, {
     timeoutMs: remainingTimeout(repository.deadline),
     env: repository.env,
@@ -1616,13 +1686,20 @@ function runPatchGit(
 
 function patchApplyArgs(args: string[]): string[] {
   return [
-    "-c", "apply.whitespace=nowarn",
-    "-c", "apply.ignoreWhitespace=false",
-    "-c", "core.filemode=true",
-    "-c", "core.autocrlf=false",
-    "-c", "core.eol=lf",
-    "-c", "core.safecrlf=false",
-    "-c", `core.attributesFile=${os.devNull}`,
+    "-c",
+    "apply.whitespace=nowarn",
+    "-c",
+    "apply.ignoreWhitespace=false",
+    "-c",
+    "core.filemode=true",
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "core.eol=lf",
+    "-c",
+    "core.safecrlf=false",
+    "-c",
+    `core.attributesFile=${os.devNull}`,
     "apply",
     "--cached",
     "--whitespace=nowarn",
@@ -1635,27 +1712,20 @@ function readPatchPaths(repository: PatchRepository, patchPath: string): Buffer[
   return parseNumstat(output).paths;
 }
 
-function populatePatchIndex(
-  repository: PatchRepository,
-  repoRoot: string,
-  paths: Buffer[],
-): void {
+function populatePatchIndex(repository: PatchRepository, repoRoot: string, paths: Buffer[]): void {
   runPatchGit(repository, ["read-tree", "--empty"]);
   const records: Buffer[] = [];
   for (const entryPath of paths) {
     const entry = readFilesystemEntryNoFollow(repoRoot, entryPath);
     if (!entry) continue;
-    const oid = stripOneLineEnding(runPatchGit(repository, [
-      "hash-object",
-      "-w",
-      "--no-filters",
-      "--stdin",
-    ], entry.content).toString("ascii"));
-    records.push(
-      Buffer.from(`${entry.mode} ${oid}\t`, "ascii"),
-      entry.path,
-      Buffer.from([0]),
+    const oid = stripOneLineEnding(
+      runPatchGit(
+        repository,
+        ["hash-object", "-w", "--no-filters", "--stdin"],
+        entry.content,
+      ).toString("ascii"),
     );
+    records.push(Buffer.from(`${entry.mode} ${oid}\t`, "ascii"), entry.path, Buffer.from([0]));
   }
   if (records.length > 0) {
     runPatchGit(repository, ["update-index", "-z", "--index-info"], Buffer.concat(records));
@@ -1677,8 +1747,9 @@ function materializePatchIndex(
     throw new Error("applied patch produced an unexpected private-index path");
   }
   const root = Buffer.from(repoRoot);
-  const deepestFirst = [...paths].sort((left, right) =>
-    pathDepth(right) - pathDepth(left) || Buffer.compare(right, left));
+  const deepestFirst = [...paths].sort(
+    (left, right) => pathDepth(right) - pathDepth(left) || Buffer.compare(right, left),
+  );
   for (const entryPath of deepestFirst) {
     if (byPath.has(entryPath.toString("base64"))) continue;
     const target = repositoryPath(root, entryPath);
@@ -1699,8 +1770,10 @@ function materializePatchIndex(
   }
   pruneDirectoriesReplacedByLeaves(root, paths, byPath.values());
 
-  const shallowestFirst = [...byPath.values()].sort((left, right) =>
-    pathDepth(left.path) - pathDepth(right.path) || Buffer.compare(left.path, right.path));
+  const shallowestFirst = [...byPath.values()].sort(
+    (left, right) =>
+      pathDepth(left.path) - pathDepth(right.path) || Buffer.compare(left.path, right.path),
+  );
   for (const entry of shallowestFirst) {
     if (!["100644", "100755", "120000"].includes(entry.mode)) {
       throw new Error(`applied patch produced unsupported mode ${entry.mode}`);
@@ -1758,17 +1831,20 @@ function pruneDirectoriesReplacedByLeaves(
     for (const relative of paths) {
       if (!isDescendantPath(relative, entry.path)) continue;
       for (const directory of parentDirectories(root, relative)) {
-        if (directory.equals(target) || (
-          directory.length > target.length
-          && directory.subarray(0, target.length).equals(target)
-          && directory[target.length] === Buffer.from(path.sep)[0]
-        )) {
+        if (
+          directory.equals(target) ||
+          (directory.length > target.length &&
+            directory.subarray(0, target.length).equals(target) &&
+            directory[target.length] === Buffer.from(path.sep)[0])
+        ) {
           candidates.set(directory.toString("hex"), directory);
         }
       }
     }
   }
-  for (const directory of [...candidates.values()].sort((left, right) => right.length - left.length)) {
+  for (const directory of [...candidates.values()].sort(
+    (left, right) => right.length - left.length,
+  )) {
     try {
       const stat = fs.lstatSync(directory);
       if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
@@ -1787,7 +1863,9 @@ function pruneEmptyPatchParents(root: Buffer, paths: Buffer[]): void {
       candidates.set(directory.toString("hex"), directory);
     }
   }
-  for (const directory of [...candidates.values()].sort((left, right) => right.length - left.length)) {
+  for (const directory of [...candidates.values()].sort(
+    (left, right) => right.length - left.length,
+  )) {
     try {
       const stat = fs.lstatSync(directory);
       if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
@@ -1798,7 +1876,9 @@ function pruneEmptyPatchParents(root: Buffer, paths: Buffer[]): void {
   }
 }
 
-function parseNumstat(value: Buffer): Pick<WorktreeDiff, "filesChanged" | "insertions" | "deletions" | "paths"> {
+function parseNumstat(
+  value: Buffer,
+): Pick<WorktreeDiff, "filesChanged" | "insertions" | "deletions" | "paths"> {
   let filesChanged = 0;
   let insertions = 0;
   let deletions = 0;
@@ -1828,8 +1908,9 @@ function parseNumstat(value: Buffer): Pick<WorktreeDiff, "filesChanged" | "inser
 }
 
 function containsGitlink(patch: Buffer): boolean {
-  return /^(?:(?:old|new|new file|deleted file) mode 160000|index [0-9a-f]+\.\.[0-9a-f]+ 160000)$/m
-    .test(patch.toString("latin1"));
+  return /^(?:(?:old|new|new file|deleted file) mode 160000|index [0-9a-f]+\.\.[0-9a-f]+ 160000)$/m.test(
+    patch.toString("latin1"),
+  );
 }
 
 function withTrailingNewline(input: PatchInput): Buffer {
@@ -1924,19 +2005,24 @@ function snapshotApplyPaths(repoRoot: string, paths: Buffer[]): ApplySnapshot {
         });
         continue;
       }
-      throw new Error("patch rollback supports only files, directories, symlinks, and missing paths");
+      throw new Error(
+        "patch rollback supports only files, directories, symlinks, and missing paths",
+      );
     }
   }
   return {
     roots,
     paths: snapshots,
-    directories: [...directories.values()].sort((left, right) => right.path.length - left.path.length),
+    directories: [...directories.values()].sort(
+      (left, right) => right.path.length - left.path.length,
+    ),
   };
 }
 
 function minimalPaths(paths: Buffer[]): Buffer[] {
-  const sorted = deduplicatePaths(paths).sort((left, right) =>
-    left.length - right.length || Buffer.compare(left, right));
+  const sorted = deduplicatePaths(paths).sort(
+    (left, right) => left.length - right.length || Buffer.compare(left, right),
+  );
   const roots: Buffer[] = [];
   for (const candidate of sorted) {
     if (!roots.some((root) => isDescendantPath(candidate, root))) roots.push(candidate);
@@ -1945,11 +2031,15 @@ function minimalPaths(paths: Buffer[]): Buffer[] {
 }
 
 function restoreApplySnapshot(repoRoot: string, snapshot: ApplySnapshot): void {
-  for (const root of [...snapshot.roots].sort((left, right) => right.path.length - left.path.length)) {
+  for (const root of [...snapshot.roots].sort(
+    (left, right) => right.path.length - left.path.length,
+  )) {
     removeDirectoryTreeNoFollow(root.path);
   }
   const snapshotDirectories = snapshot.paths
-    .filter((entry): entry is Extract<PathSnapshot, { kind: "directory" }> => entry.kind === "directory")
+    .filter(
+      (entry): entry is Extract<PathSnapshot, { kind: "directory" }> => entry.kind === "directory",
+    )
     .sort((left, right) => left.path.length - right.path.length);
   for (const entry of snapshotDirectories) {
     fs.mkdirSync(entry.path, { recursive: true, mode: 0o700 });
@@ -1965,7 +2055,9 @@ function restoreApplySnapshot(repoRoot: string, snapshot: ApplySnapshot): void {
       fs.symlinkSync(entry.target as any, entry.path as any);
     }
   }
-  for (const entry of snapshotDirectories.sort((left, right) => right.path.length - left.path.length)) {
+  for (const entry of snapshotDirectories.sort(
+    (left, right) => right.path.length - left.path.length,
+  )) {
     fs.chmodSync(entry.path, entry.mode);
   }
   for (const directory of snapshot.directories) {
@@ -1980,7 +2072,10 @@ function restoreApplySnapshot(repoRoot: string, snapshot: ApplySnapshot): void {
     if (!directory.existed || directory.mode === undefined) continue;
     fs.chmodSync(directory.path, directory.mode);
   }
-  fsyncAppliedPaths(repoRoot, snapshot.paths.map((entry) => entry.relative));
+  fsyncAppliedPaths(
+    repoRoot,
+    snapshot.paths.map((entry) => entry.relative),
+  );
 }
 
 function bufferParent(value: Buffer): Buffer {
@@ -2024,22 +2119,16 @@ function fsyncDirectory(directory: Buffer): void {
     const stat = fs.lstatSync(directory);
     if (!stat.isDirectory() || stat.isSymbolicLink()) return;
     const constants = fs.constants as Record<string, number>;
-    const flags = fs.constants.O_RDONLY
-      | (constants.O_NOFOLLOW ?? 0)
-      | (constants.O_DIRECTORY ?? 0);
+    const flags =
+      fs.constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_DIRECTORY ?? 0);
     fd = fs.openSync(directory, flags);
     if (!fs.fstatSync(fd).isDirectory()) throw new Error("fsync target is not a directory");
     fs.fsyncSync(fd);
   } catch (error: any) {
-    if (![
-      "ENOENT",
-      "ENOTDIR",
-      "ELOOP",
-      "EINVAL",
-      "ENOTSUP",
-      "EISDIR",
-      "EBADF",
-    ].includes(error?.code)) throw error;
+    if (
+      !["ENOENT", "ENOTDIR", "ELOOP", "EINVAL", "ENOTSUP", "EISDIR", "EBADF"].includes(error?.code)
+    )
+      throw error;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
   }
@@ -2047,8 +2136,13 @@ function fsyncDirectory(directory: Buffer): void {
 
 function repositoryPath(root: Buffer, relative: Buffer): Buffer {
   const components = splitPath(relative);
-  if (components.length === 0 || components.some((part) =>
-    part.length === 0 || part.equals(Buffer.from(".")) || part.equals(Buffer.from("..")))) {
+  if (
+    components.length === 0 ||
+    components.some(
+      (part) =>
+        part.length === 0 || part.equals(Buffer.from(".")) || part.equals(Buffer.from("..")),
+    )
+  ) {
     throw new Error("patch contains an unsafe repository-relative path");
   }
   const separator = Buffer.from(path.sep);
@@ -2060,7 +2154,9 @@ function parentDirectories(root: Buffer, relative: Buffer): Buffer[] {
   const separator = Buffer.from(path.sep);
   const result = [root];
   for (let count = 1; count < components.length; count++) {
-    result.push(Buffer.concat([root, separator, ...interleave(components.slice(0, count), separator)]));
+    result.push(
+      Buffer.concat([root, separator, ...interleave(components.slice(0, count), separator)]),
+    );
   }
   return result;
 }
@@ -2089,7 +2185,8 @@ function interleave(parts: Buffer[], separator: Buffer): Buffer[] {
 }
 
 function normalizeTimeout(value: number): number {
-  if (!Number.isFinite(value) || value <= 0) throw new Error("Git operation timeout must be positive");
+  if (!Number.isFinite(value) || value <= 0)
+    throw new Error("Git operation timeout must be positive");
   return Math.max(1, Math.floor(value));
 }
 

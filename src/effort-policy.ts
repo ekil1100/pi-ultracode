@@ -3,11 +3,14 @@ import { THINKING_LEVELS, type ThinkingLevel } from "./thinking.ts";
 /** Task-based effort criteria shared by workflow prompts and Jev selection. */
 const EFFORT_CRITERIA: Record<ThinkingLevel, string> = {
   off: "Fully specified mechanical work with no implementation decision or hidden-impact reasoning. Excludes finding where to change something or checking its meaning. Example: fix a typo at an exact location using a supplied replacement.",
-  minimal: "One clear local judgment in a single scope with no unresolved dependencies. Excludes cross-file tracing or multi-step implementation. Example: explain a short self-contained expression by checking its direct condition.",
+  minimal:
+    "One clear local judgment in a single scope with no unresolved dependencies. Excludes cross-file tracing or multi-step implementation. Example: explain a short self-contained expression by checking its direct condition.",
   low: "Small implementation or direct question with a clear goal, known approach, and straightforward checks. Excludes faults with an unknown root cause. Example: add a specified input validation rule and its test to an existing function.",
-  medium: "Bounded multi-step implementation or investigation coordinating several known constraints. Excludes interacting unresolved hypotheses requiring deeper investigation. Example: add a configuration option through loading, usage, and tests within an established architecture.",
+  medium:
+    "Bounded multi-step implementation or investigation coordinating several known constraints. Excludes interacting unresolved hypotheses requiring deeper investigation. Example: add a configuration option through loading, usage, and tests within an established architecture.",
   high: "Test multiple plausible hypotheses, trace cross-module effects, or reason about critical correctness constraints. Excludes escalation based solely on security or architecture keywords. Example: diagnose state desynchronization across modules by testing competing causes.",
-  xhigh: "Interacting hard problems requiring deep reasoning, comparison of approaches, and validation of cross-module invariants. Excludes escalation based only on file count or unsupported claims of complexity. Example: investigate an intermittent bug involving lifecycle, caching, and cancellation interactions.",
+  xhigh:
+    "Interacting hard problems requiring deep reasoning, comparison of approaches, and validation of cross-module invariants. Excludes escalation based only on file count or unsupported claims of complexity. Example: investigate an intermittent bug involving lifecycle, caching, and cancellation interactions.",
   max: "Exceptionally difficult synthesis requiring sustained rigorous argument and adversarial validation, or concrete evidence that lower-effort reasoning is insufficient. Excludes escalation from risk keywords alone; prior lower-level failure is not required. Example: prove and repair system-wide invariants involving concurrency, memory safety, and low-level semantics.",
 };
 

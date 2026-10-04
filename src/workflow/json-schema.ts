@@ -27,16 +27,22 @@ function convertJsonSchema(schema: unknown): TSchema {
 
   // Composite keywords first.
   if (Array.isArray(node.enum)) {
-    return withAnnotations(Type.Unsafe<unknown>({
-      ...(node.type !== undefined ? { type: node.type } : {}),
-      enum: node.enum,
-    }), annotations);
+    return withAnnotations(
+      Type.Unsafe<unknown>({
+        ...(node.type !== undefined ? { type: node.type } : {}),
+        enum: node.enum,
+      }),
+      annotations,
+    );
   }
   if ("const" in node) {
-    return withAnnotations(Type.Unsafe<unknown>({
-      ...(node.type !== undefined ? { type: node.type } : {}),
-      const: node.const,
-    }), annotations);
+    return withAnnotations(
+      Type.Unsafe<unknown>({
+        ...(node.type !== undefined ? { type: node.type } : {}),
+        const: node.const,
+      }),
+      annotations,
+    );
   }
   if (Array.isArray(node.anyOf)) {
     return withAnnotations(Type.Union(node.anyOf.map(convertJsonSchema)), annotations);

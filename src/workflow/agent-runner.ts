@@ -24,7 +24,7 @@ import {
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, TextContent } from "@earendil-works/pi-ai";
-import type { Static, TSchema } from "typebox";
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Result, Scope } from "effect";
 import { createStructuredOutputTool, type StructuredOutputCapture } from "./structured-output.ts";
 import {
   DISPLAY_INPUT_LIMIT,
@@ -66,29 +66,50 @@ export interface WorkflowChildResourceLoaderOptions {
  * already replaced process-global lifecycle state. Disable ambient extensions at
  * the loader boundary while retaining project context and ordinary skills.
  */
-export async function createWorkflowChildResourceLoader(
+export function createWorkflowChildResourceLoader(
   options: WorkflowChildResourceLoaderOptions,
 ): Promise<DefaultResourceLoader> {
-  const settingsManager = options.settingsManager
-    ?? SettingsManager.create(options.cwd, options.agentDir, {
-      projectTrusted: options.projectTrusted ?? false,
-    });
-  const loader = new DefaultResourceLoader({
-    cwd: options.cwd,
-    agentDir: options.agentDir,
-    settingsManager,
-    noExtensions: true,
-    extensionFactories: [createCodemodeExtension({ mode: "on", models: false })],
-    skillsOverride: ({ skills, diagnostics }) => ({
-      skills: skills.filter((skill) => !PARENT_ONLY_CHILD_SKILLS.has(skill.name)),
-      diagnostics,
-    }),
-  });
-  await loader.reload();
-  settingsManager.applyOverrides({
-    defaultTools: [...(settingsManager.getDefaultTools() ?? []), "+codemode"],
-  });
-  return loader;
+  return runAtSdkBoundary(loadChildResources(options));
+}
+
+function loadChildResources(options: WorkflowChildResourceLoaderOptions) {
+  return attempt(
+    () =>
+      options.settingsManager ??
+      SettingsManager.create(options.cwd, options.agentDir, {
+        projectTrusted: options.projectTrusted ?? false,
+      }),
+  ).pipe(
+    Effect.flatMap((settingsManager) =>
+      attempt(
+        () =>
+          new DefaultResourceLoader({
+            cwd: options.cwd,
+            agentDir: options.agentDir,
+            settingsManager,
+            noExtensions: true,
+            extensionFactories: [createCodemodeExtension({ mode: "on", models: false })],
+            skillsOverride: ({ skills, diagnostics }) => ({
+              skills: skills.filter((skill) => !PARENT_ONLY_CHILD_SKILLS.has(skill.name)),
+              diagnostics,
+            }),
+          }),
+      ).pipe(
+        Effect.flatMap((loader) =>
+          fromSdk(() => loader.reload()).pipe(
+            Effect.andThen(() =>
+              attempt(() =>
+                settingsManager.applyOverrides({
+                  defaultTools: [...(settingsManager.getDefaultTools() ?? []), "+codemode"],
+                }),
+              ),
+            ),
+            Effect.as(loader),
+          ),
+        ),
+      ),
+    ),
+  );
 }
 
 /** A minimal structural view of a Pi model (avoids importing the heavy generic type). */
@@ -206,10 +227,7 @@ export interface AgentSessionLike {
   supportsThinking(): boolean;
   getAvailableThinkingLevels(): ThinkingLevel[];
   setThinkingLevel(level: ThinkingLevel, options?: { persist?: boolean }): void;
-  prompt(
-    prompt: string,
-    options?: { preflightResult?: (success: boolean) => void },
-  ): Promise<void>;
+  prompt(prompt: string, options?: { preflightResult?: (success: boolean) => void }): Promise<void>;
   abort(): Promise<void>;
   subscribe(listener: (event: unknown) => void): () => void;
   dispose(): void;
@@ -307,384 +325,652 @@ export interface AgentRunner {
   run(call: AgentRunCall): Promise<AgentRunResult>;
 }
 
+/** The constructor is the SDK compatibility boundary; all run state lives in closures. */
 export class WorkflowAgentRunner implements AgentRunner {
   readonly supportsSchedulingHooks = true;
-  private readonly baseCwd: string;
-  private readonly projectTrusted: boolean;
-  private readonly modelRegistry?: ModelRegistryLike;
-  private readonly providedModelRuntime?: ModelRuntimeLike;
-  private readonly defaultModel?: ModelLike;
-  private readonly defaultThinking?: ThinkingLevel;
-  private readonly createSession: AgentSessionFactory;
-  private readonly usesPiSessionFactory: boolean;
-  private readonly createModelRuntime?: ModelRuntimeFactory;
-  private modelRuntimePromise?: Promise<ModelRuntimeLike | undefined>;
-  private readonly runtimeSupportsMaxThinking: boolean;
+  readonly run: AgentRunner["run"];
 
   constructor(options: WorkflowAgentRunnerOptions) {
-    this.baseCwd = options.cwd;
-    this.projectTrusted = options.projectTrusted ?? false;
-    this.modelRegistry = options.modelRegistry;
-    this.providedModelRuntime = options.modelRuntime;
-    this.defaultModel = options.model;
-    this.defaultThinking = options.thinkingLevel;
-    this.usesPiSessionFactory = options.createSession === undefined;
-    this.createSession = options.createSession ?? (createAgentSession as unknown as AgentSessionFactory);
-    this.createModelRuntime = options.createModelRuntime
-      ?? (options.modelRuntime !== undefined || !this.usesPiSessionFactory ? undefined : createPiModelRuntime);
-    this.runtimeSupportsMaxThinking = options.supportsMaxThinking ?? piVersionSupportsMaxThinking(PI_VERSION);
+    this.run = makeAgentRunner(options);
   }
+}
 
-  async run(call: AgentRunCall): Promise<AgentRunResult> {
-    if (call.signal?.aborted) throw new Error("Subagent was aborted");
+/** Keep foreign failures opaque, including rejection with undefined and custom properties. */
+interface AgentRunnerFailure {
+  readonly _tag: "AgentRunnerFailure";
+  readonly cause: unknown;
+}
 
-    const executionCwd = call.cwd ?? this.baseCwd;
-    const resourceCwd = this.baseCwd;
-    const capture: StructuredOutputCapture<any> = { called: false, value: undefined };
+const failure = (cause: unknown): AgentRunnerFailure => ({ _tag: "AgentRunnerFailure", cause });
+const attempt = <A>(thunk: () => A) => Effect.try({ try: thunk, catch: failure });
+const fromSdk = <A>(thunk: () => PromiseLike<A>) =>
+  Effect.tryPromise({ try: thunk, catch: failure });
 
-    const customTools: ToolDefinition[] = [...createCodingTools(executionCwd)];
-    let toolAllowlist: string[] | undefined = call.agentTypeDef?.tools
-      ? [...call.agentTypeDef.tools]
-      : undefined;
-
-    let schemaTSchema: TSchema | undefined;
-    if (call.schema) {
-      schemaTSchema = jsonSchemaToTypeBox(call.schema);
-      customTools.push(
-        createStructuredOutputTool({ schema: schemaTSchema, capture }) as unknown as ToolDefinition,
-      );
-      if (toolAllowlist) toolAllowlist.push("structured_output");
+function runAtSdkBoundary<A>(effect: Effect.Effect<A, AgentRunnerFailure>): Promise<A> {
+  return Effect.runPromiseExit(effect).then((exit) => {
+    if (Exit.isSuccess(exit)) return exit.value;
+    for (const reason of exit.cause.reasons) {
+      if (Cause.isFailReason(reason)) throw reason.error.cause;
     }
+    throw Cause.squash(exit.cause);
+  });
+}
 
-    const selection = this.resolveModel(call.modelPattern, call.agentTypeDef);
-    const thinkingLevel = selection.thinkingLevel;
-    const agentDir = getAgentDir();
+const AgentSessions = Context.Service<{
+  create(options: AgentSessionCreateOptions): Effect.Effect<AgentSessionLike, AgentRunnerFailure>;
+}>("pi-ultracode/agent-runner/AgentSessions");
 
-    let modelRuntime: ModelRuntimeLike | undefined;
-    let model: ModelLike | undefined;
-    try {
-      modelRuntime = await waitForSharedInitialization(
-        this.getModelRuntime(agentDir),
-        call.signal,
-      );
-      if (call.signal?.aborted) throw abortedError();
-      model = selection.model && modelRuntime?.getModel
-        ? modelRuntime.getModel(selection.model.provider, selection.model.id) ?? selection.model
-        : selection.model;
-    } catch (error) {
-      safeEmitTelemetry(call.onTelemetry, {
-        kind: "run_error",
-        error: safeDisplayText(errorText(error), 512),
-        usage: emptyAgentUsage(),
-      });
-      throw error;
-    }
+const ChildModels = Context.Service<{
+  get(
+    agentDir: string,
+    signal?: AbortSignal,
+  ): Effect.Effect<ModelRuntimeLike | undefined, AgentRunnerFailure>;
+  classifierRuntime?: ModelRuntimeLike | ModelRegistryLike;
+}>("pi-ultracode/agent-runner/ChildModels");
 
-    const createSession = async (level: ThinkingLevel | undefined) => {
-      const settingsManager = SettingsManager.create(resourceCwd, agentDir, {
-        projectTrusted: this.projectTrusted,
-      });
-      const resourceLoader = this.usesPiSessionFactory
-        ? await createWorkflowChildResourceLoader({
-            cwd: resourceCwd,
-            agentDir,
-            projectTrusted: this.projectTrusted,
-            settingsManager,
-          })
-        : undefined;
-      return this.createSession({
-        cwd: executionCwd,
-        agentDir,
-        sessionManager: SessionManager.inMemory(executionCwd),
-        settingsManager,
-        ...(resourceLoader ? { resourceLoader } : {}),
-        customTools,
-        excludeTools: [...CHILD_ORCHESTRATION_TOOLS],
-        ...(model ? { model: model as any } : {}),
-        ...(level ? { thinkingLevel: level as any } : {}),
-        ...(toolAllowlist ? { tools: toolAllowlist } : {}),
-        ...(modelRuntime
-          ? { modelRuntime }
-          : this.modelRegistry
-            ? { modelRegistry: this.modelRegistry as any }
-            : {}),
-      });
-    };
+function makeAgentRunner(options: WorkflowAgentRunnerOptions): AgentRunner["run"] {
+  // Capture configuration once, as the public constructor did before this adapter.
+  const config = { ...options };
+  const usesPiSessionFactory = config.createSession === undefined;
+  const createSession =
+    config.createSession ?? (createAgentSession as unknown as AgentSessionFactory);
+  const sessions = AgentSessions.of({
+    create: (input) =>
+      fromSdk(() => createSession(input)).pipe(Effect.map(({ session }) => session)),
+  });
+  const models = makeChildModels(config, usesPiSessionFactory);
+  const supportsMaxThinking =
+    config.supportsMaxThinking ?? piVersionSupportsMaxThinking(PI_VERSION);
+  return (call) =>
+    runAtSdkBoundary(
+      runAgent(call, config, usesPiSessionFactory, supportsMaxThinking).pipe(
+        Effect.provideService(AgentSessions, sessions),
+        Effect.provideService(ChildModels, models),
+      ),
+    );
+}
 
-    const sessionThinking = resolveSessionThinkingLevel(thinkingLevel, model);
-    safeEmitTelemetry(call.onTelemetry, {
-      kind: "model_requested",
-      modelId: model?.id,
-      effort: thinkingLevel,
-    });
-
-    let created: { session: AgentSessionLike };
-    try {
-      created = await createSession(sessionThinking);
-      if (call.signal?.aborted) {
-        disposeQuietly(created.session);
-        throw abortedError();
-      }
-      const selectedModel = created.session.model;
-      const selectedModelAdvertisesMax = (model ?? selectedModel)?.thinkingLevelMap?.max != null;
-      if (
-        thinkingLevel === ULTRACODE_THINKING_LEVEL &&
-        sessionThinking === ULTRACODE_THINKING_LEVEL &&
-        created.session.thinkingLevel !== ULTRACODE_THINKING_LEVEL &&
-        created.session.supportsThinking() &&
-        (!this.runtimeSupportsMaxThinking || selectedModelAdvertisesMax)
-      ) {
-        // A legacy runtime may clamp an unknown `max` to medium/high instead of
-        // off. Recreate with xhigh; never mutate the user's global default effort.
-        disposeQuietly(created.session);
-        created = await createSession(LEGACY_ULTRACODE_THINKING_LEVEL);
-        if (call.signal?.aborted) {
-          disposeQuietly(created.session);
-          throw abortedError();
+function makeChildModels(options: WorkflowAgentRunnerOptions, usesPiSessionFactory: boolean) {
+  const createRuntime =
+    options.createModelRuntime ??
+    (options.modelRuntime !== undefined || !usesPiSessionFactory
+      ? undefined
+      : createPiModelRuntime);
+  let pending: Fiber.Fiber<ModelRuntimeLike | undefined, AgentRunnerFailure> | undefined;
+  return ChildModels.of({
+    classifierRuntime: options.modelRuntime ?? options.modelRegistry,
+    get: (agentDir, signal) =>
+      Effect.suspend(() => {
+        if (options.modelRuntime) return Effect.succeed(options.modelRuntime);
+        if (!createRuntime) return Effect.succeed(undefined);
+        // The shared initialization belongs to this runner, not to any one call.
+        // Start/cache atomically; cancelled waiters only detach from this fiber.
+        if (!pending) {
+          const started = Effect.runFork(
+            // Publish the fiber before invoking the factory, so concurrent calls
+            // also share a synchronous factory failure.
+            Effect.yieldNow.pipe(
+              Effect.andThen(() =>
+                initializeModelRuntime(createRuntime, options.modelRegistry, agentDir),
+              ),
+            ),
+          );
+          pending = started;
+          started.addObserver((exit) => {
+            if (Exit.isFailure(exit) && pending === started) pending = undefined;
+          });
         }
-      }
-    } catch (error) {
-      safeEmitTelemetry(call.onTelemetry, {
-        kind: "run_error",
-        error: safeDisplayText(errorText(error), 512),
-        usage: emptyAgentUsage(),
-      });
-      throw error;
-    }
-    const { session } = created;
-    const actualModelId = session.model?.id ?? model?.id;
-    let actualEffort = session.thinkingLevel;
-    const telemetryCounters = { retries: 0, compactions: 0, turns: 0, toolUses: 0, observing: false };
+        return signal
+          ? Effect.raceFirst(Fiber.join(pending), waitForAbort(signal))
+          : Fiber.join(pending);
+      }),
+  });
+}
 
-    let removeAbort: (() => void) | undefined;
-    let unsubscribe: (() => void) | undefined;
-    let aborting: Promise<void> | undefined;
-    let hasPrimaryError = false;
-    try {
-      if (call.signal) {
-        const onAbort = () => {
-          // Attach the rejection handler synchronously so a failing abort can
-          // never become an unhandled rejection while prompt() is unwinding.
-          aborting = session.abort().catch(() => {});
-        };
-        call.signal.addEventListener("abort", onAbort, { once: true });
-        removeAbort = () => call.signal?.removeEventListener("abort", onAbort);
-        // AbortSignal does not replay an abort that happened before listener
-        // registration, so close the initialization race explicitly.
-        if (call.signal.aborted) {
-          onAbort();
-          await aborting;
-          throw abortedError();
-        }
-      }
+function initializeModelRuntime(
+  createRuntime: ModelRuntimeFactory,
+  registry: ModelRegistryLike | undefined,
+  agentDir: string,
+) {
+  return fromSdk(() =>
+    createRuntime({
+      authPath: path.join(agentDir, "auth.json"),
+      modelsPath: path.join(agentDir, "models.json"),
+      allowModelNetwork: false,
+    }),
+  ).pipe(
+    Effect.flatMap((runtime) => {
+      if (!runtime) return Effect.succeed(undefined);
+      const registerProviders = (providers: readonly string[]) =>
+        attempt(() =>
+          providers
+            .map((provider) => {
+              const nativeProvider = registry?.getRegisteredNativeProvider?.(provider);
+              if (nativeProvider !== undefined && runtime.registerNativeProvider) {
+                runtime.registerNativeProvider(nativeProvider);
+                return true;
+              }
+              const config = registry?.getRegisteredProviderConfig?.(provider);
+              if (config === undefined || !runtime.registerProvider) return false;
+              runtime.registerProvider(provider, config);
+              return true;
+            })
+            .some(Boolean),
+        ).pipe(
+          Effect.flatMap((changed) =>
+            changed && runtime.refresh
+              ? fromSdk(() => runtime.refresh!({ allowNetwork: false }))
+              : Effect.void,
+          ),
+        );
 
-      const prompt = this.buildPrompt(call, Boolean(call.schema));
-      const supportedEfforts = session.model ? session.getAvailableThinkingLevels() : [];
-      // Classifier-only runtime keys belong to the host, not the child runtime's
-      // chat-provider replay. An explicit SDK runtime remains authoritative.
-      const classifierRuntime = this.providedModelRuntime ?? this.modelRegistry ?? modelRuntime;
-      const selectionTask: JevSelection | undefined = session.model && supportedEfforts.length > 1
-        ? { runtime: classifierRuntime, task: prompt, model: session.model, supportedEfforts }
-        : undefined;
-      const effort = call.selectEffort
-        ? await call.selectEffort(selectionTask)
-        : selectionTask
-          ? (await selectJevEfforts({ ...selectionTask, tasks: [selectionTask], signal: call.signal }))[0]
-          : undefined;
-      if (call.signal?.aborted) throw abortedError();
-      if (effort !== undefined) session.setThinkingLevel(effort, { persist: false });
-      // Idle session preparation and classification never hold an execution slot.
-      // The runtime retains the permit through result publication/worktree delivery.
-      await call.acquireExecution?.();
-      if (call.signal?.aborted) throw abortedError();
-      actualEffort = session.thinkingLevel;
-      safeEmitTelemetry(call.onTelemetry, {
-        kind: "model_resolved",
-        modelId: actualModelId,
-        effort: actualEffort,
-      });
-
-      // One subscription feeds both compact status and the private transcript
-      // stream. Telemetry callbacks are isolated so observability can never
-      // change the child run's outcome.
-      if (call.onActivity || call.onTelemetry) {
-        telemetryCounters.observing = true;
-        unsubscribe = session.subscribe((event: unknown) => {
-          const sessionEvent = event as { type?: unknown; message?: { role?: unknown } };
-          const eventType = sessionEvent?.type;
-          if (eventType === "message_end" && sessionEvent.message?.role === "assistant") telemetryCounters.turns++;
-          if (eventType === "tool_execution_start") telemetryCounters.toolUses++;
-          if (eventType === "auto_retry_start") telemetryCounters.retries++;
-          if (eventType === "compaction_start") telemetryCounters.compactions++;
-          if (call.onActivity) forwardActivity(event, call.onActivity);
-          if (call.onTelemetry) forwardTelemetry(event, call.onTelemetry);
+      // Replay only runtime overrides. Stored/OAuth/env/model credentials remain
+      // owned by the isolated runtime so that Pi can refresh them itself.
+      const replayCredentials = (registeredProviderIds: readonly string[]) =>
+        Effect.suspend(() => {
+          if (
+            !runtime.setRuntimeApiKey ||
+            !registry?.getProviderAuthStatus ||
+            !registry.getApiKeyForProvider
+          )
+            return Effect.void;
+          const replayProvider = (provider: string) =>
+            attempt(() => registry.getProviderAuthStatus!(provider)).pipe(
+              Effect.flatMap((status) =>
+                status.source !== "runtime"
+                  ? Effect.void
+                  : fromSdk(() => registry.getApiKeyForProvider!(provider)).pipe(
+                      Effect.flatMap((apiKey) =>
+                        apiKey
+                          ? fromSdk(() => runtime.setRuntimeApiKey!(provider, apiKey))
+                          : Effect.void,
+                      ),
+                    ),
+              ),
+            );
+          return attempt(
+            () =>
+              new Set([
+                ...registry.getAvailable().map((model) => model.provider),
+                ...registeredProviderIds,
+              ]),
+          ).pipe(
+            Effect.flatMap((providers) =>
+              Effect.forEach(providers, replayProvider, { discard: true }),
+            ),
+          );
         });
-      }
 
-      // Observers can cancel synchronously; do not enter Pi's auth preflight afterward.
-      if (call.signal?.aborted) throw abortedError();
-      await session.prompt(prompt, {
-        // Pi invokes this after async input/before_agent_start preflight and
-        // immediately before _runAgentPrompt(). Throwing here closes the window
-        // where abort() sees an idle session and therefore cannot stop streaming.
-        preflightResult: () => {
-          if (call.signal?.aborted) throw abortedError();
-        },
-      });
-      if (call.signal?.aborted) {
-        await aborting;
-        throw abortedError();
-      }
+      return attempt(() => registry?.getRegisteredProviderIds?.() ?? []).pipe(
+        Effect.flatMap((providers) =>
+          registerProviders(providers).pipe(Effect.andThen(() => replayCredentials(providers))),
+        ),
+        Effect.as(runtime),
+      );
+    }),
+  );
+}
 
-      let value: unknown;
-      if (call.schema) {
-        if (!capture.called) throw new Error("Subagent finished without calling structured_output");
-        value = capture.value;
-      } else {
-        value = lastAssistantText(session.messages as unknown[]);
-      }
-
-      return {
-        value,
-        usage: readUsage(session, telemetryCounters),
-        modelId: actualModelId,
-        effort: actualEffort,
-        cwd: executionCwd,
+function waitForAbort(signal: AbortSignal) {
+  return Deferred.make<never, AgentRunnerFailure>().pipe(
+    Effect.flatMap((cancelled) => {
+      const onAbort = () => {
+        Effect.runSync(Deferred.fail(cancelled, failure(abortedError())));
       };
-    } catch (error) {
-      hasPrimaryError = true;
-      safeEmitTelemetry(call.onTelemetry, {
-        kind: "run_error",
-        error: safeDisplayText(errorText(error), 512),
-        usage: readUsage(session, telemetryCounters),
-        modelId: actualModelId,
-        effort: actualEffort,
-      });
-      throw error;
-    } finally {
-      let hasCleanupError = false;
-      let cleanupError: unknown;
-      const cleanup = (fn: (() => void) | undefined) => {
-        if (!fn) return;
-        try {
-          fn();
-        } catch (error) {
-          if (!hasCleanupError) {
-            hasCleanupError = true;
-            cleanupError = error;
-          }
+      return Effect.acquireRelease(
+        attempt(() => {
+          signal.addEventListener("abort", onAbort, { once: true });
+        }),
+        () => attempt(() => signal.removeEventListener("abort", onAbort)).pipe(Effect.ignore),
+      ).pipe(
+        Effect.andThen(() => {
+          if (signal.aborted) onAbort();
+          return Deferred.await(cancelled);
+        }),
+      );
+    }),
+    Effect.scoped,
+  );
+}
+
+const checkAborted = (signal?: AbortSignal) =>
+  Effect.suspend(() => (signal?.aborted ? Effect.fail(failure(abortedError())) : Effect.void));
+
+type Cleanup = (effect: Effect.Effect<unknown, AgentRunnerFailure>) => Effect.Effect<void>;
+
+/** Finalizers finish independently; only a successful body exposes the first cleanup failure. */
+function withCleanup<A, R>(use: (cleanup: Cleanup) => Effect.Effect<A, AgentRunnerFailure, R>) {
+  return Effect.suspend(() => {
+    let firstFailure: AgentRunnerFailure | undefined;
+    const cleanup = (effect: Effect.Effect<unknown, AgentRunnerFailure>) =>
+      effect.pipe(
+        Effect.asVoid,
+        Effect.catch((error) =>
+          Effect.sync(() => {
+            firstFailure ??= error;
+          }),
+        ),
+      );
+    return Effect.exit(use(cleanup)).pipe(
+      Effect.flatMap((result) => {
+        if (Exit.isFailure(result)) return Effect.failCause(result.cause);
+        return firstFailure ? Effect.fail(firstFailure) : Effect.succeed(result.value);
+      }),
+    );
+  });
+}
+
+function reportFailure<A, R>(
+  effect: Effect.Effect<A, AgentRunnerFailure, R>,
+  call: AgentRunCall,
+  details: () => Omit<Extract<AgentTelemetryEvent, { kind: "run_error" }>, "kind" | "error">,
+) {
+  return effect.pipe(
+    Effect.tapError((error) =>
+      Effect.sync(() =>
+        safeEmitTelemetry(call.onTelemetry, {
+          kind: "run_error",
+          error: safeDisplayText(errorText(error.cause), 512),
+          ...details(),
+        }),
+      ),
+    ),
+  );
+}
+
+function runAgent(
+  call: AgentRunCall,
+  options: WorkflowAgentRunnerOptions,
+  usesPiSessionFactory: boolean,
+  supportsMaxThinking: boolean,
+) {
+  return checkAborted(call.signal).pipe(
+    Effect.andThen(() => {
+      const executionCwd = call.cwd ?? options.cwd;
+      const capture: StructuredOutputCapture<unknown> = { called: false, value: undefined };
+      const prepare = attempt(() => {
+        const customTools: ToolDefinition[] = [...createCodingTools(executionCwd)];
+        const tools = call.agentTypeDef?.tools ? [...call.agentTypeDef.tools] : undefined;
+        if (call.schema) {
+          customTools.push(
+            createStructuredOutputTool({
+              schema: jsonSchemaToTypeBox(call.schema),
+              capture,
+            }) as unknown as ToolDefinition,
+          );
+          tools?.push("structured_output");
         }
-      };
-      cleanup(removeAbort);
-      // If cancellation started while prompt() was failing, let AgentSession
-      // finish abort teardown before disposing resources underneath it.
-      await aborting;
-      cleanup(unsubscribe);
-      cleanup(() => session.dispose());
-      // Cleanup must always run to completion. Its first failure is surfaced only
-      // when there is no prompt/abort failure (including reject(undefined)).
-      if (!hasPrimaryError && hasCleanupError) throw cleanupError;
-    }
-  }
+        return {
+          customTools,
+          tools,
+          agentDir: getAgentDir(),
+          selection: resolveModelSelection({
+            pattern: call.modelPattern,
+            roleModel: call.agentTypeDef?.model,
+            roleThinking: call.agentTypeDef?.thinking,
+            defaultModel: options.model,
+            defaultThinking: options.thinkingLevel,
+            models: options.modelRegistry?.getAvailable(),
+          }),
+        };
+      });
+      return prepare.pipe(
+        Effect.flatMap((prepared) => {
+          const runWithModels = (models: typeof ChildModels.Service) => {
+            const runWithModel = ({
+              modelRuntime,
+              model,
+            }: {
+              modelRuntime: ModelRuntimeLike | undefined;
+              model: ModelLike | undefined;
+            }) => {
+              const thinkingLevel = prepared.selection.thinkingLevel;
+              const sessionThinking = resolveSessionThinkingLevel(thinkingLevel, model);
+              safeEmitTelemetry(call.onTelemetry, {
+                kind: "model_requested",
+                modelId: model?.id,
+                effort: thinkingLevel,
+              });
+              return AgentSessions.pipe(
+                Effect.flatMap((sessions) => {
+                  const create = (level: ThinkingLevel | undefined) =>
+                    attempt(() =>
+                      SettingsManager.create(options.cwd, prepared.agentDir, {
+                        projectTrusted: options.projectTrusted ?? false,
+                      }),
+                    ).pipe(
+                      Effect.flatMap((settingsManager) => {
+                        const resources: Effect.Effect<
+                          DefaultResourceLoader | undefined,
+                          AgentRunnerFailure
+                        > = usesPiSessionFactory
+                          ? loadChildResources({
+                              cwd: options.cwd,
+                              agentDir: prepared.agentDir,
+                              projectTrusted: options.projectTrusted,
+                              settingsManager,
+                            })
+                          : Effect.succeed(undefined);
+                        return resources.pipe(
+                          Effect.flatMap((resourceLoader) =>
+                            attempt((): AgentSessionCreateOptions => ({
+                              cwd: executionCwd,
+                              agentDir: prepared.agentDir,
+                              sessionManager: SessionManager.inMemory(executionCwd),
+                              settingsManager,
+                              ...(resourceLoader ? { resourceLoader } : {}),
+                              customTools: prepared.customTools,
+                              excludeTools: [...CHILD_ORCHESTRATION_TOOLS],
+                              ...(model ? { model } : {}),
+                              ...(level ? { thinkingLevel: level } : {}),
+                              ...(prepared.tools ? { tools: prepared.tools } : {}),
+                              ...(modelRuntime
+                                ? { modelRuntime }
+                                : options.modelRegistry
+                                  ? { modelRegistry: options.modelRegistry }
+                                  : {}),
+                            })),
+                          ),
+                          Effect.flatMap((input) => sessions.create(input)),
+                        );
+                      }),
+                    );
 
-  private buildPrompt(call: AgentRunCall, structured: boolean): string {
-    const role = call.agentTypeDef;
-    const parts: Array<string | undefined> = [];
-    if (role?.systemPrompt) {
-      const header = role.systemPromptMode === "replace" ? `Role (operate strictly as):` : `Role:`;
-      parts.push(`${header}\n${role.systemPrompt}`);
-    }
-    parts.push(call.instructions);
-    parts.push(call.label ? `Task label: ${call.label}` : undefined);
-    parts.push(call.prompt);
-    if (structured) {
-      parts.push(
-        [
+                  const runSession = (level: ThinkingLevel | undefined, allowFallback: boolean) =>
+                    withCleanup((cleanup) => {
+                      let provisional = false;
+                      const acquire = Effect.acquireRelease(create(level), (session) => {
+                        const dispose = attempt(() => session.dispose());
+                        return provisional ? dispose.pipe(Effect.ignore) : cleanup(dispose);
+                      });
+                      const useSession = (session: AgentSessionLike) => {
+                        // Ownership is established before reading any SDK capability getters.
+                        const fallback = checkAborted(call.signal).pipe(
+                          Effect.andThen(() =>
+                            attempt(
+                              () =>
+                                allowFallback &&
+                                thinkingLevel === ULTRACODE_THINKING_LEVEL &&
+                                sessionThinking === ULTRACODE_THINKING_LEVEL &&
+                                session.thinkingLevel !== ULTRACODE_THINKING_LEVEL &&
+                                session.supportsThinking() &&
+                                (!supportsMaxThinking ||
+                                  (model ?? session.model)?.thinkingLevelMap?.max != null),
+                            ),
+                          ),
+                        );
+                        return reportFailure(fallback, call, () => ({
+                          usage: emptyAgentUsage(),
+                        })).pipe(
+                          Effect.flatMap((fallback) => {
+                            if (fallback) {
+                              provisional = true;
+                              return Effect.succeed(undefined);
+                            }
+                            return executeSession(
+                              session,
+                              call,
+                              capture,
+                              model,
+                              models.classifierRuntime ?? modelRuntime,
+                              executionCwd,
+                              cleanup,
+                            );
+                          }),
+                        );
+                      };
+                      return reportFailure(acquire, call, () => ({
+                        usage: emptyAgentUsage(),
+                      })).pipe(Effect.flatMap(useSession), Effect.scoped);
+                    });
+
+                  return runSession(sessionThinking, true).pipe(
+                    // The provisional scope closes before the compatibility replacement is acquired.
+                    Effect.flatMap((result) =>
+                      result
+                        ? Effect.succeed(result)
+                        : runSession(LEGACY_ULTRACODE_THINKING_LEVEL, false).pipe(
+                            Effect.map((replacement) => replacement!),
+                          ),
+                    ),
+                  );
+                }),
+              );
+            };
+            const resolveModel = models.get(prepared.agentDir, call.signal).pipe(
+              Effect.flatMap((modelRuntime) =>
+                checkAborted(call.signal).pipe(
+                  Effect.andThen(() =>
+                    attempt(() =>
+                      prepared.selection.model && modelRuntime?.getModel
+                        ? (modelRuntime.getModel(
+                            prepared.selection.model.provider,
+                            prepared.selection.model.id,
+                          ) ?? prepared.selection.model)
+                        : prepared.selection.model,
+                    ),
+                  ),
+                  Effect.map((model) => ({ modelRuntime, model })),
+                ),
+              ),
+            );
+
+            return reportFailure(resolveModel, call, () => ({ usage: emptyAgentUsage() })).pipe(
+              Effect.flatMap(runWithModel),
+            );
+          };
+          return ChildModels.pipe(Effect.flatMap(runWithModels));
+        }),
+      );
+    }),
+  );
+}
+
+function listenForCancellation(
+  session: AgentSessionLike,
+  signal: AbortSignal | undefined,
+  cleanup: Cleanup,
+) {
+  return Effect.suspend(() => {
+    if (!signal) return Effect.succeed(Effect.void);
+    let aborting: Fiber.Fiber<void> | undefined;
+    const drain = Effect.suspend(() => (aborting ? Fiber.join(aborting) : Effect.void));
+    const onAbort = () => {
+      // AbortSignal invokes callbacks synchronously. Start Effect's Promise adapter
+      // here so synchronous throws and rejected abort promises are both contained.
+      aborting ??= Effect.runFork(fromSdk(() => session.abort()).pipe(Effect.ignore));
+    };
+    return Effect.acquireRelease(Effect.succeed(onAbort), (listener) =>
+      cleanup(attempt(() => signal.removeEventListener("abort", listener))).pipe(
+        Effect.andThen(drain),
+      ),
+    ).pipe(
+      // Establish cleanup before registration, including partially failed setup.
+      Effect.andThen(() =>
+        attempt(() => signal.addEventListener("abort", onAbort, { once: true })),
+      ),
+      Effect.andThen(() => {
+        if (!signal.aborted) return Effect.void;
+        onAbort();
+        return drain;
+      }),
+      Effect.andThen(checkAborted(signal)),
+      Effect.as(drain),
+    );
+  });
+}
+
+function executeSession(
+  session: AgentSessionLike,
+  call: AgentRunCall,
+  capture: StructuredOutputCapture<unknown>,
+  requestedModel: ModelLike | undefined,
+  classifierRuntime: Partial<JevRuntime> | undefined,
+  executionCwd: string,
+  cleanup: Cleanup,
+) {
+  return attempt(() => session.model?.id ?? requestedModel?.id).pipe(
+    Effect.flatMap((actualModelId) =>
+      attempt(() => session.thinkingLevel).pipe(
+        Effect.flatMap((initialEffort) => {
+          let actualEffort = initialEffort;
+          const counters = { retries: 0, compactions: 0, turns: 0, toolUses: 0, observing: false };
+          const selectEffort = (prompt: string) =>
+            attempt((): JevSelection | undefined => {
+              const supportedEfforts = session.model ? session.getAvailableThinkingLevels() : [];
+              return session.model && supportedEfforts.length > 1
+                ? {
+                    runtime: classifierRuntime,
+                    task: prompt,
+                    model: session.model,
+                    supportedEfforts,
+                  }
+                : undefined;
+            }).pipe(
+              Effect.flatMap((selectionTask) =>
+                call.selectEffort
+                  ? fromSdk(() => call.selectEffort!(selectionTask))
+                  : selectionTask
+                    ? fromSdk(() =>
+                        selectJevEfforts({
+                          ...selectionTask,
+                          tasks: [selectionTask],
+                          signal: call.signal,
+                        }),
+                      ).pipe(Effect.map((efforts) => efforts[0]))
+                    : Effect.succeed(undefined),
+              ),
+              Effect.flatMap((effort) =>
+                checkAborted(call.signal).pipe(
+                  Effect.andThen(() =>
+                    effort !== undefined
+                      ? attempt(() => session.setThinkingLevel(effort, { persist: false }))
+                      : Effect.void,
+                  ),
+                ),
+              ),
+            );
+          const acquireExecution = Effect.suspend(() =>
+            // The runtime owns and releases this permit after publication/worktree delivery.
+            // Await even an in-flight admission on cancellation; never orphan its acquisition.
+            call.acquireExecution ? fromSdk(() => call.acquireExecution!()) : Effect.void,
+          ).pipe(
+            Effect.andThen(checkAborted(call.signal)),
+            Effect.andThen(() => attempt(() => session.thinkingLevel)),
+            Effect.map((effort) => {
+              actualEffort = effort;
+              safeEmitTelemetry(call.onTelemetry, {
+                kind: "model_resolved",
+                modelId: actualModelId,
+                effort: actualEffort,
+              });
+            }),
+          );
+          const subscribe = Effect.suspend(() => {
+            if (!call.onActivity && !call.onTelemetry) return Effect.void;
+            counters.observing = true;
+            return Effect.acquireRelease(
+              attempt(() =>
+                session.subscribe((event: unknown) => {
+                  const sessionEvent = event as { type?: unknown; message?: { role?: unknown } };
+                  const type = sessionEvent?.type;
+                  if (type === "message_end" && sessionEvent.message?.role === "assistant")
+                    counters.turns++;
+                  if (type === "tool_execution_start") counters.toolUses++;
+                  if (type === "auto_retry_start") counters.retries++;
+                  if (type === "compaction_start") counters.compactions++;
+                  if (call.onActivity) forwardActivity(event, call.onActivity);
+                  if (call.onTelemetry) forwardTelemetry(event, call.onTelemetry);
+                }),
+              ),
+              (unsubscribe) => cleanup(attempt(unsubscribe)),
+            ).pipe(Effect.asVoid);
+          });
+          const promptSession = (prompt: string, drainAbort: Effect.Effect<void>) =>
+            checkAborted(call.signal).pipe(
+              // Do not pass call.signal to runPromise: interrupting tryPromise would detach
+              // from Pi's external prompt. Cancellation calls abort(), then joins BOTH SDK
+              // operations before closing scopes, including asynchronous input preflight.
+              Effect.andThen(
+                fromSdk(() =>
+                  session.prompt(prompt, {
+                    preflightResult: () => {
+                      if (call.signal?.aborted) throw abortedError();
+                    },
+                  }),
+                ).pipe(Effect.uninterruptible),
+              ),
+              // Successful prompt completion can precede abort teardown and its last
+              // usage events. Drain first so cancellation telemetry includes them.
+              Effect.andThen(() => (call.signal?.aborted ? drainAbort : Effect.void)),
+              Effect.andThen(checkAborted(call.signal)),
+              Effect.andThen(() =>
+                attempt(() => {
+                  if (!call.schema) return lastAssistantText(session.messages);
+                  if (!capture.called)
+                    throw new Error("Subagent finished without calling structured_output");
+                  return capture.value;
+                }),
+              ),
+              Effect.map((value) => ({
+                value,
+                usage: readUsage(session, counters),
+                modelId: actualModelId,
+                effort: actualEffort,
+                cwd: executionCwd,
+              })),
+            );
+
+          // The abort listener scope is inner: remove it and drain abort() before
+          // releasing the event subscription, then let the outer session scope dispose.
+          return Effect.scopedWith((subscriptionScope) =>
+            reportFailure(
+              listenForCancellation(session, call.signal, cleanup).pipe(
+                Effect.flatMap((drainAbort) => {
+                  const prompt = buildPrompt(call, Boolean(call.schema));
+                  return selectEffort(prompt).pipe(
+                    Effect.andThen(acquireExecution),
+                    Effect.andThen(
+                      subscribe.pipe(Effect.provideService(Scope.Scope, subscriptionScope)),
+                    ),
+                    Effect.andThen(() => promptSession(prompt, drainAbort)),
+                  );
+                }),
+              ),
+              call,
+              () => ({
+                usage: readUsage(session, counters),
+                modelId: actualModelId,
+                effort: actualEffort,
+              }),
+            ).pipe(Effect.scoped),
+          );
+        }),
+      ),
+    ),
+  );
+}
+
+function buildPrompt(call: AgentRunCall, structured: boolean): string {
+  const role = call.agentTypeDef;
+  return [
+    role?.systemPrompt
+      ? `${role.systemPromptMode === "replace" ? "Role (operate strictly as):" : "Role:"}\n${role.systemPrompt}`
+      : undefined,
+    call.instructions,
+    call.label ? `Task label: ${call.label}` : undefined,
+    call.prompt,
+    structured
+      ? [
           "Final output contract:",
           "- Your final action MUST be a structured_output tool call.",
           "- The structured_output arguments are the return value of this subagent.",
           "- Do not emit a prose final answer instead of structured_output.",
-        ].join("\n"),
-      );
-    }
-    return parts.filter(Boolean).join("\n\n");
-  }
-
-  private getModelRuntime(agentDir: string): Promise<ModelRuntimeLike | undefined> {
-    if (this.providedModelRuntime) return Promise.resolve(this.providedModelRuntime);
-    if (!this.createModelRuntime) return Promise.resolve(undefined);
-    if (!this.modelRuntimePromise) {
-      // Cache the in-flight promise so parallel agent() calls never initialize
-      // separate runtimes or race provider/auth replay. Clear only this failed
-      // attempt so a later serial agent can retry transient initialization errors.
-      const pending = this.initializeModelRuntime(agentDir);
-      this.modelRuntimePromise = pending;
-      void pending.catch(() => {
-        if (this.modelRuntimePromise === pending) this.modelRuntimePromise = undefined;
-      });
-    }
-    return this.modelRuntimePromise;
-  }
-
-  private async initializeModelRuntime(agentDir: string): Promise<ModelRuntimeLike | undefined> {
-    const runtime = await this.createModelRuntime?.({
-      authPath: path.join(agentDir, "auth.json"),
-      modelsPath: path.join(agentDir, "models.json"),
-      allowModelNetwork: false,
-    });
-    if (!runtime) return undefined;
-
-    const registeredProviderIds = this.modelRegistry?.getRegisteredProviderIds?.() ?? [];
-    let providersChanged = false;
-    for (const provider of registeredProviderIds) {
-      const nativeProvider = this.modelRegistry?.getRegisteredNativeProvider?.(provider);
-      if (nativeProvider !== undefined && runtime.registerNativeProvider) {
-        runtime.registerNativeProvider(nativeProvider);
-        providersChanged = true;
-        continue;
-      }
-
-      const config = this.modelRegistry?.getRegisteredProviderConfig?.(provider);
-      if (config === undefined || !runtime.registerProvider) continue;
-      runtime.registerProvider(provider, config);
-      providersChanged = true;
-    }
-    if (providersChanged && runtime.refresh) {
-      await runtime.refresh({ allowNetwork: false });
-    }
-
-    // Only replay CLI/SDK runtime overrides. Stored credentials, OAuth, env,
-    // and models.json auth must stay owned by the new runtime so they can refresh.
-    if (
-      runtime.setRuntimeApiKey
-      && this.modelRegistry?.getProviderAuthStatus
-      && this.modelRegistry.getApiKeyForProvider
-    ) {
-      const providers = new Set(this.modelRegistry.getAvailable().map((model) => model.provider));
-      for (const provider of registeredProviderIds) providers.add(provider);
-      for (const provider of providers) {
-        if (this.modelRegistry.getProviderAuthStatus(provider).source !== "runtime") continue;
-        const apiKey = await this.modelRegistry.getApiKeyForProvider(provider);
-        if (apiKey) await runtime.setRuntimeApiKey(provider, apiKey);
-      }
-    }
-
-    return runtime;
-  }
-
-  private resolveModel(
-    pattern: string | undefined,
-    role: AgentTypeDef | undefined,
-  ): { model?: ModelLike; thinkingLevel?: ThinkingLevel } {
-    return resolveModelSelection({
-      pattern,
-      roleModel: role?.model,
-      roleThinking: role?.thinking,
-      defaultModel: this.defaultModel,
-      defaultThinking: this.defaultThinking,
-      models: this.modelRegistry?.getAvailable(),
-    });
-  }
+        ].join("\n")
+      : undefined,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 interface ModelRuntimeConstructorLike {
@@ -692,13 +978,15 @@ interface ModelRuntimeConstructorLike {
 }
 
 /** Capability detection avoids importing a named export that Pi 0.80.7 lacks. */
-async function createPiModelRuntime(
+function createPiModelRuntime(
   options: ModelRuntimeCreateOptions,
 ): Promise<ModelRuntimeLike | undefined> {
-  const runtimeClass = (PiCodingAgent as unknown as {
-    ModelRuntime?: ModelRuntimeConstructorLike;
-  }).ModelRuntime;
-  return runtimeClass?.create ? runtimeClass.create(options) : undefined;
+  const runtimeClass = (
+    PiCodingAgent as unknown as {
+      ModelRuntime?: ModelRuntimeConstructorLike;
+    }
+  ).ModelRuntime;
+  return runtimeClass?.create ? runtimeClass.create(options) : Promise.resolve(undefined);
 }
 
 export function splitThinkingSuffix(pattern: string): { base: string; thinking?: ThinkingLevel } {
@@ -730,12 +1018,15 @@ export function resolveSessionThinkingLevel(
     : ULTRACODE_THINKING_LEVEL;
 }
 
-function matchExactModelIn(models: ModelLike[] | undefined, pattern: string): ModelLike | undefined {
+function matchExactModelIn(
+  models: ModelLike[] | undefined,
+  pattern: string,
+): ModelLike | undefined {
   if (!models || !pattern.trim()) return undefined;
   const trimmed = pattern.trim();
   const lower = trimmed.toLowerCase();
-  const canonicalMatches = models.filter((model) =>
-    `${model.provider}/${model.id}`.toLowerCase() === lower
+  const canonicalMatches = models.filter(
+    (model) => `${model.provider}/${model.id}`.toLowerCase() === lower,
   );
   if (canonicalMatches.length === 1) return canonicalMatches[0];
   if (canonicalMatches.length > 1) throw ambiguousModelReferenceError(trimmed, canonicalMatches);
@@ -756,7 +1047,10 @@ function ambiguousModelReferenceError(pattern: string, matches: ModelLike[]): Er
 }
 
 /** Match a model pattern against a registry list: exact provider/id, then exact id, then substring. */
-export function matchModelIn(models: ModelLike[] | undefined, pattern: string): ModelLike | undefined {
+export function matchModelIn(
+  models: ModelLike[] | undefined,
+  pattern: string,
+): ModelLike | undefined {
   if (!models) return undefined;
   // An empty pattern must never match: "any-id".includes("") === true would
   // otherwise silently return the FIRST registered model.
@@ -796,50 +1090,19 @@ export function resolveModelSelection(args: {
   }
   // A literal model id wins before suffix parsing, so ids/tags such as
   // `ollama/coder:max` remain addressable. Parse :level only without an exact hit.
-  const exactModel = matchExactModelIn(models, effectivePattern)
-    ?? matchExactModelIn(defaultModel ? [defaultModel] : undefined, effectivePattern);
+  const exactModel =
+    matchExactModelIn(models, effectivePattern) ??
+    matchExactModelIn(defaultModel ? [defaultModel] : undefined, effectivePattern);
   if (exactModel) {
     return { model: exactModel, thinkingLevel: roleThinking ?? defaultThinking };
   }
   const { base, thinking } = splitThinkingSuffix(effectivePattern);
-  const model = base ? matchModelIn(models, base) ?? defaultModel : defaultModel;
+  const model = base ? (matchModelIn(models, base) ?? defaultModel) : defaultModel;
   return { model, thinkingLevel: thinking ?? roleThinking ?? defaultThinking };
-}
-
-function waitForSharedInitialization<T>(
-  pending: Promise<T>,
-  signal: AbortSignal | undefined,
-): Promise<T> {
-  if (!signal) return pending;
-  if (signal.aborted) return Promise.reject(abortedError());
-
-  return new Promise<T>((resolve, reject) => {
-    let settled = false;
-    const finish = (callback: () => void) => {
-      if (settled) return;
-      settled = true;
-      signal.removeEventListener("abort", onAbort);
-      callback();
-    };
-    const onAbort = () => finish(() => reject(abortedError()));
-    signal.addEventListener("abort", onAbort, { once: true });
-    pending.then(
-      (value) => finish(() => resolve(value)),
-      (error) => finish(() => reject(error)),
-    );
-  });
 }
 
 function abortedError(): Error {
   return new Error("Subagent was aborted");
-}
-
-function disposeQuietly(session: { dispose(): void }): void {
-  try {
-    session.dispose();
-  } catch {
-    // A failed provisional-session cleanup must not block compatibility fallback.
-  }
 }
 
 function emptyAgentUsage(): AgentUsage {
@@ -866,11 +1129,8 @@ function safeEmitTelemetry(
   event: AgentTelemetryEvent,
 ): void {
   if (!listener) return;
-  try {
-    listener(event);
-  } catch {
-    // Detailed observability is best-effort and must never affect execution.
-  }
+  // Detailed observability is best-effort and must never affect execution.
+  Effect.runSync(attempt(() => listener(event)).pipe(Effect.ignore));
 }
 
 function normalizeTurnUsage(value: unknown): AgentTurnUsage | undefined {
@@ -921,7 +1181,11 @@ function toolResultPreview(result: unknown): string | undefined {
   const raw = resultText(result);
   if (!raw.trim()) return undefined;
   const safe = safeTranscriptText(raw, 64 * 1024);
-  const lines = safe.split(/\r?\n/).filter((line) => line.trim()).slice(-20).join("\n");
+  const lines = safe
+    .split(/\r?\n/)
+    .filter((line) => line.trim())
+    .slice(-20)
+    .join("\n");
   const bounded = tailByUtf8Bytes(lines, 8 * 1024);
   return bounded.trim() || undefined;
 }
@@ -931,96 +1195,110 @@ export function forwardTelemetry(
   event: unknown,
   onTelemetry: (event: AgentTelemetryEvent) => void,
 ): void {
-  try {
-    const e = event as any;
-    switch (e?.type) {
-      case "turn_start":
-        safeEmitTelemetry(onTelemetry, {
-          kind: "turn_start",
-          turnIndex: finiteNumber(e.turnIndex),
-        });
-        return;
-      case "message_update": {
-        const update = e.assistantMessageEvent;
-        if (update?.type === "text_delta" && typeof update.delta === "string") {
-          safeEmitTelemetry(onTelemetry, { kind: "text_delta", delta: update.delta });
-        } else if (update?.type === "thinking_start") {
-          safeEmitTelemetry(onTelemetry, { kind: "thinking_start" });
-        } else if (update?.type === "thinking_end") {
-          safeEmitTelemetry(onTelemetry, { kind: "thinking_end" });
-        }
-        return;
-      }
-      case "message_end":
-        if (e.message?.role === "assistant") {
+  Effect.runSync(
+    attempt(() => {
+      const e = event as any;
+      switch (e?.type) {
+        case "turn_start":
           safeEmitTelemetry(onTelemetry, {
-            kind: "message_end",
-            text: assistantText(e.message),
-            usage: normalizeTurnUsage(e.message.usage),
-            error: typeof e.message.errorMessage === "string" ? e.message.errorMessage : undefined,
+            kind: "turn_start",
+            turnIndex: finiteNumber(e.turnIndex),
           });
+          return;
+        case "message_update": {
+          const update = e.assistantMessageEvent;
+          if (update?.type === "text_delta" && typeof update.delta === "string") {
+            safeEmitTelemetry(onTelemetry, { kind: "text_delta", delta: update.delta });
+          } else if (update?.type === "thinking_start") {
+            safeEmitTelemetry(onTelemetry, { kind: "thinking_start" });
+          } else if (update?.type === "thinking_end") {
+            safeEmitTelemetry(onTelemetry, { kind: "thinking_end" });
+          }
+          return;
         }
-        return;
-      case "tool_execution_start":
-        if (typeof e.toolName === "string") {
-          const args = toolArgsPreview(e.toolName, e.args);
+        case "message_end":
+          if (e.message?.role === "assistant") {
+            safeEmitTelemetry(onTelemetry, {
+              kind: "message_end",
+              text: assistantText(e.message),
+              usage: normalizeTurnUsage(e.message.usage),
+              error:
+                typeof e.message.errorMessage === "string" ? e.message.errorMessage : undefined,
+            });
+          }
+          return;
+        case "tool_execution_start":
+          if (typeof e.toolName === "string") {
+            const args = toolArgsPreview(e.toolName, e.args);
+            safeEmitTelemetry(onTelemetry, {
+              kind: "tool_start",
+              toolCallId: typeof e.toolCallId === "string" ? e.toolCallId : `${e.toolName}:unknown`,
+              toolName: e.toolName,
+              ...(args ? { toolArgs: args } : {}),
+            });
+          }
+          return;
+        case "tool_execution_end":
           safeEmitTelemetry(onTelemetry, {
-            kind: "tool_start",
-            toolCallId: typeof e.toolCallId === "string" ? e.toolCallId : `${e.toolName}:unknown`,
-            toolName: e.toolName,
-            ...(args ? { toolArgs: args } : {}),
+            kind: "tool_end",
+            toolCallId:
+              typeof e.toolCallId === "string"
+                ? e.toolCallId
+                : `${String(e.toolName ?? "tool")}:unknown`,
+            toolName: typeof e.toolName === "string" ? e.toolName : "tool",
+            isError: Boolean(e.isError),
+            resultPreview: toolResultPreview(e.result),
           });
+          return;
+        case "auto_retry_start": {
+          const attempt = finiteNumber(e.attempt) ?? 0;
+          const maxAttempts = finiteNumber(e.maxAttempts) ?? 0;
+          const reason =
+            typeof e.errorMessage === "string" ? safeDisplayText(e.errorMessage, 160) : "";
+          safeEmitTelemetry(onTelemetry, {
+            kind: "retry",
+            state: "start",
+            detail: `retry ${attempt}/${maxAttempts} in ${formatDelay(finiteNumber(e.delayMs) ?? 0)}${reason ? `: ${reason}` : ""}`,
+          });
+          return;
         }
-        return;
-      case "tool_execution_end":
-        safeEmitTelemetry(onTelemetry, {
-          kind: "tool_end",
-          toolCallId: typeof e.toolCallId === "string" ? e.toolCallId : `${String(e.toolName ?? "tool")}:unknown`,
-          toolName: typeof e.toolName === "string" ? e.toolName : "tool",
-          isError: Boolean(e.isError),
-          resultPreview: toolResultPreview(e.result),
-        });
-        return;
-      case "auto_retry_start": {
-        const attempt = finiteNumber(e.attempt) ?? 0;
-        const maxAttempts = finiteNumber(e.maxAttempts) ?? 0;
-        const reason = typeof e.errorMessage === "string" ? safeDisplayText(e.errorMessage, 160) : "";
-        safeEmitTelemetry(onTelemetry, {
-          kind: "retry",
-          state: "start",
-          detail: `retry ${attempt}/${maxAttempts} in ${formatDelay(finiteNumber(e.delayMs) ?? 0)}${reason ? `: ${reason}` : ""}`,
-        });
-        return;
+        case "auto_retry_end": {
+          const failure =
+            typeof e.finalError === "string" ? safeDisplayText(e.finalError, 180) : "";
+          safeEmitTelemetry(onTelemetry, {
+            kind: "retry",
+            state: "end",
+            detail: e.success
+              ? "retry succeeded"
+              : failure
+                ? `retry failed: ${failure}`
+                : "retry failed",
+          });
+          return;
+        }
+        case "compaction_start":
+          safeEmitTelemetry(onTelemetry, {
+            kind: "compaction",
+            state: "start",
+            detail: compactionStartDetail(e.reason),
+          });
+          return;
+        case "compaction_end":
+          safeEmitTelemetry(onTelemetry, {
+            kind: "compaction",
+            state: "end",
+            detail: e.aborted
+              ? "compaction aborted"
+              : e.errorMessage
+                ? "compaction failed"
+                : "compaction complete",
+          });
+          return;
+        default:
+          return;
       }
-      case "auto_retry_end": {
-        const failure = typeof e.finalError === "string" ? safeDisplayText(e.finalError, 180) : "";
-        safeEmitTelemetry(onTelemetry, {
-          kind: "retry",
-          state: "end",
-          detail: e.success ? "retry succeeded" : failure ? `retry failed: ${failure}` : "retry failed",
-        });
-        return;
-      }
-      case "compaction_start":
-        safeEmitTelemetry(onTelemetry, {
-          kind: "compaction",
-          state: "start",
-          detail: compactionStartDetail(e.reason),
-        });
-        return;
-      case "compaction_end":
-        safeEmitTelemetry(onTelemetry, {
-          kind: "compaction",
-          state: "end",
-          detail: e.aborted ? "compaction aborted" : e.errorMessage ? "compaction failed" : "compaction complete",
-        });
-        return;
-      default:
-        return;
-    }
-  } catch {
-    // best-effort: malformed provider events must not affect the run
-  }
+    }).pipe(Effect.ignore),
+  );
 }
 
 function readUsage(
@@ -1033,7 +1311,7 @@ function readUsage(
     observing?: boolean;
   } = {},
 ): AgentUsage {
-  try {
+  const statsUsage = Result.try(() => {
     const stats = session.getSessionStats?.();
     if (stats?.tokens) {
       return {
@@ -1043,15 +1321,14 @@ function readUsage(
         cacheWriteTokens: stats.tokens.cacheWrite ?? 0,
         totalTokens: (stats.tokens.input ?? 0) + (stats.tokens.output ?? 0),
         cost: stats.cost ?? 0,
-        turns: counters.observing ? counters.turns ?? 0 : stats.assistantMessages ?? 0,
-        toolUses: counters.observing ? counters.toolUses ?? 0 : stats.toolCalls ?? 0,
+        turns: counters.observing ? (counters.turns ?? 0) : (stats.assistantMessages ?? 0),
+        toolUses: counters.observing ? (counters.toolUses ?? 0) : (stats.toolCalls ?? 0),
         retries: counters.retries ?? 0,
         compactions: counters.compactions ?? 0,
       };
     }
-  } catch {
-    // fall through to message-based estimate
-  }
+  }).pipe(Result.getOrElse(() => undefined));
+  if (statsUsage) return statsUsage;
   // Fallback: sum assistant usage from messages.
   const usage = emptyAgentUsage();
   for (const message of (session.messages ?? []) as Array<any>) {
@@ -1093,117 +1370,119 @@ function lastAssistantText(messages: unknown[]): string {
  * Defensive: activity forwarding must never break the subagent run.
  */
 export function forwardActivity(event: unknown, onActivity: (e: AgentActivityInput) => void): void {
-  try {
-    const e = event as any;
-    switch (e?.type) {
-      case "agent_start":
-        onActivity({ kind: "waiting", detail: "starting agent" });
-        return;
-      case "turn_start":
-        // Pi emits this immediately before authentication/request setup and then
-        // waits for the provider's first stream event.
-        onActivity({ kind: "waiting", detail: "waiting for model" });
-        return;
-      case "message_start":
-        if (e.message?.role === "assistant") {
-          onActivity({ kind: "waiting", detail: "model stream opened" });
-        }
-        return;
-      case "message_update":
-        forwardMessageActivity(e.assistantMessageEvent, onActivity);
-        return;
-      case "message_end":
-        if (e.message?.role === "assistant") {
-          const error = compactText(e.message.errorMessage, 100);
+  Effect.runSync(
+    attempt(() => {
+      const e = event as any;
+      switch (e?.type) {
+        case "agent_start":
+          onActivity({ kind: "waiting", detail: "starting agent" });
+          return;
+        case "turn_start":
+          // Pi emits this immediately before authentication/request setup and then
+          // waits for the provider's first stream event.
+          onActivity({ kind: "waiting", detail: "waiting for model" });
+          return;
+        case "message_start":
+          if (e.message?.role === "assistant") {
+            onActivity({ kind: "waiting", detail: "model stream opened" });
+          }
+          return;
+        case "message_update":
+          forwardMessageActivity(e.assistantMessageEvent, onActivity);
+          return;
+        case "message_end":
+          if (e.message?.role === "assistant") {
+            const error = compactText(e.message.errorMessage, 100);
+            onActivity({
+              kind: "waiting",
+              detail: error ? `model response ended: ${error}` : "model response complete",
+            });
+          }
+          return;
+        case "tool_execution_start":
+          forwardToolActivity(e, "start", onActivity);
+          return;
+        case "tool_execution_update":
+          forwardToolActivity(e, "update", onActivity);
+          return;
+        case "tool_execution_end":
+          forwardToolActivity(e, "end", onActivity);
+          return;
+        case "turn_end":
+          onActivity({ kind: "waiting", detail: "turn complete" });
+          return;
+        case "agent_end":
           onActivity({
             kind: "waiting",
-            detail: error ? `model response ended: ${error}` : "model response complete",
+            detail: e.willRetry ? "agent ended; retry pending" : "finishing agent",
           });
+          return;
+        case "agent_settled":
+          onActivity({ kind: "waiting", detail: "agent settled" });
+          return;
+        case "auto_retry_start": {
+          const attempt = finiteNumber(e.attempt) ?? 0;
+          const maxAttempts = finiteNumber(e.maxAttempts) ?? 0;
+          const delay = formatDelay(finiteNumber(e.delayMs) ?? 0);
+          const error = compactText(e.errorMessage, 100);
+          onActivity({
+            kind: "retry",
+            detail: `retry ${attempt}/${maxAttempts} in ${delay}${error ? `: ${error}` : ""}`,
+          });
+          return;
         }
-        return;
-      case "tool_execution_start":
-        forwardToolActivity(e, "start", onActivity);
-        return;
-      case "tool_execution_update":
-        forwardToolActivity(e, "update", onActivity);
-        return;
-      case "tool_execution_end":
-        forwardToolActivity(e, "end", onActivity);
-        return;
-      case "turn_end":
-        onActivity({ kind: "waiting", detail: "turn complete" });
-        return;
-      case "agent_end":
-        onActivity({
-          kind: "waiting",
-          detail: e.willRetry ? "agent ended; retry pending" : "finishing agent",
-        });
-        return;
-      case "agent_settled":
-        onActivity({ kind: "waiting", detail: "agent settled" });
-        return;
-      case "auto_retry_start": {
-        const attempt = finiteNumber(e.attempt) ?? 0;
-        const maxAttempts = finiteNumber(e.maxAttempts) ?? 0;
-        const delay = formatDelay(finiteNumber(e.delayMs) ?? 0);
-        const error = compactText(e.errorMessage, 100);
-        onActivity({
-          kind: "retry",
-          detail: `retry ${attempt}/${maxAttempts} in ${delay}${error ? `: ${error}` : ""}`,
-        });
-        return;
-      }
-      case "auto_retry_end": {
-        const attempt = finiteNumber(e.attempt) ?? 0;
-        const error = compactText(e.finalError, 100);
-        onActivity({
-          kind: "retry",
-          detail: e.success
-            ? `retry ${attempt} succeeded`
-            : `retry ${attempt} failed${error ? `: ${error}` : ""}`,
-        });
-        return;
-      }
-      case "compaction_start":
-        onActivity({ kind: "compaction", detail: compactionStartDetail(e.reason) });
-        return;
-      case "compaction_end": {
-        const error = compactText(e.errorMessage, 100);
-        onActivity({
-          kind: "compaction",
-          detail: error
-            ? `compaction failed: ${error}`
-            : e.aborted
-              ? "compaction aborted"
-              : e.willRetry
-                ? "compaction complete; retrying model"
-                : "compaction complete",
-        });
-        return;
-      }
-      case "queue_update": {
-        const queued = (Array.isArray(e.steering) ? e.steering.length : 0)
-          + (Array.isArray(e.followUp) ? e.followUp.length : 0);
-        if (queued > 0) onActivity({ kind: "waiting", detail: `${queued} queued message${queued === 1 ? "" : "s"}` });
-        return;
-      }
-      case "thinking_level_changed":
-        if (typeof e.level === "string") {
-          onActivity({ kind: "waiting", detail: `thinking level: ${e.level}` });
+        case "auto_retry_end": {
+          const attempt = finiteNumber(e.attempt) ?? 0;
+          const error = compactText(e.finalError, 100);
+          onActivity({
+            kind: "retry",
+            detail: e.success
+              ? `retry ${attempt} succeeded`
+              : `retry ${attempt} failed${error ? `: ${error}` : ""}`,
+          });
+          return;
         }
-        return;
-      default:
-        return;
-    }
-  } catch {
-    // best-effort: never let observability break the run
-  }
+        case "compaction_start":
+          onActivity({ kind: "compaction", detail: compactionStartDetail(e.reason) });
+          return;
+        case "compaction_end": {
+          const error = compactText(e.errorMessage, 100);
+          onActivity({
+            kind: "compaction",
+            detail: error
+              ? `compaction failed: ${error}`
+              : e.aborted
+                ? "compaction aborted"
+                : e.willRetry
+                  ? "compaction complete; retrying model"
+                  : "compaction complete",
+          });
+          return;
+        }
+        case "queue_update": {
+          const queued =
+            (Array.isArray(e.steering) ? e.steering.length : 0) +
+            (Array.isArray(e.followUp) ? e.followUp.length : 0);
+          if (queued > 0)
+            onActivity({
+              kind: "waiting",
+              detail: `${queued} queued message${queued === 1 ? "" : "s"}`,
+            });
+          return;
+        }
+        case "thinking_level_changed":
+          if (typeof e.level === "string") {
+            onActivity({ kind: "waiting", detail: `thinking level: ${e.level}` });
+          }
+          return;
+        default:
+          return;
+      }
+    }).pipe(Effect.ignore),
+  );
 }
 
-function forwardMessageActivity(
-  event: any,
-  onActivity: (e: AgentActivityInput) => void,
-): void {
+function forwardMessageActivity(event: any, onActivity: (e: AgentActivityInput) => void): void {
   switch (event?.type) {
     case "text_start":
     case "text_end":
@@ -1246,9 +1525,8 @@ function forwardToolActivity(
   const args = state === "end" ? undefined : toolArgsPreview(name, event.args);
   onActivity({
     kind: "tool",
-    detail: state === "end"
-      ? `${name} ${event.isError ? "failed" : "finished"}`
-      : toolLabel(name, args),
+    detail:
+      state === "end" ? `${name} ${event.isError ? "failed" : "finished"}` : toolLabel(name, args),
     toolCallId: typeof event.toolCallId === "string" ? event.toolCallId : `${name}:unknown`,
     toolName: name,
     ...(args ? { toolArgs: args } : {}),
@@ -1291,9 +1569,7 @@ function safePathPreview(value: string, max: number): string {
 
 function scalarPreview(value: unknown): string | undefined {
   if (typeof value === "string") {
-    const sample = value.length > DISPLAY_INPUT_LIMIT
-      ? value.slice(0, DISPLAY_INPUT_LIMIT)
-      : value;
+    const sample = value.length > DISPLAY_INPUT_LIMIT ? value.slice(0, DISPLAY_INPUT_LIMIT) : value;
     if (sample.trim()) return value;
   }
   if (typeof value === "number" || typeof value === "boolean") return String(value);

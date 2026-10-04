@@ -57,18 +57,18 @@ Pi decides whether a workflow is useful. Small tasks can still use the normal si
 
 Useful commands:
 
-| Command | Action |
-| --- | --- |
-| `/ultracode` | Enable `auto` from off; disable any active mode |
-| `/ultracode auto` | Let the parent choose depth using the task and context |
-| `/ultracode focused` | Use fixed depth for bounded work with direct local verification |
-| `/ultracode standard` | Use fixed depth for independent dimensions or competing hypotheses, with targeted verification |
-| `/ultracode deep` | Use fixed depth for interacting constraints or critical invariants, with independent evidence and counterexample checks |
-| `/ultracode off` | Disable it without changing the parent effort |
-| `/ultracode status` | Show the configured mode and its applicability / verification requirements |
-| `/workflows` or `F6` | Open the workflow browser |
-| `/workflows <runId>` | Open a specific run |
-| `/workflows abort` | Abort active runs |
+| Command               | Action                                                                                                                  |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `/ultracode`          | Enable `auto` from off; disable any active mode                                                                         |
+| `/ultracode auto`     | Let the parent choose depth using the task and context                                                                  |
+| `/ultracode focused`  | Use fixed depth for bounded work with direct local verification                                                         |
+| `/ultracode standard` | Use fixed depth for independent dimensions or competing hypotheses, with targeted verification                          |
+| `/ultracode deep`     | Use fixed depth for interacting constraints or critical invariants, with independent evidence and counterexample checks |
+| `/ultracode off`      | Disable it without changing the parent effort                                                                           |
+| `/ultracode status`   | Show the configured mode and its applicability / verification requirements                                              |
+| `/workflows` or `F6`  | Open the workflow browser                                                                                               |
+| `/workflows <runId>`  | Open a specific run                                                                                                     |
+| `/workflows abort`    | Abort active runs                                                                                                       |
 
 Press `Esc` to cancel a running workflow. In Pi's fullscreen TUI, use `Ctrl+PageUp`, `Ctrl+PageDown`, and `Ctrl+End` inside workflow details.
 
@@ -76,12 +76,12 @@ Press `Esc` to cancel a running workflow. In Pi's fullscreen TUI, use `Ctrl+Page
 
 Depth defines **what must be investigated and verified**, not model effort or a quota of agents and rounds:
 
-| Depth | Applicable conditions | Required verification |
-|---|---|---|
-| **Focused** | Bounded work with a known approach and locally verifiable results; e.g. a specified validation rule | Directly check the changed behavior or key claim, usually in the parent loop. No broad investigation or adversarial panel by default; verification is not skipped. |
-| **Standard** | Multiple independent dimensions or unresolved hypotheses can materially change the answer; e.g. a fault with several plausible causes | Investigate those dimensions or compare causes, then target disputed or weakly evidenced claims. Known multi-step work alone is not enough to require standard. |
-| **Deep** | Tightly interacting hard constraints or critical invariants need independent evidence and counterexamples; e.g. cancellation racing a durable commit | Trace interactions, test boundary/failure cases, and challenge key claims with a distinct test, reproduction, proof, or source. A second agent is neither necessary nor sufficient. |
-| **Auto** | Choose the smallest depth sufficient for the current task | Apply the selected depth's evidence requirements; escalate only when material new evidence or unresolved conflicts justify it. |
+| Depth        | Applicable conditions                                                                                                                                | Required verification                                                                                                                                                               |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Focused**  | Bounded work with a known approach and locally verifiable results; e.g. a specified validation rule                                                  | Directly check the changed behavior or key claim, usually in the parent loop. No broad investigation or adversarial panel by default; verification is not skipped.                  |
+| **Standard** | Multiple independent dimensions or unresolved hypotheses can materially change the answer; e.g. a fault with several plausible causes                | Investigate those dimensions or compare causes, then target disputed or weakly evidenced claims. Known multi-step work alone is not enough to require standard.                     |
+| **Deep**     | Tightly interacting hard constraints or critical invariants need independent evidence and counterexamples; e.g. cancellation racing a durable commit | Trace interactions, test boundary/failure cases, and challenge key claims with a distinct test, reproduction, proof, or source. A second agent is neither necessary nor sufficient. |
+| **Auto**     | Choose the smallest depth sufficient for the current task                                                                                            | Apply the selected depth's evidence requirements; escalate only when material new evidence or unresolved conflicts justify it.                                                      |
 
 Risk determines **which claims need verification**. Security, concurrency, data loss, file count, or a request for review alone never mandates `deep`; missing information does not prove hidden complexity. Deep does not automatically mean a workflow, more agents, or repeated rounds. Explicit `focused` / `standard` / `deep` modes remain fixed: if insufficient, report the uncertainty and recommend a deeper mode rather than silently exceeding the boundary.
 
@@ -105,15 +105,15 @@ Before each parent run, the extension supplies a local Pi capability snapshot: t
 
 The snapshot describes local registered capabilities, not a live provider probe, and may become stale during a run. Runtime clamping remains a safety net for explicit requests or stale metadata. Standalone SDK use of `createWorkflowTool()` without the extension does not inject this section; the host must supply capability context to enable informed automatic suffix selection. Neither the snapshot nor its absence rewrites explicit user effort choices or no-suffix defaults.
 
-| Suffix | Criteria and exclusions | Example |
-|---|---|---|
-| `:off` | Fully specified mechanical work; no locating changes, interpreting meaning, or hidden-impact reasoning | Fix a typo at an exact location using a supplied replacement |
-| `:minimal` | One clear local judgment; no cross-file tracing or multi-step implementation | Explain a short self-contained expression |
-| `:low` | Small implementation or question with a known approach and straightforward checks; not an unknown-root-cause fault | Add a specified validation rule and its test |
-| `:medium` | Bounded multi-step work coordinating known constraints; not interacting unresolved hypotheses | Wire a configuration option through loading, usage, and tests |
-| `:high` | Test competing hypotheses, trace cross-module effects, or reason about critical correctness constraints; security/architecture keywords alone do not qualify | Diagnose cross-module state desynchronization by comparing plausible causes |
-| `:xhigh` | Interacting hard problems requiring comparison of approaches and validation of cross-module invariants; file count or vague complexity claims do not qualify | Investigate an intermittent lifecycle, cache, and cancellation interaction |
-| `:max` | Exceptionally difficult synthesis requiring rigorous argument and adversarial validation, or concrete evidence of insufficient lower-effort reasoning; risk keywords alone do not qualify | Prove and repair system-wide concurrency, memory-safety, and low-level invariants |
+| Suffix     | Criteria and exclusions                                                                                                                                                                   | Example                                                                           |
+| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------- |
+| `:off`     | Fully specified mechanical work; no locating changes, interpreting meaning, or hidden-impact reasoning                                                                                    | Fix a typo at an exact location using a supplied replacement                      |
+| `:minimal` | One clear local judgment; no cross-file tracing or multi-step implementation                                                                                                              | Explain a short self-contained expression                                         |
+| `:low`     | Small implementation or question with a known approach and straightforward checks; not an unknown-root-cause fault                                                                        | Add a specified validation rule and its test                                      |
+| `:medium`  | Bounded multi-step work coordinating known constraints; not interacting unresolved hypotheses                                                                                             | Wire a configuration option through loading, usage, and tests                     |
+| `:high`    | Test competing hypotheses, trace cross-module effects, or reason about critical correctness constraints; security/architecture keywords alone do not qualify                              | Diagnose cross-module state desynchronization by comparing plausible causes       |
+| `:xhigh`   | Interacting hard problems requiring comparison of approaches and validation of cross-module invariants; file count or vague complexity claims do not qualify                              | Investigate an intermittent lifecycle, cache, and cancellation interaction        |
+| `:max`     | Exceptionally difficult synthesis requiring rigorous argument and adversarial validation, or concrete evidence of insufficient lower-effort reasoning; risk keywords alone do not qualify | Prove and repair system-wide concurrency, memory-safety, and low-level invariants |
 
 Implementation, review, input length, file count, risk keywords, and depth mode are not sufficient reasons for high effort. Missing information does not automatically imply `medium/high`; do not invent complexity. For `high/xhigh/max`, briefly identify the concrete reasoning difficulty. The highest supported effort requires neither a failed lower-level attempt nor an available intermediate level. Risk determines what needs verification, not a uniform high effort for every child.
 
@@ -145,14 +145,14 @@ export const meta = {
 };
 
 const findings = await parallel([
-  () => agent(
-    "Review the current branch for correctness and lifecycle bugs.",
-    { label: "correctness review" },
-  ),
-  () => agent(
-    "Review the current branch for missing or weak regression tests.",
-    { label: "test review" },
-  ),
+  () =>
+    agent("Review the current branch for correctness and lifecycle bugs.", {
+      label: "correctness review",
+    }),
+  () =>
+    agent("Review the current branch for missing or weak regression tests.", {
+      label: "test review",
+    }),
 ]);
 
 return findings.filter(Boolean);
@@ -210,12 +210,62 @@ Token and cost data are reported for observability, not enforced as a budget. Wo
 
 ## Development
 
+Development uses Node.js 24.21.0 (`.node-version`) and Vite+ 1.0.0. The
+`packageManager` field pins npm 11.19.0 and selects the installer used by
+`vp install`, `vp add`, and `vp remove`.
+
+With the global Vite+ CLI installed:
+
 ```bash
-npm ci
-npm run typecheck
-npm test
-npm pack --dry-run
+vp install --frozen-lockfile --ignore-scripts
+vp run check
+vp run typecheck
+vp run test
+vp pm pack -- --dry-run
 ```
+
+Without the global CLI, run `npm ci --ignore-scripts`, then `npm run check`,
+`npm run typecheck`, and `npm test`. These scripts use the pinned local `vp`;
+release CI follows this path and preserves npm trusted publishing and version gates.
+
+`vp test` invokes the built-in test runner once; use `vp test watch` for watch mode.
+`vp run test` executes this package's `test` script, which uses `vp test run` for a
+single run. `vp dev` starts Vite's development server; this source-distributed
+extension has no web development server or `dev` task.
+
+### Static checks
+
+`vp check` and `vp run check` run the same complete formatting, lint, and type
+checks. The `check` script calls `vp check` without bypass flags or path filters,
+and release CI uses this same script. Lint warnings remain visible for review.
+Use `vp fmt <files>` to format changed files.
+
+`vp run typecheck` runs only TypeScript (`vp exec tsc --noEmit`) against
+`tsconfig.json`. It is a focused development command; the complete `check` task
+remains the CI gate.
+
+Saved JavaScript workflows in `examples/` run in the workflow sandbox. The example
+uses a JSDoc type-only import from `pi-ultracode/workflow` to load the ambient
+workflow declarations in both the checkout and an installed package, without
+adding a runtime import or a checkout-only alias.
+
+Tests retain isolated fork workers, automatic mock restoration, and the previous
+runner's unlimited default test timeout.
+
+### Package validation
+
+The published package intentionally contains `extensions/`, `src/`, `types/`,
+examples, and documentation. Pi loads the TypeScript entry directly, and
+`src/workflow/script-executor.ts` locates its sibling `script-worker.mjs`.
+`npm pack --dry-run` checks the actual publication contents; an extracted tarball
+should also resolve `/// <reference types="pi-ultracode/workflow" />` from a
+consumer TypeScript project.
+
+`vp pack` is a tsdown bundle builder, not a replacement for `npm pack` here. An
+optional smoke check such as
+`vp pack --no-config src/depth.ts --out-dir /tmp/pi-ultracode-pack-smoke --no-dts`
+only tests the bundler. It does not validate the extension's release artifact.
+There is intentionally no generated `dist/`, build step, or rewritten export map.
 
 ## License
 

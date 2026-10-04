@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test } from "vite-plus/test";
 import assert from "node:assert/strict";
 import { ACTIVE_ULTRACODE_MODES } from "../src/depth.ts";
 import { WORKFLOW_EFFORT_GUIDELINES } from "../src/effort-policy.ts";
@@ -30,8 +30,14 @@ test("effort criteria separate routine implementation from unresolved reasoning 
   assert.match(criterion("low"), /Excludes faults with an unknown root cause/);
   assert.match(criterion("medium"), /multi-step implementation.*known constraints/);
   assert.match(criterion("medium"), /configuration option through loading, usage, and tests/);
-  assert.match(criterion("high"), /multiple plausible hypotheses.*cross-module effects.*critical correctness/);
-  assert.match(criterion("xhigh"), /Interacting hard problems.*comparison of approaches.*cross-module invariants/);
+  assert.match(
+    criterion("high"),
+    /multiple plausible hypotheses.*cross-module effects.*critical correctness/,
+  );
+  assert.match(
+    criterion("xhigh"),
+    /Interacting hard problems.*comparison of approaches.*cross-module invariants/,
+  );
   assert.match(criterion("max"), /rigorous argument and adversarial validation/);
   assert.match(criterion("max"), /concrete evidence that lower-effort reasoning is insufficient/);
 });
@@ -40,10 +46,16 @@ test("effort selection avoids fixed defaults, keyword escalation, and mandatory 
   assert.match(policy, /assigned subtask/);
   assert.match(policy, /no fixed medium\/high default/);
   assert.match(policy, /uncertainty alone does not mandate medium or high/);
-  assert.match(policy, /file count, risk keywords, and the configured depth are not sufficient reasons/);
+  assert.match(
+    policy,
+    /file count, risk keywords, and the configured depth are not sufficient reasons/,
+  );
   assert.match(policy, /not a uniform effort for every child/);
   assert.match(policy, /briefly name the concrete reasoning difficulty/);
-  assert.match(policy, /highest supported effort requires neither a failed lower-level attempt nor an available intermediate level/);
+  assert.match(
+    policy,
+    /highest supported effort requires neither a failed lower-level attempt nor an available intermediate level/,
+  );
   assert.match(policy, /never changes the parent session's effort/);
   assert.match(policy, /omitted child suffix uses its normal user\/model configuration/);
   assert.match(policy, /chosen model's supported efforts/);
@@ -59,7 +71,10 @@ test("all depth modes and workflow guidelines inject the same effort policy", ()
       assert.equal(lines.filter((entry) => entry === `- ${line}`).length, 1, mode);
     }
   }
-  for (const prompt of [WORKFLOW_GUIDELINES.join("\n"), ...ACTIVE_ULTRACODE_MODES.map((mode) => ultracodeSystemBlock(mode))]) {
+  for (const prompt of [
+    WORKFLOW_GUIDELINES.join("\n"),
+    ...ACTIVE_ULTRACODE_MODES.map((mode) => ultracodeSystemBlock(mode)),
+  ]) {
     assert.doesNotMatch(prompt, /high for substantive analysis or implementation/);
     assert.doesNotMatch(prompt, /max only for deep or decisive high-risk verification/);
   }

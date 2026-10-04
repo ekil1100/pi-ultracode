@@ -55,25 +55,42 @@ export function isWorkflowStallError(error: unknown): error is WorkflowStallErro
   return !!error && typeof error === "object" && (error as any).code === WORKFLOW_STALL_ERROR_CODE;
 }
 
-export function isWorkflowCleanupTimeoutError(error: unknown): error is WorkflowCleanupTimeoutError {
-  return !!error && typeof error === "object" && (error as any).code === WORKFLOW_CLEANUP_TIMEOUT_ERROR_CODE;
+export function isWorkflowCleanupTimeoutError(
+  error: unknown,
+): error is WorkflowCleanupTimeoutError {
+  return (
+    !!error &&
+    typeof error === "object" &&
+    (error as any).code === WORKFLOW_CLEANUP_TIMEOUT_ERROR_CODE
+  );
 }
 
 export function normalizeMaxAgents(value: unknown, name = "maxAgents"): number {
   if (value === undefined || value === null) return DEFAULT_MAX_AGENTS;
   if (typeof value !== "number" || !Number.isInteger(value)) {
-    throw new WorkflowPolicyError(`workflow ${name} must be an integer between 1 and ${ABSOLUTE_MAX_AGENTS}`);
+    throw new WorkflowPolicyError(
+      `workflow ${name} must be an integer between 1 and ${ABSOLUTE_MAX_AGENTS}`,
+    );
   }
   if (value < 1 || value > ABSOLUTE_MAX_AGENTS) {
-    throw new WorkflowPolicyError(`workflow ${name} must be between 1 and ${ABSOLUTE_MAX_AGENTS} (got ${value})`);
+    throw new WorkflowPolicyError(
+      `workflow ${name} must be between 1 and ${ABSOLUTE_MAX_AGENTS} (got ${value})`,
+    );
   }
   return value;
 }
 
 export function normalizeReservationSize(value: unknown, fallback: number): number {
   if (value === undefined || value === null) return fallback;
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > ABSOLUTE_MAX_AGENTS) {
-    throw new WorkflowPolicyError(`parallel reserveAgents must be an integer between 0 and ${ABSOLUTE_MAX_AGENTS}`);
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 0 ||
+    value > ABSOLUTE_MAX_AGENTS
+  ) {
+    throw new WorkflowPolicyError(
+      `parallel reserveAgents must be an integer between 0 and ${ABSOLUTE_MAX_AGENTS}`,
+    );
   }
   return value;
 }
@@ -199,7 +216,9 @@ export class AgentAdmission {
   ): PanelReservation {
     const slots = normalizeReservationSize(requestedSlots, requestedSlots);
     if (!Number.isInteger(branchCount) || branchCount < 0 || branchCount > ABSOLUTE_MAX_AGENTS) {
-      throw new WorkflowPolicyError(`parallel branch count must be an integer between 0 and ${ABSOLUTE_MAX_AGENTS}`);
+      throw new WorkflowPolicyError(
+        `parallel branch count must be an integer between 0 and ${ABSOLUTE_MAX_AGENTS}`,
+      );
     }
     if (slots < branchCount) {
       throw new WorkflowPolicyError(
@@ -252,7 +271,9 @@ export class AgentAdmission {
       );
     }
     if (this.rootFree < 1) {
-      throw new WorkflowPolicyError(`workflow exceeded maxAgents=${this.maxAgents} (no agent slots remain)`);
+      throw new WorkflowPolicyError(
+        `workflow exceeded maxAgents=${this.maxAgents} (no agent slots remain)`,
+      );
     }
     this.rootFree--;
     this.consumed++;

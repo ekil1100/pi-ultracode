@@ -8,30 +8,32 @@ export const DISPLAY_INPUT_LIMIT = 16_384;
 export const DISPLAY_OMITTED_TEXT = "[output omitted]";
 
 function isInvisibleFormat(code: number): boolean {
-  return code === 0x00ad
-    || code === 0x034f
-    || (code >= 0x0600 && code <= 0x0605)
-    || code === 0x061c
-    || code === 0x06dd
-    || code === 0x070f
-    || (code >= 0x0890 && code <= 0x0891)
-    || code === 0x08e2
-    || (code >= 0x17b4 && code <= 0x17b5)
-    || (code >= 0x180b && code <= 0x180f)
-    || (code >= 0x200b && code <= 0x200f)
-    || (code >= 0x202a && code <= 0x202e)
-    || (code >= 0x2060 && code <= 0x206f)
-    || (code >= 0xfe00 && code <= 0xfe0f)
-    || code === 0xfeff
-    || (code >= 0xfff9 && code <= 0xfffb)
-    || code === 0x110bd
-    || code === 0x110cd
-    || (code >= 0x13430 && code <= 0x1345f)
-    || (code >= 0x1bca0 && code <= 0x1bca3)
-    || (code >= 0x1d173 && code <= 0x1d17a)
-    || code === 0xe0001
-    || (code >= 0xe0020 && code <= 0xe007f)
-    || (code >= 0xe0100 && code <= 0xe01ef);
+  return (
+    code === 0x00ad ||
+    code === 0x034f ||
+    (code >= 0x0600 && code <= 0x0605) ||
+    code === 0x061c ||
+    code === 0x06dd ||
+    code === 0x070f ||
+    (code >= 0x0890 && code <= 0x0891) ||
+    code === 0x08e2 ||
+    (code >= 0x17b4 && code <= 0x17b5) ||
+    (code >= 0x180b && code <= 0x180f) ||
+    (code >= 0x200b && code <= 0x200f) ||
+    (code >= 0x202a && code <= 0x202e) ||
+    (code >= 0x2060 && code <= 0x206f) ||
+    (code >= 0xfe00 && code <= 0xfe0f) ||
+    code === 0xfeff ||
+    (code >= 0xfff9 && code <= 0xfffb) ||
+    code === 0x110bd ||
+    code === 0x110cd ||
+    (code >= 0x13430 && code <= 0x1345f) ||
+    (code >= 0x1bca0 && code <= 0x1bca3) ||
+    (code >= 0x1d173 && code <= 0x1d17a) ||
+    code === 0xe0001 ||
+    (code >= 0xe0020 && code <= 0xe007f) ||
+    (code >= 0xe0100 && code <= 0xe01ef)
+  );
 }
 
 const SAFE_SUBCOMMANDS = new Map<string, ReadonlySet<string>>([
@@ -45,8 +47,21 @@ const SAFE_SUBCOMMANDS = new Map<string, ReadonlySet<string>>([
 ]);
 const SAFE_EXECUTABLES = new Set([
   ...SAFE_SUBCOMMANDS.keys(),
-  "sleep", "curl", "wget", "node", "python", "python3", "pytest", "tsc", "make", "cmake",
-  "rg", "grep", "find", "ls", "pwd",
+  "sleep",
+  "curl",
+  "wget",
+  "node",
+  "python",
+  "python3",
+  "pytest",
+  "tsc",
+  "make",
+  "cmake",
+  "rg",
+  "grep",
+  "find",
+  "ls",
+  "pwd",
 ]);
 
 /**
@@ -203,8 +218,14 @@ function redactPrepared(value: string): string {
     )
     .replace(/(\s-u)(?:\s+)?(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s]+)/gi, "$1***")
     .replace(/(^|[^A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@\s]+@/g, "$1$2***@")
-    .replace(/(^|[^A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@\s]+:[^/@\s]*(?=$|[/?#\s])/g, "$1$2***")
-    .replace(/([?&](?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|id[_-]?token|password|secret|client_secret)=)[^&\s'" ]+/gi, "$1***")
+    .replace(
+      /(^|[^A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@\s]+:[^/@\s]*(?=$|[/?#\s])/g,
+      "$1$2***",
+    )
+    .replace(
+      /([?&](?:api[_-]?key|token|access[_-]?token|refresh[_-]?token|id[_-]?token|password|secret|client_secret)=)[^&\s'" ]+/gi,
+      "$1***",
+    )
     .replace(/\b(?:sk|ghp|github_pat|xox[baprs])[-_][A-Za-z0-9_-]{6,}\b/g, "***");
 }
 
@@ -225,7 +246,11 @@ export function safeCommandPreview(value: string): string {
   const index = 0;
   if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0] ?? "")) return "environment-prefixed command";
   const rawExecutable = tokens[index] ?? "command";
-  const basename = rawExecutable.replace(/^['"]|['"]$/g, "").split("/").pop() || "command";
+  const basename =
+    rawExecutable
+      .replace(/^['"]|['"]$/g, "")
+      .split("/")
+      .pop() || "command";
   const candidate = /^[A-Za-z0-9_.+-]+$/.test(basename) ? basename.toLowerCase() : "";
   if (!SAFE_EXECUTABLES.has(candidate)) return "command";
   const executable = truncateDisplay(basename, 32);
@@ -239,7 +264,8 @@ export function safeCommandPreview(value: string): string {
   return tokens.length > index + 1 ? `${executable} …` : executable;
 }
 
-const SENSITIVE_HEADER_NAME = "(?:proxy-authorization|authorization|x-auth-token|x-api-key|api-key|api_key|client-secret|client_secret|access-token|access_token|refresh-token|refresh_token|id-token|id_token|set-cookie|cookie|token|password|passwd|secret)";
+const SENSITIVE_HEADER_NAME =
+  "(?:proxy-authorization|authorization|x-auth-token|x-api-key|api-key|api_key|client-secret|client_secret|access-token|access_token|refresh-token|refresh_token|id-token|id_token|set-cookie|cookie|token|password|passwd|secret)";
 const SENSITIVE_HEADER = new RegExp(
   `(^|[^A-Za-z0-9_-]|(?:^|\\s)-H\\s*["']?)((?:["']?${SENSITIVE_HEADER_NAME}["']?)\\s*:\\s*)`,
   "gi",
@@ -300,7 +326,11 @@ function hasPendingTerminalSequence(value: string): boolean {
       if (!terminated) return true;
       continue;
     }
-    while (index < value.length && value.charCodeAt(index) >= 0x20 && value.charCodeAt(index) <= 0x2f) {
+    while (
+      index < value.length &&
+      value.charCodeAt(index) >= 0x20 &&
+      value.charCodeAt(index) <= 0x2f
+    ) {
       index++;
     }
     if (index >= value.length) return true;
@@ -324,7 +354,11 @@ function hasPendingCredentialContextPrepared(value: string): boolean {
   return false;
 }
 
-function sensitiveValueIsComplete(value: string, start: number, authorizationHeader: boolean): boolean {
+function sensitiveValueIsComplete(
+  value: string,
+  start: number,
+  authorizationHeader: boolean,
+): boolean {
   if (start >= value.length) return false;
   if (value.startsWith("***", start)) return true;
   const opener = value[start];
@@ -387,7 +421,11 @@ function redactSensitiveHeaders(value: string): string {
   return output + value.slice(cursor);
 }
 
-function consumeSensitiveValue(value: string, start: number, consumeUnquotedRemainder: boolean): number {
+function consumeSensitiveValue(
+  value: string,
+  start: number,
+  consumeUnquotedRemainder: boolean,
+): number {
   if (start >= value.length) return start;
   if (value.startsWith("***", start)) return start + 3;
   const opener = value[start];
@@ -396,7 +434,12 @@ function consumeSensitiveValue(value: string, start: number, consumeUnquotedRema
   if (consumeUnquotedRemainder) return value.length;
 
   let index = start;
-  while (index < value.length && value[index] !== "," && value[index] !== "}" && value[index] !== "]") {
+  while (
+    index < value.length &&
+    value[index] !== "," &&
+    value[index] !== "}" &&
+    value[index] !== "]"
+  ) {
     index++;
   }
   return index;

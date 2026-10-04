@@ -25,7 +25,14 @@ declare global {
   }
 
   interface JsonSchema {
-    type?: "object" | "array" | "string" | "number" | "integer" | "boolean" | "null"
+    type?:
+      | "object"
+      | "array"
+      | "string"
+      | "number"
+      | "integer"
+      | "boolean"
+      | "null"
       | Array<"object" | "array" | "string" | "number" | "integer" | "boolean" | "null">;
     properties?: Record<string, JsonSchema>;
     items?: JsonSchema | JsonSchema[];
@@ -94,7 +101,10 @@ declare global {
    * Agent calls issued during synchronous thunk launch share a Jev effort batch;
    * calls after an await are classified when ready, without waiting for future work.
    */
-  function parallel<T = string>(thunks: Array<() => T | Promise<T>>, options?: WorkflowParallelOptions): Promise<Array<Awaited<T> | null>>;
+  function parallel<T = string>(
+    thunks: Array<() => T | Promise<T>>,
+    options?: WorkflowParallelOptions,
+  ): Promise<Array<Awaited<T> | null>>;
 
   /**
    * Fan items through sequential stages. A stage input can be null when a prior
@@ -124,5 +134,4 @@ declare global {
 
   /** Working directory for the workflow and its subagents. */
   const cwd: string;
-
 }

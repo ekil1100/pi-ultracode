@@ -1,9 +1,6 @@
 import * as os from "node:os";
 import * as path from "node:path";
-import {
-  artifactPathExists,
-  readContainedArtifactFile,
-} from "./run-artifacts.ts";
+import { artifactPathExists, readContainedArtifactFile } from "./run-artifacts.ts";
 
 export interface SavedWorkflowSource {
   script: string;

@@ -2,13 +2,21 @@
  * Slash commands: `/ultracode` (mode toggle) and `/workflows` (run manager).
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { ACTIVE_ULTRACODE_MODES, MODE_DESCRIPTIONS, isActiveUltracodeMode, isUltracodeModeName } from "./depth.ts";
+import { Effect, Result } from "effect";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  ACTIVE_ULTRACODE_MODES,
+  MODE_DESCRIPTIONS,
+  isActiveUltracodeMode,
+  isUltracodeModeName,
+} from "./depth.ts";
 import type { UltracodeMode } from "./mode.ts";
 import type { UltracodePreferenceStore } from "./preferences.ts";
 import type { WorkflowRegistry } from "./workflow/registry.ts";
 import { workflowRunsDir } from "./workflow/tool.ts";
 import { openWorkflowOverlay } from "./workflow/workflow-overlay.ts";
+
+const attempt = <A>(thunk: () => A) => Effect.try({ try: thunk, catch: (error) => error });
 
 export function registerCommands(
   pi: ExtensionAPI,
@@ -17,117 +25,157 @@ export function registerCommands(
   preferences: UltracodePreferenceStore,
 ): void {
   pi.registerCommand("ultracode", {
-    description: "Analysis depth: auto routing, focused local checks, standard targeted verification, deep invariant/counterexample checks; off|status|default on|off",
+    description:
+      "Analysis depth: auto routing, focused local checks, standard targeted verification, deep invariant/counterexample checks; off|status|default on|off",
     getArgumentCompletions(prefix: string) {
       return [...ACTIVE_ULTRACODE_MODES, "off", "status", "default", "default on", "default off"]
         .filter((value) => value.startsWith(prefix))
-        .map((value) => ({ value, label: value, description: isUltracodeModeName(value) ? MODE_DESCRIPTIONS[value] : undefined }));
+        .map((value) => ({
+          value,
+          label: value,
+          description: isUltracodeModeName(value) ? MODE_DESCRIPTIONS[value] : undefined,
+        }));
     },
-    handler: async (args: string, ctx) => {
-      const parts = args.trim().split(/\s+/).filter(Boolean);
-      const sub = (parts[0] ?? "").toLowerCase();
+    handler: (args: string, ctx) =>
+      Effect.runPromise(
+        attempt(() => {
+          const parts = args.trim().split(/\s+/).filter(Boolean);
+          const sub = (parts[0] ?? "").toLowerCase();
 
-      // Bare `/ultracode` enables auto from off and disables any active mode.
-      if (sub === "") {
-        const nowOn = mode.toggle(pi);
-        ctx.ui.notify(
-          nowOn
-            ? `Ultracode auto — ${MODE_DESCRIPTIONS.auto}`
-            : "Ultracode off — workflow tool disabled; parent effort unchanged.",
-          "info",
-        );
-        ctx.ui.setStatus(
-          "ultracode",
-          nowOn ? mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)) : undefined,
-        );
-        return;
-      }
-
-      if (sub === "default") {
-        const value = parts[1]?.toLowerCase();
-        if (parts.length > 2 || (value !== undefined && value !== "on" && value !== "off")) {
-          ctx.ui.notify("Usage: /ultracode default [on|off]", "error");
-          return;
-        }
-        try {
-          if (value !== undefined) preferences.setDefaultEnabled(value === "on");
-          const enabled = preferences.getDefaultEnabled();
-          if (value === "on") {
-            if (!mode.isEnabled()) mode.enable(pi, "auto");
-            ctx.ui.setStatus("ultracode", mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)));
+          // Bare `/ultracode` enables auto from off and disables any active mode.
+          if (sub === "") {
+            const nowOn = mode.toggle(pi);
+            ctx.ui.notify(
+              nowOn
+                ? `Ultracode auto — ${MODE_DESCRIPTIONS.auto}`
+                : "Ultracode off — workflow tool disabled; parent effort unchanged.",
+              "info",
+            );
+            ctx.ui.setStatus(
+              "ultracode",
+              nowOn ? mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)) : undefined,
+            );
+            return;
           }
-          const sessionStatus = value === "on" ? `current session: ${mode.getMode()}` : "current session unchanged";
-          ctx.ui.notify(
-            `Ultracode default ${enabled ? "on (auto)" : "off"} — global startup preference; ${sessionStatus}.`,
-            "info",
+
+          if (sub === "default") {
+            const value = parts[1]?.toLowerCase();
+            if (parts.length > 2 || (value !== undefined && value !== "on" && value !== "off")) {
+              ctx.ui.notify("Usage: /ultracode default [on|off]", "error");
+              return;
+            }
+            Result.try({
+              try: () => {
+                if (value !== undefined) preferences.setDefaultEnabled(value === "on");
+                const enabled = preferences.getDefaultEnabled();
+                if (value === "on") {
+                  if (!mode.isEnabled()) mode.enable(pi, "auto");
+                  ctx.ui.setStatus(
+                    "ultracode",
+                    mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)),
+                  );
+                }
+                const sessionStatus =
+                  value === "on"
+                    ? `current session: ${mode.getMode()}`
+                    : "current session unchanged";
+                ctx.ui.notify(
+                  `Ultracode default ${enabled ? "on (auto)" : "off"} — global startup preference; ${sessionStatus}.`,
+                  "info",
+                );
+              },
+              catch: (error) => error,
+            }).pipe(
+              Result.getOrElse((error) => {
+                ctx.ui.notify(
+                  `Failed to ${value === undefined ? "read" : "save"} Ultracode default: ${String(error)}`,
+                  "error",
+                );
+              }),
+            );
+            return;
+          }
+
+          if (parts.length > 1) {
+            ctx.ui.notify(ultracodeUsage(), "error");
+            return;
+          }
+
+          if (sub === "status") {
+            ctx.ui.notify(
+              `${mode.statusLine()} — ${MODE_DESCRIPTIONS[mode.getMode()]} Depth is independent of model effort.`,
+              "info",
+            );
+            return;
+          }
+
+          if (sub === "off") {
+            mode.disable(pi);
+            ctx.ui.notify(
+              "Ultracode off — workflow tool disabled; parent effort unchanged.",
+              "info",
+            );
+            ctx.ui.setStatus("ultracode", undefined);
+            return;
+          }
+
+          if (!isActiveUltracodeMode(sub)) {
+            ctx.ui.notify(ultracodeUsage(), "error");
+            return;
+          }
+
+          mode.enable(pi, sub);
+          ctx.ui.notify(`Ultracode ${sub} — ${MODE_DESCRIPTIONS[sub]}`, "info");
+          ctx.ui.setStatus(
+            "ultracode",
+            mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)),
           );
-        } catch (error) {
-          ctx.ui.notify(`Failed to ${value === undefined ? "read" : "save"} Ultracode default: ${String(error)}`, "error");
-        }
-        return;
-      }
-
-      if (parts.length > 1) {
-        ctx.ui.notify(ultracodeUsage(), "error");
-        return;
-      }
-
-      if (sub === "status") {
-        ctx.ui.notify(`${mode.statusLine()} — ${MODE_DESCRIPTIONS[mode.getMode()]} Depth is independent of model effort.`, "info");
-        return;
-      }
-
-      if (sub === "off") {
-        mode.disable(pi);
-        ctx.ui.notify("Ultracode off — workflow tool disabled; parent effort unchanged.", "info");
-        ctx.ui.setStatus("ultracode", undefined);
-        return;
-      }
-
-      if (!isActiveUltracodeMode(sub)) {
-        ctx.ui.notify(ultracodeUsage(), "error");
-        return;
-      }
-
-      mode.enable(pi, sub);
-      ctx.ui.notify(`Ultracode ${sub} — ${MODE_DESCRIPTIONS[sub]}`, "info");
-      ctx.ui.setStatus(
-        "ultracode",
-        mode.statusLine((text, color) => ctx.ui.theme.fg(color, text)),
-      );
-    },
+        }),
+      ),
   });
 
-  const openWorkflows = async (ctx: any, runId?: string) => {
-    registry.restoreRuns(workflowRunsDir(ctx));
-    await openWorkflowOverlay(ctx, registry, runId);
-  };
+  const openWorkflows = (ctx: ExtensionContext, runId?: string) =>
+    attempt(() => registry.restoreRuns(workflowRunsDir(ctx))).pipe(
+      Effect.andThen(
+        Effect.tryPromise({
+          try: () => openWorkflowOverlay(ctx, registry, runId),
+          catch: (error) => error,
+        }),
+      ),
+    );
 
   pi.registerCommand("workflows", {
-    description: "Open the interactive workflow/task detail overlay. Usage: /workflows [runId | abort]",
+    description:
+      "Open the interactive workflow/task detail overlay. Usage: /workflows [runId | abort]",
     getArgumentCompletions(prefix: string) {
       const values = [
         "abort",
-        ...registry.list().map((handle) => handle.snapshot.runId).filter((runId): runId is string => Boolean(runId)),
+        ...registry
+          .list()
+          .map((handle) => handle.snapshot.runId)
+          .filter((runId): runId is string => Boolean(runId)),
       ];
       return [...new Set(values)]
         .filter((value) => value.startsWith(prefix))
         .map((value) => ({ value, label: value }));
     },
-    handler: async (args: string, ctx) => {
-      const arg = args.trim();
-      if (arg.toLowerCase() === "abort") {
-        registry.abortAll();
-        ctx.ui.notify("Requested abort of all active workflow runs.", "warning");
-        return;
-      }
-      await openWorkflows(ctx, arg || undefined);
-    },
+    handler: (args: string, ctx) =>
+      Effect.runPromise(
+        Effect.suspend(() => {
+          const arg = args.trim();
+          return arg.toLowerCase() === "abort"
+            ? attempt(() => {
+                registry.abortAll();
+                ctx.ui.notify("Requested abort of all active workflow runs.", "warning");
+              })
+            : openWorkflows(ctx, arg || undefined);
+        }),
+      ),
   });
 
   pi.registerShortcut("f6", {
     description: "Open workflow task details",
-    handler: async (ctx) => openWorkflows(ctx),
+    handler: (ctx) => Effect.runPromise(openWorkflows(ctx)),
   });
 }
 

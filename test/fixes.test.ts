@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test } from "vite-plus/test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -6,7 +6,12 @@ import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createAgentSession, ModelRuntime, SessionManager, SettingsManager } from "@earendil-works/pi-coding-agent";
+import {
+  createAgentSession,
+  ModelRuntime,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
 import {
   WorkflowAgentRunner,
@@ -40,7 +45,9 @@ function fakeSession(overrides: Partial<AgentSessionLike> = {}): AgentSessionLik
     thinkingLevel: "medium",
     supportsThinking: () => true,
     getAvailableThinkingLevels: () => ["medium"],
-    setThinkingLevel(level) { this.thinkingLevel = level; },
+    setThinkingLevel(level) {
+      this.thinkingLevel = level;
+    },
     prompt: async () => {},
     abort: async () => {},
     subscribe: () => () => {},
@@ -109,7 +116,11 @@ test("resolveModelSelection: real pattern matches and applies the max thinking s
 
 test("resolveModelSelection: whitespace-padded pattern still matches (trim)", () => {
   // Regression: lower was untrimmed, so " sonnet " matched nothing -> default.
-  const r = resolveModelSelection({ pattern: " sonnet :high", defaultModel: DEFAULT, models: MODELS });
+  const r = resolveModelSelection({
+    pattern: " sonnet :high",
+    defaultModel: DEFAULT,
+    models: MODELS,
+  });
   assert.equal(r.model?.id, "claude-sonnet");
   assert.equal(r.thinkingLevel, "high");
 });
@@ -172,11 +183,12 @@ test("bare exact model ids reject ambiguity across available providers", () => {
   );
   assert.equal(matchModelIn(duplicated, "beta/shared-model"), duplicated[1]);
   assert.throws(
-    () => resolveModelSelection({
-      pattern: "shared-model:high",
-      defaultModel: DEFAULT,
-      models: duplicated,
-    }),
+    () =>
+      resolveModelSelection({
+        pattern: "shared-model:high",
+        defaultModel: DEFAULT,
+        models: duplicated,
+      }),
     /ambiguous.*provider\/model/i,
     "a thinking suffix must not turn an ambiguous exact id into a catalog-order choice",
   );
@@ -188,7 +200,10 @@ test("resolveSessionThinkingLevel uses max only when the model advertises it", (
     thinkingLevelMap: { max: "max" },
   };
   assert.equal(resolveSessionThinkingLevel("max", maxModel), "max");
-  assert.equal(resolveSessionThinkingLevel("max", { ...DEFAULT, thinkingLevelMap: { max: null } }), "xhigh");
+  assert.equal(
+    resolveSessionThinkingLevel("max", { ...DEFAULT, thinkingLevelMap: { max: null } }),
+    "xhigh",
+  );
   assert.equal(resolveSessionThinkingLevel("max", DEFAULT), "xhigh");
   assert.equal(resolveSessionThinkingLevel("max", undefined), "max");
   assert.equal(resolveSessionThinkingLevel("high", DEFAULT), "high");
@@ -227,38 +242,74 @@ test("workflow child resources exclude ambient orchestrators without dropping or
     delete (globalThis as Record<string, unknown>)[marker];
 
     const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
-    const loader = await createWorkflowChildResourceLoader({ cwd, agentDir, projectTrusted: false, settingsManager });
+    const loader = await createWorkflowChildResourceLoader({
+      cwd,
+      agentDir,
+      projectTrusted: false,
+      settingsManager,
+    });
 
     assert.equal(
       (globalThis as Record<string, unknown>)[marker],
       undefined,
       "ambient extension factories must never run in workflow children",
     );
-    assert.equal(loader.getExtensions().extensions.length, 1, "only the explicit codemode extension loads");
+    assert.equal(
+      loader.getExtensions().extensions.length,
+      1,
+      "only the explicit codemode extension loads",
+    );
     assert.deepEqual(loader.getExtensions().errors, []);
     const modelRuntime = await ModelRuntime.create({
-      credentials: new InMemoryCredentialStore(), modelsPath: null, refreshOnCreate: false, allowModelNetwork: false,
+      credentials: new InMemoryCredentialStore(),
+      modelsPath: null,
+      refreshOnCreate: false,
+      allowModelNetwork: false,
     });
     for (const tools of [undefined, ["read"]]) {
       const { session } = await createAgentSession({
-        cwd, agentDir, resourceLoader: loader, settingsManager, modelRuntime,
-        sessionManager: SessionManager.inMemory(cwd), tools,
+        cwd,
+        agentDir,
+        resourceLoader: loader,
+        settingsManager,
+        modelRuntime,
+        sessionManager: SessionManager.inMemory(cwd),
+        tools,
         excludeTools: ["workflow", "subagent", "subagent_wait"],
       });
       try {
         const active = session.getActiveToolNames();
-        assert.equal(active.includes("codemode"), tools === undefined, "explicit tool allowlists remain authoritative");
+        assert.equal(
+          active.includes("codemode"),
+          tools === undefined,
+          "explicit tool allowlists remain authoritative",
+        );
         assert.ok(active.includes("read"));
-        for (const name of ["workflow", "subagent", "subagent_wait"]) assert.equal(active.includes(name), false);
+        for (const name of ["workflow", "subagent", "subagent_wait"])
+          assert.equal(active.includes(name), false);
         if (!tools) {
           const codemode = session.agent.state.tools.find((tool) => tool.name === "codemode")!;
-          const args = { code: 'console.log(await tools.read({ path: "AGENTS.md" })); console.log(typeof tools.workflow, typeof models);' };
+          const args = {
+            code: 'console.log(await tools.read({ path: "AGENTS.md" })); console.log(typeof tools.workflow, typeof models);',
+          };
           session.agent.state.messages.push({
-            role: "assistant", api: "openai-responses", provider: "openai", model: "test",
-            content: [{ type: "toolCall", id: "codemode-probe", name: "codemode", arguments: args }],
-            stopReason: "toolUse", timestamp: 0,
-            usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
-              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+            role: "assistant",
+            api: "openai-responses",
+            provider: "openai",
+            model: "test",
+            content: [
+              { type: "toolCall", id: "codemode-probe", name: "codemode", arguments: args },
+            ],
+            stopReason: "toolUse",
+            timestamp: 0,
+            usage: {
+              input: 0,
+              output: 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
           });
           const result = await codemode.execute("codemode-probe", args);
           assert.match(JSON.stringify(result.content), /Project child context/);
@@ -268,16 +319,28 @@ test("workflow child resources exclude ambient orchestrators without dropping or
         session.dispose();
       }
     }
-    assert.equal(loader.getSystemPrompt(), undefined, "untrusted project system prompts stay hidden");
+    assert.equal(
+      loader.getSystemPrompt(),
+      undefined,
+      "untrusted project system prompts stay hidden",
+    );
     const skillNames = loader.getSkills().skills.map((skill) => skill.name);
     assert.ok(skillNames.includes("ordinary"), "ordinary user skills remain available");
-    assert.equal(skillNames.includes("pi-subagents"), false, "parent-only orchestration skill is hidden");
+    assert.equal(
+      skillNames.includes("pi-subagents"),
+      false,
+      "parent-only orchestration skill is hidden",
+    );
     assert.ok(
       loader.getAgentsFiles().agentsFiles.some((file) => file.path === contextPath),
       "AGENTS context remains available under Pi's trust contract",
     );
 
-    const trustedLoader = await createWorkflowChildResourceLoader({ cwd, agentDir, projectTrusted: true });
+    const trustedLoader = await createWorkflowChildResourceLoader({
+      cwd,
+      agentDir,
+      projectTrusted: true,
+    });
     assert.equal(trustedLoader.getSystemPrompt(), "UNTRUSTED PROJECT SYSTEM\n");
   } finally {
     delete (globalThis as Record<string, unknown>)[marker];
@@ -450,8 +513,16 @@ test("production WorkflowAgentRunner wires sealed resources into the real Pi ses
       error: string;
     };
 
-    assert.equal(result.sessionCreated, true, "the real Pi session must be created before the probe aborts");
-    assert.equal(result.extensionLoaded, false, "production wiring must not initialize ambient extensions");
+    assert.equal(
+      result.sessionCreated,
+      true,
+      "the real Pi session must be created before the probe aborts",
+    );
+    assert.equal(
+      result.extensionLoaded,
+      false,
+      "production wiring must not initialize ambient extensions",
+    );
     assert.match(result.error, /Subagent was aborted/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -468,7 +539,9 @@ test("WorkflowAgentRunner shares one modern model runtime and replays public reg
     getModel: (provider: string, id: string) =>
       provider === runtimeModel.provider && id === runtimeModel.id ? runtimeModel : undefined,
     registerProvider: (provider: string, config: unknown) => registered.push([provider, config]),
-    refresh: async (options?: unknown) => { refreshed.push(options); },
+    refresh: async (options?: unknown) => {
+      refreshed.push(options);
+    },
     setRuntimeApiKey: async (provider: string, apiKey: string) => {
       runtimeKeys.push([provider, apiKey]);
     },
@@ -477,7 +550,8 @@ test("WorkflowAgentRunner shares one modern model runtime and replays public reg
   const registry = {
     getAvailable: () => [DEFAULT, { provider: "custom", id: "custom-model" }],
     getRegisteredProviderIds: () => ["custom"],
-    getRegisteredProviderConfig: (provider: string) => provider === "custom" ? providerConfig : undefined,
+    getRegisteredProviderConfig: (provider: string) =>
+      provider === "custom" ? providerConfig : undefined,
     getProviderAuthStatus: (provider: string) => ({
       configured: true,
       source: provider === "anthropic" ? "runtime" : "stored",
@@ -525,8 +599,16 @@ test("WorkflowAgentRunner shares one modern model runtime and replays public reg
   assert.equal(sessionOptions.length, 2);
   for (const options of sessionOptions) {
     assert.equal(options.modelRuntime, runtime);
-    assert.equal("modelRegistry" in options, false, "modern sessions never receive the removed option");
-    assert.equal(options.model, runtimeModel, "the selected model is rebound to the target runtime");
+    assert.equal(
+      "modelRegistry" in options,
+      false,
+      "modern sessions never receive the removed option",
+    );
+    assert.equal(
+      options.model,
+      runtimeModel,
+      "the selected model is rebound to the target runtime",
+    );
     assert.deepEqual(
       options.excludeTools,
       ["workflow", "subagent", "subagent_wait"],
@@ -555,7 +637,9 @@ test("WorkflowAgentRunner replays native providers into the child model runtime"
       registeredNativeProviders.push(provider);
       nativeRegistered = true;
     },
-    refresh: async (options?: unknown) => { refreshed.push(options); },
+    refresh: async (options?: unknown) => {
+      refreshed.push(options);
+    },
   };
   const registry = {
     getAvailable: () => [parentModel],
@@ -590,7 +674,11 @@ test("WorkflowAgentRunner replays native providers into the child model runtime"
   assert.equal(result.value, "native");
   assert.deepEqual(registeredNativeProviders, [nativeProvider]);
   assert.deepEqual(refreshed, [{ allowNetwork: false }]);
-  assert.equal(sessionOptions[0].model, runtimeModel, "the model is rebound after native provider replay");
+  assert.equal(
+    sessionOptions[0].model,
+    runtimeModel,
+    "the model is rebound after native provider replay",
+  );
 });
 
 test("WorkflowAgentRunner retains the legacy registry option when ModelRuntime is unavailable", async () => {
@@ -652,10 +740,18 @@ test("WorkflowAgentRunner shares a concurrent runtime failure but retries later"
   ]);
   assert.equal(runtimeCreations, 1);
   assert.equal(sessionCreations, 0);
-  assert.ok(settled.every((result) => result.status === "rejected" && /runtime init failed/.test(String(result.reason))));
+  assert.ok(
+    settled.every(
+      (result) => result.status === "rejected" && /runtime init failed/.test(String(result.reason)),
+    ),
+  );
 
   const recovered = await runner.run({ prompt: "retry", label: "retry" });
-  assert.equal(runtimeCreations, 2, "a transient initialization failure must not poison the runner");
+  assert.equal(
+    runtimeCreations,
+    2,
+    "a transient initialization failure must not poison the runner",
+  );
   assert.equal(sessionCreations, 1);
   assert.equal(recovered.value, "recovered");
 });
@@ -663,8 +759,12 @@ test("WorkflowAgentRunner shares a concurrent runtime failure but retries later"
 test("WorkflowAgentRunner cancels one runtime waiter without cancelling shared initialization", async () => {
   let releaseRuntime!: (runtime: object) => void;
   let markEntered!: () => void;
-  const entered = new Promise<void>((resolve) => { markEntered = resolve; });
-  const runtimePending = new Promise<object>((resolve) => { releaseRuntime = resolve; });
+  const entered = new Promise<void>((resolve) => {
+    markEntered = resolve;
+  });
+  const runtimePending = new Promise<object>((resolve) => {
+    releaseRuntime = resolve;
+  });
   let runtimeCreations = 0;
   let sessionCreations = 0;
   const runner = new WorkflowAgentRunner({
@@ -779,7 +879,11 @@ test("WorkflowAgentRunner avoids rebuilding a current-Pi default model that clam
     },
   });
   await legacyRunner.run({ prompt: "test", label: "legacy default" });
-  assert.deepEqual(legacyLevels, ["max", "xhigh"], "pre-max Pi still receives the compatibility retry");
+  assert.deepEqual(
+    legacyLevels,
+    ["max", "xhigh"],
+    "pre-max Pi still receives the compatibility retry",
+  );
 });
 
 test("WorkflowAgentRunner retries xhigh when a legacy runtime clamps max to medium", async () => {
@@ -827,10 +931,11 @@ test("WorkflowAgentRunner does not prompt when aborted during session creation",
   let disposeCalls = 0;
   const runner = new WorkflowAgentRunner({
     cwd: process.cwd(),
-    createSession: () => new Promise((resolve) => {
-      release = resolve;
-      markSessionCreationStarted();
-    }),
+    createSession: () =>
+      new Promise((resolve) => {
+        release = resolve;
+        markSessionCreationStarted();
+      }),
   });
   const session = fakeSession({
     prompt: async () => {
@@ -929,10 +1034,7 @@ test("WorkflowAgentRunner preserves a prompt error when final cleanup also fails
     }),
   });
 
-  await assert.rejects(
-    runner.run({ prompt: "test", label: "cleanup" }),
-    /prompt failed/,
-  );
+  await assert.rejects(runner.run({ prompt: "test", label: "cleanup" }), /prompt failed/);
 });
 
 test("WorkflowAgentRunner contains abort rejection and preserves reject(undefined)", async () => {
@@ -1035,11 +1137,11 @@ test("writeRescuePatch: sanitizes hostile run/label input", () => {
 
 /** Helper: run git in a temp repo with an explicit author (CI has no global identity). */
 function gitIn(cwd: string, args: string[]): string {
-  return execFileSync(
-    "git",
-    ["-c", "user.email=t@t", "-c", "user.name=t", ...args],
-    { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
-  ).trim();
+  return execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
 }
 
 test("applyPatch: applies a clean patch and returns true", () => {
@@ -1150,7 +1252,9 @@ test("applyPatch rolls back earlier paths when the write phase fails midway", ()
     assert.equal(fs.readFileSync(path.join(repo, "a.txt"), "utf8"), "base\n");
     assert.equal(fs.existsSync(path.join(locked, "new.txt")), false);
   } finally {
-    try { fs.chmodSync(locked, 0o755); } catch {}
+    try {
+      fs.chmodSync(locked, 0o755);
+    } catch {}
     fs.rmSync(repo, { recursive: true, force: true });
   }
 });
@@ -1182,7 +1286,9 @@ test("applyPatch rollback restores parent directory modes after a partial delete
     assert.equal(fs.statSync(path.join(repo, "aaa")).mode & 0o777, 0o751);
     assert.equal(fs.existsSync(path.join(repo, "zzz-locked", "new.txt")), false);
   } finally {
-    try { fs.chmodSync(path.join(repo, "zzz-locked"), 0o755); } catch {}
+    try {
+      fs.chmodSync(path.join(repo, "zzz-locked"), 0o755);
+    } catch {}
     fs.rmSync(repo, { recursive: true, force: true });
   }
 });
@@ -1312,7 +1418,11 @@ test("captureWorktreeDiff: captures binary changes as applicable binary patch da
     const diff = captureWorktreeDiff(worktree);
     const patchText = diff.patch.toString("latin1");
     assert.ok(diff.filesChanged >= 1, "binary change is counted");
-    assert.match(patchText, /diff --git a\/blob\.bin b\/blob\.bin/, "patch carries the blob.bin path");
+    assert.match(
+      patchText,
+      /diff --git a\/blob\.bin b\/blob\.bin/,
+      "patch carries the blob.bin path",
+    );
     assert.match(patchText, /GIT binary patch/, "patch carries literal binary patch data");
     assert.doesNotMatch(patchText, /Binary files.*differ/, "no textless 'Binary files differ'");
     assert.equal(applyPatch(repo, diff.patch), true, "binary patch applies on the clean base");
@@ -1348,7 +1458,11 @@ test("applyPatch: a binary conflict leaves the shared bytes untouched", () => {
 
     const ok = applyPatch(repo, patch);
     assert.equal(ok, false, "binary conflict must not report success");
-    assert.deepEqual(fs.readFileSync(path.join(repo, "blob.bin")), before, "shared bytes restored, no corruption");
+    assert.deepEqual(
+      fs.readFileSync(path.join(repo, "blob.bin")),
+      before,
+      "shared bytes restored, no corruption",
+    );
     const status = gitIn(repo, ["status", "--porcelain"]);
     assert.doesNotMatch(status, /^(UU|AA) /m, "no unmerged index entries remain");
   } finally {
@@ -1379,7 +1493,9 @@ test("applyPatch and verification handle file-symlink conversions on repeated pa
     fs.writeFileSync(path.join(repo, "a"), "new file\n");
     fs.unlinkSync(path.join(repo, "z"));
     fs.symlinkSync("new-target", path.join(repo, "z"));
-    const patch = execFileSync("git", ["diff", "--binary", "--full-index", "--no-renames", base], { cwd: repo });
+    const patch = execFileSync("git", ["diff", "--binary", "--full-index", "--no-renames", base], {
+      cwd: repo,
+    });
     gitIn(repo, ["reset", "--hard", "-q", base]);
 
     assert.equal(applyPatch(repo, patch), true);
@@ -1426,7 +1542,11 @@ test("createWorktree uses unique detached identities and preserves an existing t
 
     assert.notEqual(first.path, second.path);
     assert.equal(fs.readFileSync(path.join(first.path, "x.txt"), "utf8"), "preserved\n");
-    assert.equal(gitIn(repo, ["branch", "--list", "ultracode/*"]), "", "detached worktrees create no cleanup branches");
+    assert.equal(
+      gitIn(repo, ["branch", "--list", "ultracode/*"]),
+      "",
+      "detached worktrees create no cleanup branches",
+    );
   } finally {
     if (first) removeWorktree(first);
     if (second) removeWorktree(second);
@@ -1445,7 +1565,10 @@ test("createWorktree cleans up when a checkout hook fails", () => {
     gitIn(repo, ["commit", "-qm", "base"]);
     const before = gitIn(repo, ["worktree", "list", "--porcelain"]);
     const tempPrefix = "ultracode-wt-hook-failure-0-";
-    const beforePaths = fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith(tempPrefix)).sort();
+    const beforePaths = fs
+      .readdirSync(os.tmpdir())
+      .filter((name) => name.startsWith(tempPrefix))
+      .sort();
     const hook = path.join(repo, ".git", "hooks", "post-checkout");
     fs.writeFileSync(
       hook,
@@ -1455,7 +1578,13 @@ test("createWorktree cleans up when a checkout hook fails", () => {
 
     assert.throws(() => createWorktree(repo, "hook-failure", 0), /worktree|checkout|status 7/i);
     assert.equal(gitIn(repo, ["worktree", "list", "--porcelain"]), before);
-    assert.deepEqual(fs.readdirSync(os.tmpdir()).filter((name) => name.startsWith(tempPrefix)).sort(), beforePaths);
+    assert.deepEqual(
+      fs
+        .readdirSync(os.tmpdir())
+        .filter((name) => name.startsWith(tempPrefix))
+        .sort(),
+      beforePaths,
+    );
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }
@@ -1495,7 +1624,11 @@ test("createWorktree rejects a hook that redirects linked-worktree Git metadata"
     }
   } finally {
     for (const candidate of created) {
-      try { gitIn(repo, ["worktree", "remove", "--force", "--force", candidate]); } catch { /* ignore */ }
+      try {
+        gitIn(repo, ["worktree", "remove", "--force", "--force", candidate]);
+      } catch {
+        /* ignore */
+      }
       fs.rmSync(candidate, { recursive: true, force: true });
     }
     fs.rmSync(repo, { recursive: true, force: true });
@@ -1517,12 +1650,13 @@ test("createWorktree preserves a hook-created raw-object sidecar", () => {
     const hook = path.join(repo, ".git", "hooks", "post-checkout");
     fs.writeFileSync(
       hook,
-      "#!/bin/sh\nmkdir \"$PWD.ultracode-objects\"\nprintf 'owned by hook\\n' > \"$PWD.ultracode-objects/marker\"\n",
+      '#!/bin/sh\nmkdir "$PWD.ultracode-objects"\nprintf \'owned by hook\\n\' > "$PWD.ultracode-objects/marker"\n',
     );
     fs.chmodSync(hook, 0o755);
 
     assert.throws(() => createWorktree(repo, "sidecar-hook", 0), /EEXIST|exist/i);
-    const candidates = fs.readdirSync(os.tmpdir())
+    const candidates = fs
+      .readdirSync(os.tmpdir())
       .filter((name) => name.startsWith(prefix) && name.endsWith(".ultracode-objects"));
     assert.equal(candidates.length, 1);
     sidecar = path.join(os.tmpdir(), candidates[0]!);
@@ -1581,7 +1715,11 @@ test("capture and cleanup reject a worktree path that changed ownership", () => 
 
     assert.throws(() => captureWorktreeDiff(original!), /ownership|identity|replaced/i);
     removeWorktree(original!);
-    assert.equal(fs.existsSync(originalPath), true, "cleanup must not remove the replacement worktree");
+    assert.equal(
+      fs.existsSync(originalPath),
+      true,
+      "cleanup must not remove the replacement worktree",
+    );
     fs.rmSync(originalPath, { recursive: true, force: true });
     removeWorktree(original!);
     assert.equal(
@@ -1617,7 +1755,10 @@ test("captureWorktreeDiff enforces one end-to-end Git deadline", () => {
     process.env.PATH = `${wrappers}${path.delimiter}${originalPath ?? ""}`;
 
     const startedAt = Date.now();
-    assert.throws(() => captureWorktreeDiff(worktree!, 50), /ownership|timed out|SIGKILL|ETIMEDOUT/i);
+    assert.throws(
+      () => captureWorktreeDiff(worktree!, 50),
+      /ownership|timed out|SIGKILL|ETIMEDOUT/i,
+    );
     assert.ok(Date.now() - startedAt < 500);
   } finally {
     process.env.PATH = originalPath;
@@ -1679,7 +1820,12 @@ test("captureWorktreeDiff never follows symlinked path ancestors", () => {
 });
 
 test("capture and apply support file, directory, and symlink topology conversions", () => {
-  const scenarios = ["file-to-directory", "directory-to-file", "symlink-to-directory", "directory-to-symlink"] as const;
+  const scenarios = [
+    "file-to-directory",
+    "directory-to-file",
+    "symlink-to-directory",
+    "directory-to-symlink",
+  ] as const;
   for (const scenario of scenarios) {
     const repo = fs.mkdtempSync(path.join(os.tmpdir(), `uc-worktree-${scenario}-`));
     let worktree: ReturnType<typeof createWorktree> | undefined;
@@ -1744,7 +1890,11 @@ test("applyPatch does not follow a final symlink while fsyncing directories", (t
     fs.rmSync(path.join(repo, "a"), { recursive: true });
     fs.symlinkSync(fifo, path.join(repo, "a"));
     gitIn(repo, ["add", "-A"]);
-    const patch = execFileSync("git", ["diff", "--cached", "--binary", "--full-index", "--no-renames", base], { cwd: repo });
+    const patch = execFileSync(
+      "git",
+      ["diff", "--cached", "--binary", "--full-index", "--no-renames", base],
+      { cwd: repo },
+    );
     const patchPath = path.join(parent, "delivery.patch");
     fs.writeFileSync(patchPath, patch);
     gitIn(repo, ["reset", "--hard", "-q", base]);
@@ -1754,12 +1904,11 @@ test("applyPatch does not follow a final symlink while fsyncing directories", (t
       const { applyPatch } = await import(${JSON.stringify(moduleUrl)});
       console.log(applyPatch(${JSON.stringify(repo)}, fs.readFileSync(${JSON.stringify(patchPath)}), 1000));
     `;
-    const output = execFileSync(process.execPath, [
-      "--experimental-strip-types",
-      "--input-type=module",
-      "--eval",
-      script,
-    ], { cwd: process.cwd(), encoding: "utf8", timeout: 3_000 });
+    const output = execFileSync(
+      process.execPath,
+      ["--experimental-strip-types", "--input-type=module", "--eval", script],
+      { cwd: process.cwd(), encoding: "utf8", timeout: 3_000 },
+    );
     assert.equal(output.trim(), "true");
     assert.equal(fs.readlinkSync(path.join(repo, "a")), fifo);
   } finally {
@@ -1875,7 +2024,14 @@ test("captureWorktreeDiff fails closed on dirty nested submodules", () => {
     gitIn(repo, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "dep"]);
     gitIn(repo, ["commit", "-qm", "base"]);
     worktree = createWorktree(repo, "submodule", 0);
-    gitIn(worktree.path, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q"]);
+    gitIn(worktree.path, [
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "update",
+      "--init",
+      "-q",
+    ]);
     assert.equal(captureWorktreeDiff(worktree).filesChanged, 0);
     fs.writeFileSync(path.join(worktree.path, "dep", "inside.txt"), "agent\n");
 
@@ -1925,7 +2081,10 @@ test("captureWorktreeDiff fails closed on dirty nested submodules", () => {
     const replacement = gitIn(submodule, ["rev-parse", "HEAD"]);
     gitIn(submodule, ["replace", original, replacement]);
     gitIn(submodule, ["reset", "--soft", original]);
-    assert.throws(() => captureWorktreeDiff(worktree!), /changed submodule index|dirty submodule|submodule.*preserved/i);
+    assert.throws(
+      () => captureWorktreeDiff(worktree!),
+      /changed submodule index|dirty submodule|submodule.*preserved/i,
+    );
   } finally {
     if (worktree) removeWorktree(worktree);
     fs.rmSync(parent, { recursive: true, force: true });
@@ -1953,7 +2112,14 @@ test("captureWorktreeDiff rejects staged, committed, and deleted gitlink changes
     gitIn(repo, ["-c", "protocol.file.allow=always", "submodule", "add", "-q", dependency, "dep"]);
     gitIn(repo, ["commit", "-qm", "base"]);
     worktree = createWorktree(repo, "gitlink-change", 0);
-    gitIn(worktree.path, ["-c", "protocol.file.allow=always", "submodule", "update", "--init", "-q"]);
+    gitIn(worktree.path, [
+      "-c",
+      "protocol.file.allow=always",
+      "submodule",
+      "update",
+      "--init",
+      "-q",
+    ]);
 
     fs.writeFileSync(path.join(dependency, "inside.txt"), "next\n");
     gitIn(dependency, ["add", "."]);
@@ -2067,7 +2233,13 @@ test("captureWorktreeDiff observes executable mode with core.filemode disabled",
 test("capture and apply preserve tab, quote, backslash, and Unicode paths", () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "uc-worktree-paths-"));
   let worktree: ReturnType<typeof createWorktree> | undefined;
-  const names = ["tab\tname.txt", "quote\"name.txt", "back\\slash.txt", "unicodé.txt", "line\nbreak.txt"];
+  const names = [
+    "tab\tname.txt",
+    'quote"name.txt',
+    "back\\slash.txt",
+    "unicodé.txt",
+    "line\nbreak.txt",
+  ];
   try {
     gitIn(repo, ["init", "-q"]);
     gitIn(repo, ["config", "user.email", "t@t"]);
@@ -2081,7 +2253,8 @@ test("capture and apply preserve tab, quote, backslash, and Unicode paths", () =
     const diff = captureWorktreeDiff(worktree);
     assert.equal(diff.filesChanged, names.length);
     assert.equal(applyPatch(repo, diff.patch), true);
-    for (const name of names) assert.equal(fs.readFileSync(path.join(repo, name), "utf8"), "agent\n");
+    for (const name of names)
+      assert.equal(fs.readFileSync(path.join(repo, name), "utf8"), "agent\n");
   } finally {
     if (worktree) removeWorktree(worktree);
     fs.rmSync(repo, { recursive: true, force: true });
@@ -2148,7 +2321,9 @@ test("applyPatch respects umask for newly materialized files and directories", (
       fs.mkdirSync(path.join(repo, "nested"));
       fs.writeFileSync(path.join(repo, "nested", "new.txt"), "new\n");
       gitIn(repo, ["add", "."]);
-      const patch = execFileSync("git", ["diff", "--cached", "--binary", "--full-index", "HEAD"], { cwd: repo });
+      const patch = execFileSync("git", ["diff", "--cached", "--binary", "--full-index", "HEAD"], {
+        cwd: repo,
+      });
       gitIn(repo, ["reset", "--hard", "-q", "HEAD"]);
       process.umask(mask);
 
@@ -2185,7 +2360,9 @@ test("applyPatch and verification ignore hostile global EOL and attributes confi
     const base = gitIn(repo, ["rev-parse", "HEAD"]);
     fs.writeFileSync(path.join(repo, "added.txt"), "alpha\nbeta\n");
     gitIn(repo, ["add", "added.txt"]);
-    const patch = execFileSync("git", ["diff", "--cached", "--binary", "--full-index", base], { cwd: repo });
+    const patch = execFileSync("git", ["diff", "--cached", "--binary", "--full-index", base], {
+      cwd: repo,
+    });
     gitIn(repo, ["reset", "--hard", "-q", base]);
 
     const xdgConfigHome = path.join(hostileHome, "xdg");
@@ -2255,17 +2432,24 @@ test("delivery verification composes content and later executable-mode patches",
     const base = gitIn(repo, ["rev-parse", "HEAD"]);
 
     fs.writeFileSync(path.join(repo, "run.sh"), "agent\n");
-    const contentPatch = execFileSync("git", ["diff", "--binary", "--full-index", base], { cwd: repo });
+    const contentPatch = execFileSync("git", ["diff", "--binary", "--full-index", base], {
+      cwd: repo,
+    });
     gitIn(repo, ["reset", "--hard", "-q", base]);
     fs.chmodSync(path.join(repo, "run.sh"), 0o755);
-    const modePatch = execFileSync("git", ["diff", "--binary", "--full-index", base], { cwd: repo });
+    const modePatch = execFileSync("git", ["diff", "--binary", "--full-index", base], {
+      cwd: repo,
+    });
     gitIn(repo, ["reset", "--hard", "-q", base]);
 
     assert.equal(applyPatch(repo, contentPatch), true);
     assert.equal(applyPatch(repo, modePatch), true);
     assert.equal(fs.readFileSync(path.join(repo, "run.sh"), "utf8"), "agent\n");
     assert.equal(fs.statSync(path.join(repo, "run.sh")).mode & 0o111, 0o111);
-    for (const [name, patch] of [["content", contentPatch], ["mode", modePatch]] as const) {
+    for (const [name, patch] of [
+      ["content", contentPatch],
+      ["mode", modePatch],
+    ] as const) {
       const patchPath = path.join(parent, `${name}.patch`);
       fs.writeFileSync(patchPath, patch);
       const hash = createHash("sha256").update(patch).digest("hex");
@@ -2361,10 +2545,15 @@ test("applyPatch rejects unsupported gitlink delivery", () => {
     const base = gitIn(repo, ["rev-parse", "HEAD"]);
     gitIn(repo, ["update-index", "--cacheinfo", `160000,${second},submodule`]);
     const patch = execFileSync("git", ["diff", "--cached", "--binary", base], { cwd: repo });
-    const indexBefore = fs.readFileSync(path.resolve(repo, gitIn(repo, ["rev-parse", "--git-path", "index"])));
+    const indexBefore = fs.readFileSync(
+      path.resolve(repo, gitIn(repo, ["rev-parse", "--git-path", "index"])),
+    );
 
     assert.equal(applyPatch(repo, patch), false);
-    assert.deepEqual(fs.readFileSync(path.resolve(repo, gitIn(repo, ["rev-parse", "--git-path", "index"]))), indexBefore);
+    assert.deepEqual(
+      fs.readFileSync(path.resolve(repo, gitIn(repo, ["rev-parse", "--git-path", "index"]))),
+      indexBefore,
+    );
   } finally {
     fs.rmSync(repo, { recursive: true, force: true });
   }
@@ -2389,7 +2578,11 @@ test("removeWorktree removes a locked owned worktree and its registration", () =
     assert.equal(gitIn(repo, ["worktree", "list", "--porcelain"]).includes(worktree.path), false);
   } finally {
     if (worktree) {
-      try { gitIn(repo, ["worktree", "unlock", worktree.path]); } catch { /* ignore */ }
+      try {
+        gitIn(repo, ["worktree", "unlock", worktree.path]);
+      } catch {
+        /* ignore */
+      }
       removeWorktree(worktree);
     }
     fs.rmSync(repo, { recursive: true, force: true });
@@ -2416,7 +2609,11 @@ test("removeWorktree repairs read-only directories after unregistering", () => {
     assert.equal(gitIn(repo, ["worktree", "list", "--porcelain"]).includes(worktree.path), false);
   } finally {
     if (worktree) {
-      try { fs.chmodSync(path.join(worktree.path, "dir"), 0o755); } catch { /* ignore */ }
+      try {
+        fs.chmodSync(path.join(worktree.path, "dir"), 0o755);
+      } catch {
+        /* ignore */
+      }
       removeWorktree(worktree);
     }
     fs.rmSync(repo, { recursive: true, force: true });
@@ -2441,7 +2638,10 @@ test("removeWorktree preserves a replaced raw-object sidecar", () => {
 
     removeWorktree(worktree);
     assert.equal(gitIn(repo, ["worktree", "list", "--porcelain"]).includes(worktree.path), false);
-    assert.equal(fs.readFileSync(path.join(worktree.rawObjectDirectory, "marker"), "utf8"), "replacement\n");
+    assert.equal(
+      fs.readFileSync(path.join(worktree.rawObjectDirectory, "marker"), "utf8"),
+      "replacement\n",
+    );
   } finally {
     if (worktree) fs.rmSync(worktree.rawObjectDirectory, { recursive: true, force: true });
     fs.rmSync(repo, { recursive: true, force: true });
@@ -2499,8 +2699,16 @@ test("removeWorktree preserves resources when the root .git file becomes a symli
     assert.equal(fs.existsSync(worktree.rawObjectDirectory), true);
   } finally {
     if (worktree && metadataFile) {
-      try { fs.unlinkSync(path.join(worktree.path, ".git")); } catch { /* ignore */ }
-      try { fs.renameSync(metadataFile, path.join(worktree.path, ".git")); } catch { /* ignore */ }
+      try {
+        fs.unlinkSync(path.join(worktree.path, ".git"));
+      } catch {
+        /* ignore */
+      }
+      try {
+        fs.renameSync(metadataFile, path.join(worktree.path, ".git"));
+      } catch {
+        /* ignore */
+      }
       removeWorktree(worktree);
     }
     fs.rmSync(repo, { recursive: true, force: true });

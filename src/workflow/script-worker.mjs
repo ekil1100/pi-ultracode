@@ -48,8 +48,16 @@ parentPort.on("message", (message) => {
 runRoot().catch((error) => finish(false, undefined, error));
 
 async function runRoot() {
-  const rootName = typeof workerData.name === "string" && workerData.name ? workerData.name : "workflow";
-  const result = await executeBody(workerData.body, workerData.args, 0, rootName, "$", workerData.meta);
+  const rootName =
+    typeof workerData.name === "string" && workerData.name ? workerData.name : "workflow";
+  const result = await executeBody(
+    workerData.body,
+    workerData.args,
+    0,
+    rootName,
+    "$",
+    workerData.meta,
+  );
   if (stickyFatalError) throw stickyFatalError;
   const unobserved = [...orchestrationPromises].filter((record) => !record.observed);
   if (unobserved.length > 0) {
@@ -81,15 +89,21 @@ async function executeBody(body, bodyArgs, depth, name, scopePath = "$", meta) {
   return executionContext.run(context, async () => {
     const scriptContext = buildScriptContext(bodyArgs);
     const wrapped = `(async function () {\n"use strict";\n${body}\n})()`;
-    return await new vm.Script(wrapped, { filename: `${name || "workflow"}.js` }).runInContext(scriptContext);
+    return await new vm.Script(wrapped, { filename: `${name || "workflow"}.js` }).runInContext(
+      scriptContext,
+    );
   });
 }
 
 function buildScriptContext(bodyArgs) {
-  const scriptContext = vm.createContext({}, {
-    codeGeneration: { strings: false, wasm: false },
-  });
-  const install = new vm.Script(`
+  const scriptContext = vm.createContext(
+    {},
+    {
+      codeGeneration: { strings: false, wasm: false },
+    },
+  );
+  const install = new vm.Script(
+    `
     (bridge, rawArgs, cwdValue) => {
       const localize = (value, seen = new WeakMap()) => {
         if (value === null || typeof value !== "object") return value
@@ -236,27 +250,37 @@ function buildScriptContext(bodyArgs) {
       })
       Object.freeze(Math)
     }
-  `, { filename: "workflow-bootstrap.js" }).runInContext(scriptContext);
-  install(Object.freeze({
-    agent,
-    parallel,
-    pipeline,
-    workflow,
-    phase,
-    log: logLine,
-    checkpoint,
-    loop: markLoopIteration,
-    invoke: invokeHelper,
-  }), bodyArgs, workerData.cwd);
+  `,
+    { filename: "workflow-bootstrap.js" },
+  ).runInContext(scriptContext);
+  install(
+    Object.freeze({
+      agent,
+      parallel,
+      pipeline,
+      workflow,
+      phase,
+      log: logLine,
+      checkpoint,
+      loop: markLoopIteration,
+      invoke: invokeHelper,
+    }),
+    bodyArgs,
+    workerData.cwd,
+  );
   return scriptContext;
 }
 
 function checkpoint() {
   throwIfAborted();
   checkpointCount++;
-  const limit = Number.isInteger(workerData.checkpointLimit) ? workerData.checkpointLimit : 1_000_000;
+  const limit = Number.isInteger(workerData.checkpointLimit)
+    ? workerData.checkpointLimit
+    : 1_000_000;
   if (checkpointCount > limit) {
-    throw makePolicyError(`workflow exceeded the ${limit}-operation script checkpoint limit (runaway loop?)`);
+    throw makePolicyError(
+      `workflow exceeded the ${limit}-operation script checkpoint limit (runaway loop?)`,
+    );
   }
   if ((checkpointCount & 1023) === 0) sendHeartbeat();
 }
@@ -294,12 +318,16 @@ async function parallelImpl(callSite, thunks, options = {}) {
   throwIfAborted();
   if (!Array.isArray(thunks)) throw new TypeError("parallel() expects an array of functions");
   if (thunks.length > MAX_ITEMS_PER_CALL) {
-    throw makePolicyError(`parallel() accepts at most ${MAX_ITEMS_PER_CALL} items (got ${thunks.length})`);
+    throw makePolicyError(
+      `parallel() accepts at most ${MAX_ITEMS_PER_CALL} items (got ${thunks.length})`,
+    );
   }
   const plannedThunks = copyDenseDataArray(thunks, "parallel() thunk array");
   for (const thunk of plannedThunks) {
     if (typeof thunk !== "function") {
-      throw new TypeError("parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)");
+      throw new TypeError(
+        "parallel() expects an array of functions, not promises. Wrap each call: () => agent(...)",
+      );
     }
   }
   const execution = executionContext.getStore() ?? createExecutionScope({ scopePath: "$" });
@@ -309,9 +337,13 @@ async function parallelImpl(callSite, thunks, options = {}) {
   const panelSite = `${panelSource}#${plannedThunks.length}:${reserveAgents}${panelLoops ? `@${panelLoops}` : ""}`;
   const panelCallPath = allocateCallPath(execution, "parallel", "p", panelSite);
   if (reserveAgents < plannedThunks.length) {
-    throw makePolicyError(`parallel reserveAgents must be at least the number of thunks (${plannedThunks.length}); got ${reserveAgents}`);
+    throw makePolicyError(
+      `parallel reserveAgents must be at least the number of thunks (${plannedThunks.length}); got ${reserveAgents}`,
+    );
   }
-  const parentReservationIds = Array.isArray(execution.reservationIds) ? execution.reservationIds : [];
+  const parentReservationIds = Array.isArray(execution.reservationIds)
+    ? execution.reservationIds
+    : [];
   const panel = await rpc("reservePanel", {
     callPath: panelCallPath,
     reserveAgents,
@@ -319,8 +351,13 @@ async function parallelImpl(callSite, thunks, options = {}) {
     parentReservationIds,
   });
   const panelReservationId = requireString(panel?.panelReservationId, "panelReservationId");
-  const branchReservationIds = Array.isArray(panel?.branchReservationIds) ? panel.branchReservationIds : [];
-  if (branchReservationIds.length !== plannedThunks.length || branchReservationIds.some((id) => typeof id !== "string")) {
+  const branchReservationIds = Array.isArray(panel?.branchReservationIds)
+    ? panel.branchReservationIds
+    : [];
+  if (
+    branchReservationIds.length !== plannedThunks.length ||
+    branchReservationIds.some((id) => typeof id !== "string")
+  ) {
     throw makePolicyError("workflow host returned an invalid parallel reservation panel");
   }
 
@@ -328,49 +365,59 @@ async function parallelImpl(callSite, thunks, options = {}) {
   let firstFatal;
   const branchOutcomes = Array.from({ length: plannedThunks.length }, () => "pending");
   try {
-    const branchPromises = collectAgentBatch(() => plannedThunks.map(async (thunk, index) => {
-      const branchReservationId = branchReservationIds[index];
-      const childContext = createExecutionScope({
-        workflowPath: [...(execution.workflowPath ?? [])],
-        depth: execution.depth,
-        workflowContext: execution.workflowContext,
-        scheduling: [...execution.scheduling, {
-          kind: "parallel", callPath: panelCallPath, branchIndex: index, branchCount: plannedThunks.length,
-        }],
-        currentPhase: execution.currentPhase,
-        reservationIds: [branchReservationId, panelReservationId].filter(Boolean),
-        scopePath: `${panelCallPath}/b:${index}`,
-        loopIterations: execution.loopIterations,
-      });
-      return executionContext.run(childContext, async () => {
-        try {
-          throwIfAborted();
-          const value = await thunk();
-          branchOutcomes[index] = "success";
-          await rpc("completePanelBranch", {
-            callPath: panelCallPath,
-            branchIndex: index,
-            outcome: "success",
-          });
-          return value;
-        } catch (error) {
-          if (isFatal(error)) {
-            firstFatal ??= error;
-            throw error;
+    const branchPromises = collectAgentBatch(() =>
+      plannedThunks.map(async (thunk, index) => {
+        const branchReservationId = branchReservationIds[index];
+        const childContext = createExecutionScope({
+          workflowPath: [...(execution.workflowPath ?? [])],
+          depth: execution.depth,
+          workflowContext: execution.workflowContext,
+          scheduling: [
+            ...execution.scheduling,
+            {
+              kind: "parallel",
+              callPath: panelCallPath,
+              branchIndex: index,
+              branchCount: plannedThunks.length,
+            },
+          ],
+          currentPhase: execution.currentPhase,
+          reservationIds: [branchReservationId, panelReservationId].filter(Boolean),
+          scopePath: `${panelCallPath}/b:${index}`,
+          loopIterations: execution.loopIterations,
+        });
+        return executionContext.run(childContext, async () => {
+          try {
+            throwIfAborted();
+            const value = await thunk();
+            branchOutcomes[index] = "success";
+            await rpc("completePanelBranch", {
+              callPath: panelCallPath,
+              branchIndex: index,
+              outcome: "success",
+            });
+            return value;
+          } catch (error) {
+            if (isFatal(error)) {
+              firstFatal ??= error;
+              throw error;
+            }
+            branchOutcomes[index] = "failed";
+            await rpc("completePanelBranch", {
+              callPath: panelCallPath,
+              branchIndex: index,
+              outcome: "failed",
+            });
+            logLine(`parallel[${index}] failed: ${messageOf(error)}`);
+            return null;
+          } finally {
+            await cleanupRpc("releasePanel", { reservationId: branchReservationId }).catch(
+              () => undefined,
+            );
           }
-          branchOutcomes[index] = "failed";
-          await rpc("completePanelBranch", {
-            callPath: panelCallPath,
-            branchIndex: index,
-            outcome: "failed",
-          });
-          logLine(`parallel[${index}] failed: ${messageOf(error)}`);
-          return null;
-        } finally {
-          await cleanupRpc("releasePanel", { reservationId: branchReservationId }).catch(() => undefined);
-        }
-      });
-    }));
+        });
+      }),
+    );
     const settled = await Promise.allSettled(branchPromises);
     if (firstFatal) throw firstFatal;
     const rejected = settled.find((entry) => entry.status === "rejected");
@@ -396,44 +443,62 @@ function pipeline(callSite, items, ...stages) {
 
 async function pipelineImpl(callSite, items, ...stages) {
   throwIfAborted();
-  if (!Array.isArray(items)) throw new TypeError("pipeline() expects an array as the first argument");
+  if (!Array.isArray(items))
+    throw new TypeError("pipeline() expects an array as the first argument");
   if (items.length > MAX_ITEMS_PER_CALL) {
-    throw makePolicyError(`pipeline() accepts at most ${MAX_ITEMS_PER_CALL} items (got ${items.length})`);
+    throw makePolicyError(
+      `pipeline() accepts at most ${MAX_ITEMS_PER_CALL} items (got ${items.length})`,
+    );
   }
   const plannedItems = copyDenseDataArray(items, "pipeline() item array");
   if (stages.some((stage) => typeof stage !== "function")) {
-    throw new TypeError("pipeline() stages must be functions: pipeline(items, item => ..., result => ...)");
+    throw new TypeError(
+      "pipeline() stages must be functions: pipeline(items, item => ..., result => ...)",
+    );
   }
   const execution = executionContext.getStore() ?? createExecutionScope({ scopePath: "$" });
   const pipelineCallPath = allocateCallPath(execution, "pipeline", "l", callSite);
-  return await Promise.all(collectAgentBatch(() => plannedItems.map(async (item, index) => {
-    let value = item;
-    for (const [stageIndex, stage] of stages.entries()) {
-      try {
-        throwIfAborted();
-        const stageContext = createExecutionScope({
-          workflowPath: [...(execution.workflowPath ?? [])],
-          depth: execution.depth,
-          workflowContext: execution.workflowContext,
-          scheduling: [...execution.scheduling, {
-            kind: "pipeline", callPath: pipelineCallPath, itemIndex: index, itemCount: plannedItems.length,
-            stageIndex, stageCount: stages.length,
-          }],
-          currentPhase: execution.currentPhase,
-          reservationIds: Array.isArray(execution.reservationIds) ? [...execution.reservationIds] : [],
-          scopePath: `${pipelineCallPath}/i:${index}/s:${stageIndex}`,
-          loopIterations: execution.loopIterations,
-        });
-        value = await executionContext.run(stageContext, () => stage(value, item, index));
-        throwIfAborted();
-      } catch (error) {
-        if (isFatal(error)) throw error;
-        logLine(`pipeline[${index}] failed: ${messageOf(error)}`);
-        return null;
-      }
-    }
-    return value;
-  })));
+  return await Promise.all(
+    collectAgentBatch(() =>
+      plannedItems.map(async (item, index) => {
+        let value = item;
+        for (const [stageIndex, stage] of stages.entries()) {
+          try {
+            throwIfAborted();
+            const stageContext = createExecutionScope({
+              workflowPath: [...(execution.workflowPath ?? [])],
+              depth: execution.depth,
+              workflowContext: execution.workflowContext,
+              scheduling: [
+                ...execution.scheduling,
+                {
+                  kind: "pipeline",
+                  callPath: pipelineCallPath,
+                  itemIndex: index,
+                  itemCount: plannedItems.length,
+                  stageIndex,
+                  stageCount: stages.length,
+                },
+              ],
+              currentPhase: execution.currentPhase,
+              reservationIds: Array.isArray(execution.reservationIds)
+                ? [...execution.reservationIds]
+                : [],
+              scopePath: `${pipelineCallPath}/i:${index}/s:${stageIndex}`,
+              loopIterations: execution.loopIterations,
+            });
+            value = await executionContext.run(stageContext, () => stage(value, item, index));
+            throwIfAborted();
+          } catch (error) {
+            if (isFatal(error)) throw error;
+            logLine(`pipeline[${index}] failed: ${messageOf(error)}`);
+            return null;
+          }
+        }
+        return value;
+      }),
+    ),
+  );
 }
 
 function copyDenseDataArray(value, label) {
@@ -457,7 +522,9 @@ async function workflowImpl(callSite, nameOrRef, nestedArgs) {
   const execution = executionContext.getStore() ?? createExecutionScope({ scopePath: "$" });
   const workflowCallPath = allocateCallPath(execution, "workflow", "w", callSite);
   if ((execution.depth ?? 0) >= 1) {
-    throw new Error("workflow() nesting is one level deep only; cannot call workflow() inside a child workflow");
+    throw new Error(
+      "workflow() nesting is one level deep only; cannot call workflow() inside a child workflow",
+    );
   }
   let argsSnapshot;
   try {
@@ -483,7 +550,9 @@ async function workflowImpl(callSite, nameOrRef, nestedArgs) {
   try {
     outputSnapshot = structuredClone(childResult);
   } catch (error) {
-    throw makePolicyError(`nested workflow output must be structured-cloneable: ${messageOf(error)}`);
+    throw makePolicyError(
+      `nested workflow output must be structured-cloneable: ${messageOf(error)}`,
+    );
   }
   await rpc("validateOutput", { value: outputSnapshot });
   return outputSnapshot;
@@ -505,7 +574,9 @@ function createExecutionScope(input) {
   };
   Object.defineProperty(scope, "currentPhase", {
     get: () => phaseState.value,
-    set: (value) => { phaseState.value = value },
+    set: (value) => {
+      phaseState.value = value;
+    },
   });
   return scope;
 }
@@ -514,7 +585,10 @@ function allocateCallPath(execution, counter, segment, callSite) {
   const rawSite = typeof callSite === "string" && callSite ? callSite : `${counter}:dynamic`;
   const [site, loopSuffix = ""] = rawSite.split("@", 2);
   const loopIdentity = loopSuffix
-    ? `@${loopSuffix.split(",").map((loopSite) => `${loopSite}=${execution.loopIterations[loopSite] ?? -1}`).join(",")}`
+    ? `@${loopSuffix
+        .split(",")
+        .map((loopSite) => `${loopSite}=${execution.loopIterations[loopSite] ?? -1}`)
+        .join(",")}`
     : "";
   const identifiedSite = `${site}${loopIdentity}`;
   const key = `${segment}:${identifiedSite}`;
@@ -567,8 +641,15 @@ function normalizeReserveAgents(options, fallback) {
   if (typeof options !== "object") throw new TypeError("parallel() options must be an object");
   const value = options.reserveAgents;
   if (value === undefined || value === null) return fallback;
-  if (typeof value !== "number" || !Number.isInteger(value) || value < 0 || value > MAX_RESERVE_AGENTS) {
-    throw makePolicyError(`parallel reserveAgents must be an integer between 0 and ${MAX_RESERVE_AGENTS}`);
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 0 ||
+    value > MAX_RESERVE_AGENTS
+  ) {
+    throw makePolicyError(
+      `parallel reserveAgents must be an integer between 0 and ${MAX_RESERVE_AGENTS}`,
+    );
   }
   return value;
 }
@@ -620,9 +701,13 @@ function consumeHostCall() {
 function startOrchestration(factory) {
   const execution = executionContext.getStore() ?? createExecutionScope({ scopePath: "$" });
   if (execution.orchestrationState.active > 0) {
-    return trackOrchestration(Promise.reject(makePolicyError(
-      "native concurrent orchestration in one scope is non-deterministic; use parallel() or pipeline()",
-    )));
+    return trackOrchestration(
+      Promise.reject(
+        makePolicyError(
+          "native concurrent orchestration in one scope is non-deterministic; use parallel() or pipeline()",
+        ),
+      ),
+    );
   }
   execution.orchestrationState.active++;
   let promise;
@@ -632,8 +717,12 @@ function startOrchestration(factory) {
     promise = Promise.reject(error);
   }
   promise.then(
-    () => { execution.orchestrationState.active--; },
-    () => { execution.orchestrationState.active--; },
+    () => {
+      execution.orchestrationState.active--;
+    },
+    () => {
+      execution.orchestrationState.active--;
+    },
   );
   return trackOrchestration(promise);
 }
@@ -644,8 +733,12 @@ function trackOrchestration(promise) {
   // Observe settlement immediately so fast failures are contained and root
   // completion can reject detached chains that still have live host work.
   promise.then(
-    () => { record.settled = true; },
-    () => { record.settled = true; },
+    () => {
+      record.settled = true;
+    },
+    () => {
+      record.settled = true;
+    },
   );
   const observe = () => {
     record.observed = true;
@@ -737,7 +830,8 @@ function requireString(value, name) {
 }
 
 function sendHeartbeat() {
-  if (!finished) parentPort.postMessage({ type: "heartbeat", at: Date.now(), checkpoints: checkpointCount });
+  if (!finished)
+    parentPort.postMessage({ type: "heartbeat", at: Date.now(), checkpoints: checkpointCount });
 }
 
 function finish(ok, value, error) {

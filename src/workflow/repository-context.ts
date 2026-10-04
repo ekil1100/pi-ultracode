@@ -27,7 +27,9 @@ export function resolveRepositoryContext(cwd: string): RepositoryContext {
   }
 
   const repoRoot = fs.realpathSync(gitLine(realCwd, ["rev-parse", "--show-toplevel"]));
-  const gitDir = fs.realpathSync(gitLine(realCwd, ["rev-parse", "--path-format=absolute", "--git-dir"]));
+  const gitDir = fs.realpathSync(
+    gitLine(realCwd, ["rev-parse", "--path-format=absolute", "--git-dir"]),
+  );
   const gitCommonDir = fs.realpathSync(
     gitLine(realCwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
   );

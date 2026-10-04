@@ -37,7 +37,8 @@ const BUILTIN_AGENT_TYPES: AgentTypeDef[] = [
   {
     name: "claude",
     description: "General-purpose subagent with the full coding toolset.",
-    systemPrompt: "You are a capable, autonomous coding subagent. Complete the task end-to-end and report concrete results.",
+    systemPrompt:
+      "You are a capable, autonomous coding subagent. Complete the task end-to-end and report concrete results.",
     systemPromptMode: "append",
     source: "builtin",
   },
@@ -69,7 +70,8 @@ const BUILTIN_AGENT_TYPES: AgentTypeDef[] = [
   },
   {
     name: "code-reviewer",
-    description: "Adversarial reviewer that hunts for correctness, security, and reliability defects.",
+    description:
+      "Adversarial reviewer that hunts for correctness, security, and reliability defects.",
     systemPrompt:
       "You are an adversarial code-review subagent. Default to skepticism: try to REFUTE the claim or find the bug. Cite exact file:line evidence. If you cannot find a concrete defect, say so plainly rather than inventing one.",
     systemPromptMode: "append",
@@ -160,7 +162,10 @@ export function parseAgentTypeFile(
  * Minimal YAML-ish frontmatter parser: a leading `---` ... `---` block of
  * `key: value` pairs, supporting block scalars (`key: |`).
  */
-export function parseFrontmatter(content: string): { frontmatter: Record<string, string>; body: string } {
+export function parseFrontmatter(content: string): {
+  frontmatter: Record<string, string>;
+  body: string;
+} {
   const normalized = content.replace(/\r\n/g, "\n");
   const match = normalized.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
   if (!match) return { frontmatter: {}, body: normalized };

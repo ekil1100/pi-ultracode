@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test } from "vite-plus/test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -27,7 +27,9 @@ function fakeSession(overrides: Partial<AgentSessionLike> = {}): AgentSessionLik
     thinkingLevel: "medium",
     supportsThinking: () => true,
     getAvailableThinkingLevels: () => ["medium"],
-    setThinkingLevel(level) { this.thinkingLevel = level; },
+    setThinkingLevel(level) {
+      this.thinkingLevel = level;
+    },
     prompt: async () => {},
     abort: async () => {},
     subscribe: () => () => {},
@@ -49,40 +51,58 @@ test("forwardTelemetry emits visible text, bounded tool previews, and no thinkin
   const events: AgentTelemetryEvent[] = [];
   const emit = (event: AgentTelemetryEvent) => events.push(event);
 
-  forwardTelemetry({
-    type: "message_update",
-    assistantMessageEvent: { type: "text_delta", delta: "hello" },
-  }, emit);
-  forwardTelemetry({
-    type: "message_update",
-    assistantMessageEvent: { type: "thinking_delta", delta: "hidden chain of thought" },
-  }, emit);
-  forwardTelemetry({
-    type: "tool_execution_start",
-    toolCallId: "t1",
-    toolName: "bash",
-    args: { command: "npm test" },
-  }, emit);
-  forwardTelemetry({
-    type: "tool_execution_end",
-    toolCallId: "t1",
-    toolName: "bash",
-    isError: false,
-    result: { content: [{ type: "text", text: "ok\nAPI_KEY=TOP_SECRET" }] },
-  }, emit);
+  forwardTelemetry(
+    {
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta: "hello" },
+    },
+    emit,
+  );
+  forwardTelemetry(
+    {
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", delta: "hidden chain of thought" },
+    },
+    emit,
+  );
+  forwardTelemetry(
+    {
+      type: "tool_execution_start",
+      toolCallId: "t1",
+      toolName: "bash",
+      args: { command: "npm test" },
+    },
+    emit,
+  );
+  forwardTelemetry(
+    {
+      type: "tool_execution_end",
+      toolCallId: "t1",
+      toolName: "bash",
+      isError: false,
+      result: { content: [{ type: "text", text: "ok\nAPI_KEY=TOP_SECRET" }] },
+    },
+    emit,
+  );
 
   assert.deepEqual(events[0], { kind: "text_delta", delta: "hello" });
-  assert.equal(events.some((event: any) => JSON.stringify(event).includes("hidden chain of thought")), false);
+  assert.equal(
+    events.some((event: any) => JSON.stringify(event).includes("hidden chain of thought")),
+    false,
+  );
   const toolEnd = events.find((event) => event.kind === "tool_end") as any;
   assert.match(toolEnd.resultPreview, /API_KEY=\*\*\*/);
   assert.doesNotMatch(toolEnd.resultPreview, /TOP_SECRET/);
 
-  forwardTelemetry({
-    type: "tool_execution_end",
-    toolCallId: "t2",
-    toolName: "bash",
-    result: { content: [{ type: "text", text: "界".repeat(10_000) }] },
-  }, emit);
+  forwardTelemetry(
+    {
+      type: "tool_execution_end",
+      toolCallId: "t2",
+      toolName: "bash",
+      result: { content: [{ type: "text", text: "界".repeat(10_000) }] },
+    },
+    emit,
+  );
   const bounded = events.at(-1) as any;
   assert.ok(Buffer.byteLength(bounded.resultPreview, "utf8") <= 8 * 1024);
 });
@@ -107,17 +127,38 @@ test("WorkflowAgentRunner reports the actual model, effort, usage, and live tele
         messages,
         subscribe: (next) => {
           listener = next;
-          return () => { listener = undefined; };
+          return () => {
+            listener = undefined;
+          };
         },
         prompt: async () => {
           listener?.({ type: "turn_start", turnIndex: 0 });
-          listener?.({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "stream" } });
-          listener?.({ type: "tool_execution_start", toolCallId: "one", toolName: "read", args: { path: "one.ts" } });
-          listener?.({ type: "tool_execution_start", toolCallId: "two", toolName: "read", args: { path: "two.ts" } });
+          listener?.({
+            type: "message_update",
+            assistantMessageEvent: { type: "text_delta", delta: "stream" },
+          });
+          listener?.({
+            type: "tool_execution_start",
+            toolCallId: "one",
+            toolName: "read",
+            args: { path: "one.ts" },
+          });
+          listener?.({
+            type: "tool_execution_start",
+            toolCallId: "two",
+            toolName: "read",
+            args: { path: "two.ts" },
+          });
           const message = {
             role: "assistant",
             content: [{ type: "text", text: "stream complete" }],
-            usage: { input: 100, output: 40, cacheRead: 500, cacheWrite: 20, cost: { total: 0.25 } },
+            usage: {
+              input: 100,
+              output: 40,
+              cacheRead: 500,
+              cacheWrite: 20,
+              cost: { total: 0.25 },
+            },
           };
           messages.push(message);
           listener?.({ type: "message_end", message });
@@ -167,14 +208,27 @@ test("WorkflowRunDetails aggregates, redacts, persists, and restores a task time
   details.record(1, { kind: "turn_start", turnIndex: 0 });
   details.record(1, { kind: "text_delta", delta: "Analyzing TOKEN=STREAM_SECRET" });
   const liveTranscriptPath = details.getTaskSummary(1)!.transcriptPath!;
-  const pendingDisk = [liveTranscriptPath, `${liveTranscriptPath}.head`, `${liveTranscriptPath}.tail`]
+  const pendingDisk = [
+    liveTranscriptPath,
+    `${liveTranscriptPath}.head`,
+    `${liveTranscriptPath}.tail`,
+  ]
     .filter((candidate) => fs.existsSync(candidate))
     .map((candidate) => fs.readFileSync(candidate, "utf8"))
     .join("\n");
-  assert.doesNotMatch(pendingDisk, /Analyzing|STREAM_SECRET/, "raw text deltas are never persisted");
+  assert.doesNotMatch(
+    pendingDisk,
+    /Analyzing|STREAM_SECRET/,
+    "raw text deltas are never persisted",
+  );
   details.record(1, { kind: "thinking_start" });
   details.record(1, { kind: "thinking_end" });
-  details.record(1, { kind: "tool_start", toolCallId: "tool-1", toolName: "bash", toolArgs: "npm test" });
+  details.record(1, {
+    kind: "tool_start",
+    toolCallId: "tool-1",
+    toolName: "bash",
+    toolArgs: "npm test",
+  });
   details.record(1, {
     kind: "tool_end",
     toolCallId: "tool-1",
@@ -239,11 +293,15 @@ test("WorkflowRunDetails aggregates, redacts, persists, and restores a task time
   assert.equal(restoredTask.agentType, "reviewer");
   assert.equal(restoredTask.isolation, "worktree");
   assert.equal(restoredTask.structuredOutput, true);
-  assert.equal(restoredTask.events.filter((event) => event.kind === "tool").length, 1, "start/end upserts restore as one tool event");
+  assert.equal(
+    restoredTask.events.filter((event) => event.kind === "tool").length,
+    1,
+    "start/end upserts restore as one tool event",
+  );
   assert.equal(restoredTask.events.filter((event) => event.kind === "thinking").length, 1);
   assert.ok(
-    restoredTask.events.findIndex((event) => event.kind === "turn")
-      < restoredTask.events.findIndex((event) => event.kind === "text"),
+    restoredTask.events.findIndex((event) => event.kind === "turn") <
+      restoredTask.events.findIndex((event) => event.kind === "text"),
     "timeline restoration uses event sequence rather than completion write order",
   );
   assert.match(restoredTask.prompt, /API_KEY=\*\*\*/);
@@ -254,7 +312,11 @@ test("WorkflowRunDetails aggregates, redacts, persists, and restores a task time
 test("WorkflowRunDetails drops legacy budgetTotal while preserving usage on restore and persist", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-legacy-budget-"));
   try {
-    const details = new WorkflowRunDetails({ runId: "wf_legacy_budget", name: "legacy", runsDir: root });
+    const details = new WorkflowRunDetails({
+      runId: "wf_legacy_budget",
+      name: "legacy",
+      runsDir: root,
+    });
     details.startTask({ id: 1, label: "usage", prompt: "p" });
     details.finishTask(1, {
       status: "done",
@@ -317,13 +379,18 @@ test("final task transcripts preserve valid JSONL within the strict 10MB cap", (
     kind: "message_end",
     text: "x".repeat(MAX_TASK_TRANSCRIPT_BYTES + 512 * 1024),
   });
-  assert.ok(details.getTask(1)?.events.some((event) => event.kind === "text" && event.text?.endsWith("x")));
+  assert.ok(
+    details.getTask(1)?.events.some((event) => event.kind === "text" && event.text?.endsWith("x")),
+  );
   const summary = details.finishTask(1, { status: "done", result: "done" })!;
   const snapshot = createSnapshot({ name: "cap", description: "x" }, "wf_artifact_cap");
   details.close(snapshot);
 
   const stat = fs.statSync(summary.transcriptPath!);
-  assert.ok(stat.size <= MAX_TASK_TRANSCRIPT_BYTES, `${stat.size} exceeds the per-task artifact cap`);
+  assert.ok(
+    stat.size <= MAX_TASK_TRANSCRIPT_BYTES,
+    `${stat.size} exceeds the per-task artifact cap`,
+  );
   const lines = fs.readFileSync(summary.transcriptPath!, "utf8").trim().split("\n");
   for (const line of lines) assert.doesNotThrow(() => JSON.parse(line));
   assert.ok(lines.some((line) => JSON.parse(line).recordType === "omitted"));
@@ -335,60 +402,79 @@ test("workflow rendering shows model, effort, turns, tools, and compact token us
   snapshot.newTokens = 141_000;
   snapshot.replayedTokens = 62_000;
   snapshot.spentTokens = 32_000;
-  snapshot.agents = [{
-    id: 1,
-    label: "payments review",
-    status: "done",
-    modelId: "gpt-5.6-sol",
-    effort: "max",
-    usage: {
-      inputTokens: 109_000,
-      outputTokens: 32_000,
-      cacheReadTokens: 280_000,
-      cacheWriteTokens: 18_000,
-      totalTokens: 141_000,
-      cost: 1.2345,
-      turns: 15,
-      toolUses: 42,
-      retries: 0,
-      compactions: 0,
+  snapshot.agents = [
+    {
+      id: 1,
+      label: "payments review",
+      status: "done",
+      modelId: "gpt-5.6-sol",
+      effort: "max",
+      usage: {
+        inputTokens: 109_000,
+        outputTokens: 32_000,
+        cacheReadTokens: 280_000,
+        cacheWriteTokens: 18_000,
+        totalTokens: 141_000,
+        cost: 1.2345,
+        turns: 15,
+        toolUses: 42,
+        retries: 0,
+        compactions: 0,
+      },
     },
-  }];
+  ];
   const text = renderWorkflowLines(recompute(snapshot)).join("\n");
   assert.match(text, /203k token \(141k new, 62k replayed\)/);
   assert.doesNotMatch(text, /\/500k out|\/\d+k out/);
   assert.match(text, /gpt-5\.6-sol • max · 15 turns · 42 tool uses · 141k token/);
   assert.doesNotMatch(text, /openai-codex/);
 
-  snapshot.agents = [{ id: 9, label: "starting", status: "running", requestedModelId: "requested-only", requestedEffort: "high" }];
+  snapshot.agents = [
+    {
+      id: 9,
+      label: "starting",
+      status: "running",
+      requestedModelId: "requested-only",
+      requestedEffort: "high",
+    },
+  ];
   const unresolved = renderWorkflowLines(recompute(snapshot)).join("\n");
   assert.match(unresolved, /resolving model… • resolving effort…/);
-  assert.doesNotMatch(unresolved, /requested-only/, "requested values are not presented as actually applied");
+  assert.doesNotMatch(
+    unresolved,
+    /requested-only/,
+    "requested values are not presented as actually applied",
+  );
 
   snapshot.agents = [{ id: 2, label: "legacy", status: "cached", legacyCache: true }];
   const legacy = renderWorkflowLines(recompute(snapshot)).join("\n");
-  assert.match(legacy, /model unavailable • effort unavailable · metrics unavailable · cached legacy entry/);
+  assert.match(
+    legacy,
+    /model unavailable • effort unavailable · metrics unavailable · cached legacy entry/,
+  );
   assert.doesNotMatch(legacy, /0 turns/);
 
-  snapshot.agents = [{
-    id: 3,
-    label: "cancelled",
-    status: "cancelled",
-    modelId: "gpt-5.6-sol",
-    effort: "max",
-    usage: {
-      inputTokens: 100,
-      outputTokens: 40,
-      cacheReadTokens: 0,
-      cacheWriteTokens: 0,
-      totalTokens: 140,
-      cost: 0,
-      turns: 1,
-      toolUses: 0,
-      retries: 0,
-      compactions: 0,
+  snapshot.agents = [
+    {
+      id: 3,
+      label: "cancelled",
+      status: "cancelled",
+      modelId: "gpt-5.6-sol",
+      effort: "max",
+      usage: {
+        inputTokens: 100,
+        outputTokens: 40,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 140,
+        cost: 0,
+        turns: 1,
+        toolUses: 0,
+        retries: 0,
+        compactions: 0,
+      },
     },
-  }];
+  ];
   const partial = renderWorkflowLines(recompute(snapshot)).join("\n");
   assert.match(partial, /140\+ token · partial/);
   assert.match(partial, /1 cancelled/);
@@ -416,15 +502,36 @@ test("runWorkflow separates new token usage from cached replay usage", async () 
       cwd: process.cwd(),
     }),
   };
-  const firstJournal = RunJournal.create(root, { type: "run", projectTrusted: false, targetIdentity: resolveRepositoryContext(process.cwd()).identity, runId, name: "cache", scriptHash: "1", startedAt: 0 });
+  const firstJournal = RunJournal.create(root, {
+    type: "run",
+    projectTrusted: false,
+    targetIdentity: resolveRepositoryContext(process.cwd()).identity,
+    runId,
+    name: "cache",
+    scriptHash: "1",
+    startedAt: 0,
+  });
   const first = await runWorkflow(script, { projectTrusted: false, runner, journal: firstJournal });
   firstJournal.close();
   assert.equal(first.newTokens, 140);
   assert.equal(first.replayedTokens, 0);
 
-  const secondJournal = RunJournal.resume(root, runId, { type: "run", projectTrusted: false, targetIdentity: resolveRepositoryContext(process.cwd()).identity, runId, name: "cache", scriptHash: "1", startedAt: 1 });
-  const second = await runWorkflow(script, { projectTrusted: false,
-    runner: { run: async () => { throw new Error("cache miss"); } },
+  const secondJournal = RunJournal.resume(root, runId, {
+    type: "run",
+    projectTrusted: false,
+    targetIdentity: resolveRepositoryContext(process.cwd()).identity,
+    runId,
+    name: "cache",
+    scriptHash: "1",
+    startedAt: 1,
+  });
+  const second = await runWorkflow(script, {
+    projectTrusted: false,
+    runner: {
+      run: async () => {
+        throw new Error("cache miss");
+      },
+    },
     journal: secondJournal,
   });
   secondJournal.close();
@@ -445,9 +552,27 @@ test("workflow tool keeps raw deltas out of tool details while the private task 
       workflowPath: ["streaming"],
       requestedEffort: "max",
     });
-    options.onAgentTelemetry?.({ id: 1, label: "stream", workflowPath: ["streaming"], kind: "model_resolved", modelId: "gpt-5.6-sol", effort: "max" });
-    options.onAgentTelemetry?.({ id: 1, label: "stream", workflowPath: ["streaming"], kind: "turn_start" });
-    options.onAgentTelemetry?.({ id: 1, label: "stream", workflowPath: ["streaming"], kind: "text_delta", delta: "LIVE_DELTA" });
+    options.onAgentTelemetry?.({
+      id: 1,
+      label: "stream",
+      workflowPath: ["streaming"],
+      kind: "model_resolved",
+      modelId: "gpt-5.6-sol",
+      effort: "max",
+    });
+    options.onAgentTelemetry?.({
+      id: 1,
+      label: "stream",
+      workflowPath: ["streaming"],
+      kind: "turn_start",
+    });
+    options.onAgentTelemetry?.({
+      id: 1,
+      label: "stream",
+      workflowPath: ["streaming"],
+      kind: "text_delta",
+      delta: "LIVE_DELTA",
+    });
     options.onAgentEnd?.({
       id: 1,
       label: "stream",
@@ -475,7 +600,9 @@ test("workflow tool keeps raw deltas out of tool details while the private task 
   const tool = createWorkflowTool({ runWorkflowFn, registry });
   const result = await tool.execute(
     "tc",
-    { script: `export const meta = { name: 'streaming', description: 'x' }\nreturn await agent('p')` } as any,
+    {
+      script: `export const meta = { name: 'streaming', description: 'x' }\nreturn await agent('p')`,
+    } as any,
     undefined,
     undefined,
     { cwd: process.cwd(), sessionManager: { getSessionDir: () => root } } as any,
@@ -537,7 +664,9 @@ test("high-frequency telemetry does not rewrite the durable manifest hot path", 
     const tool = createWorkflowTool({ runWorkflowFn });
     await tool.execute(
       "telemetry-hotpath",
-      { script: `export const meta = { name: 'telemetry_hotpath', description: 'x' }\nreturn 'done'` } as any,
+      {
+        script: `export const meta = { name: 'telemetry_hotpath', description: 'x' }\nreturn 'done'`,
+      } as any,
       undefined,
       undefined,
       { cwd: process.cwd(), sessionManager: { getSessionDir: () => root } } as any,
@@ -583,7 +712,11 @@ test("registry restoration marks interrupted runs and tasks as cancelled", () =>
 test("resume generations hide stale task summaries while retaining cached transcripts", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-generation-"));
   try {
-    const details = new WorkflowRunDetails({ runId: "wf_generation", name: "generation", runsDir: root });
+    const details = new WorkflowRunDetails({
+      runId: "wf_generation",
+      name: "generation",
+      runsDir: root,
+    });
     details.startTask({ id: 1, label: "A", prompt: "a" });
     details.finishTask(1, { status: "done", result: "a" });
     details.startTask({ id: 2, label: "B", prompt: "b" });
@@ -600,7 +733,10 @@ test("resume generations hide stale task summaries while retaining cached transc
     restored.beginGeneration();
     assert.deepEqual(restored.listTasks(), []);
     restored.startTask({ id: 1, label: "A", prompt: "a", cached: true });
-    assert.deepEqual(restored.listTasks().map((task) => task.id), [1]);
+    assert.deepEqual(
+      restored.listTasks().map((task) => task.id),
+      [1],
+    );
     assert.equal(restored.getTaskSummary(1)?.transcriptPath, firstTranscript);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -617,13 +753,19 @@ test("a resume failure before the first task preserves prior task summaries", ()
     });
     details.startTask({ id: 1, callPath: "$/a:0", label: "A", prompt: "a" });
     details.finishTask(1, { status: "done", result: "a" });
-    let snapshot = createSnapshot({ name: "empty_generation", description: "x" }, "wf_empty_generation");
+    let snapshot = createSnapshot(
+      { name: "empty_generation", description: "x" },
+      "wf_empty_generation",
+    );
     snapshot.agents = [{ id: 1, callPath: "$/a:0", label: "A", status: "done" }];
     details.persist(recompute(snapshot));
 
     const resumed = WorkflowRunDetails.restore(details.manifestPath)!.details;
     resumed.beginGeneration();
-    const failed = createSnapshot({ name: "empty_generation", description: "x" }, "wf_empty_generation");
+    const failed = createSnapshot(
+      { name: "empty_generation", description: "x" },
+      "wf_empty_generation",
+    );
     failed.status = "failed";
     resumed.close(recompute(failed));
 
@@ -646,7 +788,11 @@ test("a resume failure before the first task preserves prior task summaries", ()
 test("resume task transcripts follow stable callPath instead of completion-order ids", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-call-path-"));
   try {
-    const details = new WorkflowRunDetails({ runId: "wf_call_path", name: "call_path", runsDir: root });
+    const details = new WorkflowRunDetails({
+      runId: "wf_call_path",
+      name: "call_path",
+      runsDir: root,
+    });
     details.startTask({ id: 1, callPath: "$/p:0/b:0/a:0", label: "A", prompt: "prompt A" });
     details.finishTask(1, { status: "done", result: "A" });
     details.startTask({ id: 2, callPath: "$/p:0/b:1/a:0", label: "B", prompt: "prompt B" });
@@ -679,12 +825,19 @@ test("resume task transcripts follow stable callPath instead of completion-order
 test("live reordered calls cannot overwrite another callPath transcript", () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "uc-details-transcript-key-"));
   try {
-    const details = new WorkflowRunDetails({ runId: "wf_transcript_key", name: "transcript_key", runsDir: root });
+    const details = new WorkflowRunDetails({
+      runId: "wf_transcript_key",
+      name: "transcript_key",
+      runsDir: root,
+    });
     details.startTask({ id: 1, callPath: "$/b", label: "B", prompt: "prompt B" });
     details.finishTask(1, { status: "done", result: "B" });
     details.startTask({ id: 2, callPath: "$/a", label: "A", prompt: "old prompt A" });
     details.finishTask(2, { status: "error", error: "failed" });
-    let snapshot = createSnapshot({ name: "transcript_key", description: "x" }, "wf_transcript_key");
+    let snapshot = createSnapshot(
+      { name: "transcript_key", description: "x" },
+      "wf_transcript_key",
+    );
     snapshot.agents = [
       { id: 1, callPath: "$/b", label: "B", status: "done" },
       { id: 2, callPath: "$/a", label: "A", status: "error" },
@@ -707,8 +860,12 @@ test("independent registries keep active handles and abort ownership isolated", 
   const registryB = new WorkflowRegistry();
   let abortsA = 0;
   let abortsB = 0;
-  registryA.register("wf_a", createSnapshot({ name: "a", description: "x" }, "wf_a"), () => { abortsA++; });
-  registryB.register("wf_b", createSnapshot({ name: "b", description: "x" }, "wf_b"), () => { abortsB++; });
+  registryA.register("wf_a", createSnapshot({ name: "a", description: "x" }, "wf_a"), () => {
+    abortsA++;
+  });
+  registryB.register("wf_b", createSnapshot({ name: "b", description: "x" }, "wf_b"), () => {
+    abortsB++;
+  });
 
   assert.ok(registryA.get("wf_a"));
   assert.equal(registryA.get("wf_b"), undefined);
@@ -722,8 +879,16 @@ test("independent registries keep active handles and abort ownership isolated", 
 test("workflow overlays are isolated by session registry", async () => {
   const firstRegistry = new WorkflowRegistry();
   const secondRegistry = new WorkflowRegistry();
-  firstRegistry.register("wf-overlay-a", createSnapshot({ name: "a", description: "x" }, "wf-overlay-a"), () => {});
-  secondRegistry.register("wf-overlay-b", createSnapshot({ name: "b", description: "x" }, "wf-overlay-b"), () => {});
+  firstRegistry.register(
+    "wf-overlay-a",
+    createSnapshot({ name: "a", description: "x" }, "wf-overlay-a"),
+    () => {},
+  );
+  secondRegistry.register(
+    "wf-overlay-b",
+    createSnapshot({ name: "b", description: "x" }, "wf-overlay-b"),
+    () => {},
+  );
   const resolvers: Array<() => void> = [];
   let customCalls = 0;
   const context = (): any => ({
@@ -770,8 +935,22 @@ test("workflow overlay renders responsive task stats and routes navigation in re
 
   let renders = 0;
   let closed = 0;
-  const tui: any = { mode: "regular", terminal: { columns: 120, rows: 40 }, requestRender: () => { renders++; } };
-  const component = new WorkflowOverlayComponent({ tui, theme: plainTheme, registry, preferredRunId: "wf_overlay", onClose: () => { closed++; } });
+  const tui: any = {
+    mode: "regular",
+    terminal: { columns: 120, rows: 40 },
+    requestRender: () => {
+      renders++;
+    },
+  };
+  const component = new WorkflowOverlayComponent({
+    tui,
+    theme: plainTheme,
+    registry,
+    preferredRunId: "wf_overlay",
+    onClose: () => {
+      closed++;
+    },
+  });
   const text = component.render(120).join("\n");
   assert.match(text, /gpt-5\.6-sol • max/);
   assert.match(text, /cache read 0 · cache write 0/);
@@ -786,17 +965,41 @@ test("workflow overlay renders responsive task stats and routes navigation in re
   assert.equal(closed, 1, "a second Escape closes the overlay");
   component.dispose();
 
-  const narrowTui: any = { mode: "regular", terminal: { columns: 70, rows: 30 }, requestRender: () => {} };
-  const narrow = new WorkflowOverlayComponent({ tui: narrowTui, theme: plainTheme, registry, preferredRunId: "wf_overlay", onClose: () => {} });
+  const narrowTui: any = {
+    mode: "regular",
+    terminal: { columns: 70, rows: 30 },
+    requestRender: () => {},
+  };
+  const narrow = new WorkflowOverlayComponent({
+    tui: narrowTui,
+    theme: plainTheme,
+    registry,
+    preferredRunId: "wf_overlay",
+    onClose: () => {},
+  });
   assert.doesNotMatch(narrow.render(70).join("\n"), /streaming output/);
   narrow.handleInput("\r");
-  assert.match(narrow.render(70).join("\n"), /streaming output/, "Enter opens the narrow detail page");
+  assert.match(
+    narrow.render(70).join("\n"),
+    /streaming output/,
+    "Enter opens the narrow detail page",
+  );
   narrow.handleInput("\u001b");
-  assert.doesNotMatch(narrow.render(70).join("\n"), /streaming output/, "Escape returns to the narrow task list");
+  assert.doesNotMatch(
+    narrow.render(70).join("\n"),
+    /streaming output/,
+    "Escape returns to the narrow task list",
+  );
   narrow.dispose();
 
   for (let id = 2; id <= 12; id++) {
-    details.startTask({ id, callPath: `$/task-${id}`, label: `task-${id}`, phase: "Verify", prompt: "p" });
+    details.startTask({
+      id,
+      callPath: `$/task-${id}`,
+      label: `task-${id}`,
+      phase: "Verify",
+      prompt: "p",
+    });
     details.finishTask(id, { status: "done", result: `result-${id}` });
   }
   const fullscreenTui: any = {
@@ -820,11 +1023,23 @@ test("workflow overlay renders responsive task stats and routes navigation in re
 
   fullscreen.handleInput("\t");
   fullscreen.handleInput("\u001b[5^");
-  assert.match(fullscreen.render(120).join("\n"), /Ctrl\+End to follow/, "Ctrl+PageUp leaves follow mode");
+  assert.match(
+    fullscreen.render(120).join("\n"),
+    /Ctrl\+End to follow/,
+    "Ctrl+PageUp leaves follow mode",
+  );
   fullscreen.handleInput("\u001b[6^");
-  assert.match(fullscreen.render(120).join("\n"), /Ctrl\+End to follow/, "Ctrl+PageDown keeps manual scrolling active");
+  assert.match(
+    fullscreen.render(120).join("\n"),
+    /Ctrl\+End to follow/,
+    "Ctrl+PageDown keeps manual scrolling active",
+  );
   fullscreen.handleInput("\u001b[8^");
-  assert.match(fullscreen.render(120).join("\n"), /Ctrl\+End follow/, "Ctrl+End restores fullscreen follow mode");
+  assert.match(
+    fullscreen.render(120).join("\n"),
+    /Ctrl\+End follow/,
+    "Ctrl+End restores fullscreen follow mode",
+  );
   fullscreen.dispose();
 
   fs.rmSync(root, { recursive: true, force: true });

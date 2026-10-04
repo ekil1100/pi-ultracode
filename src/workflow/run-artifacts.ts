@@ -83,7 +83,8 @@ export function fsyncArtifactDirectory(dir: string): void {
   const fd = fs.openSync(dir, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY ?? 0));
   try {
     const stat = fs.fstatSync(fd);
-    if (!stat.isDirectory()) throw new Error(`workflow artifact parent must be a directory: ${dir}`);
+    if (!stat.isDirectory())
+      throw new Error(`workflow artifact parent must be a directory: ${dir}`);
     fs.fsyncSync(fd);
   } finally {
     fs.closeSync(fd);
@@ -135,7 +136,8 @@ export function readContainedArtifactFile(
   for (const [index, part] of parts.entries()) {
     current = path.join(current, part);
     const stat = fs.lstatSync(current);
-    if (stat.isSymbolicLink()) throw new Error(`${label} path may not contain symlinks: ${current}`);
+    if (stat.isSymbolicLink())
+      throw new Error(`${label} path may not contain symlinks: ${current}`);
     if (index < parts.length - 1 && !stat.isDirectory()) {
       throw new Error(`${label} parent must be a directory: ${current}`);
     }
@@ -164,7 +166,8 @@ export function readContainedArtifactBytes(
   for (const [index, part] of parts.entries()) {
     current = path.join(current, part);
     const stat = fs.lstatSync(current);
-    if (stat.isSymbolicLink()) throw new Error(`${label} path may not contain symlinks: ${current}`);
+    if (stat.isSymbolicLink())
+      throw new Error(`${label} path may not contain symlinks: ${current}`);
     if (index < parts.length - 1 && !stat.isDirectory()) {
       throw new Error(`${label} parent must be a directory: ${current}`);
     }
@@ -172,11 +175,19 @@ export function readContainedArtifactBytes(
   return readArtifactBytes(target, label, maxBytes);
 }
 
-export function readArtifactFile(filePath: string, label: string, maxBytes = 16 * 1024 * 1024): string {
+export function readArtifactFile(
+  filePath: string,
+  label: string,
+  maxBytes = 16 * 1024 * 1024,
+): string {
   return readArtifactBytes(filePath, label, maxBytes).toString("utf8");
 }
 
-export function readArtifactBytes(filePath: string, label: string, maxBytes = 16 * 1024 * 1024): Buffer {
+export function readArtifactBytes(
+  filePath: string,
+  label: string,
+  maxBytes = 16 * 1024 * 1024,
+): Buffer {
   assertRegularArtifactFile(filePath, label);
   const fd = fs.openSync(filePath, fs.constants.O_RDONLY | NO_FOLLOW);
   try {
@@ -237,7 +248,9 @@ export function writeArtifactFile(
     if (error?.code !== "ENOENT") throw error;
   }
   if (existing?.isSymbolicLink() || (existing && !existing.isFile())) {
-    throw new Error(`workflow artifact must be a regular file and may not be a symlink: ${filePath}`);
+    throw new Error(
+      `workflow artifact must be a regular file and may not be a symlink: ${filePath}`,
+    );
   }
   if (existing && !options.overwrite) {
     throw new Error(`workflow artifact already exists: ${filePath}`);
