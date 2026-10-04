@@ -647,6 +647,113 @@ test("fatal deadline interrupts RPC adapters without waiting on an uncooperative
   );
 });
 
+test.each([false, true])(
+  "heartbeats protect a pending host RPC with delayed consumer=%s",
+  (delayedConsumer) => {
+    const pending = deferred<unknown>();
+    const agent = vi.fn(() => Effect.runPromise(pending.wait));
+    const h = start({ agent }, { stallTimeoutMs: 80 });
+    message(h.worker, { type: "rpc", id: 1, op: "agent", payload: {} });
+    message(h.worker, { type: "heartbeat", checkpoints: 0 });
+    return Effect.runPromise(
+      nextTurn.pipe(
+        Effect.andThen(() => external(() => vi.advanceTimersByTimeAsync(25))),
+        Effect.tap(() =>
+          Effect.sync(() => message(h.worker, { type: "heartbeat", checkpoints: 0 })),
+        ),
+        Effect.andThen(nextTurn),
+        // The tick at 40ms precedes the next heartbeat at 50ms. Delay only
+        // consumption through 150ms; startup and heartbeat delivery stay timely.
+        Effect.andThen(
+          Effect.forEach(
+            Array.from({ length: 5 }),
+            () =>
+              (delayedConsumer
+                ? Effect.sync(() => vi.advanceTimersByTime(25))
+                : external(() => vi.advanceTimersByTimeAsync(25))
+              ).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => message(h.worker, { type: "heartbeat", checkpoints: 0 })),
+                ),
+              ),
+            { discard: true },
+          ),
+        ),
+        Effect.andThen(nextTurn),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            expect(agent).toHaveBeenCalledTimes(1);
+            expect(h.worker.terminate).not.toHaveBeenCalled();
+            pending.resolve("ok");
+          }),
+        ),
+        Effect.andThen(nextTurn),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            expect(h.worker.postMessage).toHaveBeenCalledWith({
+              type: "rpcResult",
+              id: 1,
+              ok: true,
+              value: "ok",
+            });
+            message(h.worker, { type: "result", ok: true, value: "ok" });
+            h.worker.finishTermination();
+          }),
+        ),
+        Effect.andThen(Fiber.join(h.outcome)),
+        Effect.map((completed) => {
+          expect(completed).toEqual({ ok: true, value: "ok" });
+          expectReleased(h.worker, h.controller.signal);
+        }),
+      ),
+    );
+  },
+);
+
+test.each([false, true])(
+  "missing heartbeats terminate a pending host RPC with delayed consumer=%s",
+  (delayedConsumer) => {
+    const pending = deferred<unknown>();
+    const agent = vi.fn(() => Effect.runPromise(pending.wait));
+    const h = start({ agent }, { stallTimeoutMs: 80 });
+    message(h.worker, { type: "rpc", id: 1, op: "agent", payload: {} });
+    message(h.worker, { type: "heartbeat", checkpoints: 0 });
+    return Effect.runPromise(
+      nextTurn.pipe(
+        Effect.andThen(
+          delayedConsumer
+            ? Effect.sync(() => vi.advanceTimersByTime(120))
+            : external(() => vi.advanceTimersByTimeAsync(120)),
+        ),
+        Effect.andThen(nextTurn),
+        Effect.tap(() =>
+          Effect.sync(() => {
+            expect(agent).toHaveBeenCalledTimes(1);
+            expect(h.worker.terminate).toHaveBeenCalledTimes(1);
+            expect(h.worker.postMessage).not.toHaveBeenCalled();
+            h.worker.finishTermination();
+          }),
+        ),
+        Effect.andThen(Fiber.join(h.outcome)),
+        Effect.map((completed) => {
+          expect(completed).toMatchObject({
+            ok: false,
+            error: expect.any(WorkflowStallError),
+          });
+          if (!completed.ok)
+            expect((completed.error as Error).message).toBe(
+              "workflow script worker became unresponsive for 80ms",
+            );
+          expectReleased(h.worker, h.controller.signal);
+          pending.resolve("late");
+        }),
+        Effect.andThen(nextTurn),
+        Effect.tap(() => Effect.sync(() => expect(h.worker.postMessage).not.toHaveBeenCalled())),
+      ),
+    );
+  },
+);
+
 for (const responsive of [false, true]) {
   test(`watchdog releases resources for ${responsive ? "no progress" : "no heartbeat"}`, () => {
     const h = start();

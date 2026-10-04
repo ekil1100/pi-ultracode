@@ -1,4 +1,7 @@
-import { test } from "vite-plus/test";
+import { test, vi } from "vite-plus/test";
+import { Deferred, Effect } from "effect";
+import { Worker } from "node:worker_threads";
+import { EventEmitter } from "node:events";
 import assert from "node:assert/strict";
 import * as os from "node:os";
 import * as fs from "node:fs";
@@ -3991,42 +3994,115 @@ test("a responsive worker with no host RPC or checkpoint progress is terminated"
   }
 });
 
-test("raw uninstrumented worker stalls are terminated while async waits keep heartbeating", async () => {
+test("raw uninstrumented worker stalls are terminated while async waits keep heartbeating", (t) => {
   const ac = new AbortController();
+  const started = Deferred.makeUnsafe<void>();
+  const agentStarted = Deferred.makeUnsafe<void>();
+  const finishAgent = Deferred.makeUnsafe<void>();
+  const external = <A>(run: () => Promise<A>) =>
+    Effect.tryPromise({ try: run, catch: (error) => error });
+
+  // Freeze the host watchdog clock through real Worker startup. Worker timers
+  // stay native; only an observed heartbeat permits the next virtual time step.
+  vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+  let onHeartbeat = () => {};
+  const observer = vi.spyOn(Worker.prototype, "emit").mockImplementation(function (
+    this: Worker,
+    event,
+    ...args
+  ) {
+    const emitted = EventEmitter.prototype.emit.call(this, event, ...args);
+    if (event === "message" && args[0]?.type === "heartbeat") onHeartbeat();
+    return emitted;
+  });
+  const heartbeat = Effect.callback<void>((resume) => {
+    onHeartbeat = () => resume(Effect.void);
+    return Effect.sync(() => {
+      onHeartbeat = () => {};
+    });
+  });
   let timerFired = false;
   const timer = setTimeout(() => {
     timerFired = true;
   }, 0);
-  await assert.rejects(
-    executeWorkflowScript("while (true) {}", emptyHost(), {
-      cwd: process.cwd(),
-      name: "raw_stall",
-      signal: ac.signal,
-      stallTimeoutMs: 50,
-    }),
-    (error) => error instanceof WorkflowStallError,
-  );
-  clearTimeout(timer);
-  assert.equal(timerFired, true, "main thread timer should fire while the worker is stuck");
+  t.onTestFinished(() => {
+    ac.abort();
+    clearTimeout(timer);
+    observer.mockRestore();
+    vi.useRealTimers();
+  });
 
-  const slow = await runWorkflow(
-    `export const meta = { name: 'slow_agent', description: 'x' }\nreturn await agent('slow')`,
-    {
-      stallTimeoutMs: 80,
-      runner: {
-        run: async () => {
-          await new Promise((resolve) => setTimeout(resolve, 140));
-          return {
-            value: "ok",
-            usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
-            cwd: process.cwd(),
-          };
+  const stalled = external(() =>
+    assert.rejects(
+      executeWorkflowScript(
+        "log('started'); while (true) {}",
+        {
+          ...emptyHost(),
+          log: () => {
+            Effect.runSync(Deferred.succeed(started, undefined));
+          },
+        },
+        {
+          cwd: process.cwd(),
+          name: "raw_stall",
+          signal: ac.signal,
+          stallTimeoutMs: 50,
+        },
+      ),
+      (error) => error instanceof WorkflowStallError && /unresponsive/.test(error.message),
+    ),
+  );
+  const healthy = external(() =>
+    runWorkflow(
+      `export const meta = { name: 'slow_agent', description: 'x' }\nreturn await agent('slow')`,
+      {
+        signal: ac.signal,
+        stallTimeoutMs: 80,
+        runner: {
+          run: (call) =>
+            Effect.runPromise(
+              Deferred.succeed(agentStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(finishAgent)),
+                Effect.as({
+                  value: "ok",
+                  usage: { outputTokens: 1, totalTokens: 1, cost: 0 },
+                  cwd: process.cwd(),
+                }),
+              ),
+              { signal: call.signal },
+            ),
         },
       },
-    },
+    ),
   );
-  assert.equal(slow.result, "ok");
-});
+  const advanceStalledClock = Deferred.await(started).pipe(
+    Effect.andThen(() => external(() => vi.advanceTimersByTimeAsync(75))),
+  );
+  // Six real heartbeats advance the pending host wait by 140ms (>80ms).
+  const advanceHealthyClock = Deferred.await(agentStarted).pipe(
+    Effect.andThen(
+      Effect.forEach(
+        [25, 25, 25, 25, 25, 15],
+        (ms) =>
+          heartbeat.pipe(Effect.andThen(() => external(() => vi.advanceTimersByTimeAsync(ms)))),
+        { discard: true },
+      ),
+    ),
+    Effect.andThen(Deferred.succeed(finishAgent, undefined)),
+  );
+  return Effect.runPromise(
+    Effect.all([stalled, advanceStalledClock], { concurrency: "unbounded" }).pipe(
+      Effect.tap(() =>
+        Effect.sync(() =>
+          assert.equal(timerFired, true, "main thread timer should fire while the worker is stuck"),
+        ),
+      ),
+      Effect.andThen(Effect.all([healthy, advanceHealthyClock], { concurrency: "unbounded" })),
+      Effect.tap(([slow]) => Effect.sync(() => assert.equal(slow.result, "ok"))),
+      Effect.ensuring(Effect.sync(() => ac.abort())),
+    ),
+  );
+}, 10_000);
 
 test("external abort terminates a workflow awaiting a local never-settling promise", async () => {
   const ac = new AbortController();

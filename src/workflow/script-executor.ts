@@ -74,7 +74,8 @@ type ExecutorEvent =
   | { readonly type: "message"; readonly message: any }
   | { readonly type: "error"; readonly error: NodeJS.ErrnoException }
   | { readonly type: "exit"; readonly code: number }
-  | { readonly type: "watchdog" | "fatalDeadline" | "rpcSettled" };
+  | { readonly type: "watchdog"; readonly at: number }
+  | { readonly type: "fatalDeadline" | "rpcSettled" };
 
 export function executeWorkflowScript(
   body: string,
@@ -171,7 +172,7 @@ function runWorker(
   const watchdog = Effect.acquireRelease(
     Effect.sync(() => {
       const timer = setInterval(
-        () => emit({ type: "watchdog" }),
+        () => emit({ type: "watchdog", at: Date.now() }),
         Math.max(10, Math.min(250, Math.floor(stallTimeoutMs / 2))),
       );
       timer.unref?.();
@@ -217,9 +218,10 @@ function runWorker(
     });
   }
 
-  function checkWatchdog() {
+  function checkWatchdog(now: number) {
     if (fatalError) return continueEvents;
-    const now = Date.now();
+    // Compare at the queued tick, not at consumption: timely heartbeats may
+    // already be waiting behind this tick when the consumer is delayed.
     if (now - lastHeartbeat > stallTimeoutMs) {
       return Effect.fail(
         scriptFailure(
@@ -308,7 +310,7 @@ function runWorker(
       case "fatalDeadline":
         return fatalError ? Effect.fail(scriptFailure(fatalError)) : continueEvents;
       case "watchdog":
-        return checkWatchdog();
+        return checkWatchdog(event.at);
       case "error":
         if (event.error.code !== "ERR_WORKER_OUT_OF_MEMORY") {
           return Effect.fail(scriptFailure(event.error));
