@@ -170,6 +170,14 @@ export function registerOneShot(pi: ExtensionAPI, mode: UltracodeMode): void {
         return Effect.fail(
           new Error("/ult requires an idle session. Wait or cancel the current run first."),
         );
+      if (pending || changing)
+        return Effect.fail(
+          new Error(
+            "An /ult request is already pending. Wait for settlement or restart to recover it.",
+          ),
+        );
+      if (!ctx.model)
+        return Effect.fail(new Error("Select your normal model with /model before using /ult."));
       return restore(ctx).pipe(
         Effect.flatMap((ok) =>
           ok
@@ -231,12 +239,12 @@ export function registerOneShot(pi: ExtensionAPI, mode: UltracodeMode): void {
     handler: (args, ctx) =>
       Effect.runPromise(
         begin(args, ctx).pipe(
-          Effect.andThen((task) => attempt(() => pi.sendUserMessage(task))),
-          Effect.catch((error) =>
-            (ctx.isIdle() ? restore(ctx) : Effect.succeed(true)).pipe(
-              Effect.andThen(report(error, `/ult ${args}`, ctx)),
+          Effect.flatMap((task) =>
+            attempt(() => pi.sendUserMessage(task)).pipe(
+              Effect.catch((error) => restore(ctx).pipe(Effect.andThen(Effect.fail(error)))),
             ),
           ),
+          Effect.catch((error) => report(error, `/ult ${args}`, ctx)),
         ),
       ),
   });

@@ -311,3 +311,25 @@ test("active-branch navigation recovers an interrupted one-shot", async () => {
   expect(branch.model).toBe(sonnet);
   expect(branch.mode.getMode()).toBe("off");
 });
+
+test("nested invocation cannot restore an override awaiting its first run", async () => {
+  const s = setup();
+  await s.command("with fable first request");
+  await s.command("with external second request");
+  expect(s.sent).toEqual(["first request"]);
+  expect(s.model).toBe(fable);
+  expect(s.mode.getMode()).toBe("deep");
+  expect(await s.input(":ult: another request")).toEqual({ action: "handled" });
+  expect(s.model).toBe(fable);
+  await s.emit("agent_settled");
+  expect(s.model).toBe(sonnet);
+});
+
+test("a normal model must exist before a reversible one-shot", async () => {
+  const s = setup();
+  await s.pi.setModel(undefined);
+  await s.command("with fable review");
+  expect(s.sent).toEqual([]);
+  expect(s.entries).toEqual([]);
+  expect(s.notices.at(-1)).toContain("Select your normal model");
+});
