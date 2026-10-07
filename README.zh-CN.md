@@ -77,6 +77,26 @@ Pi 会自行判断工作流是否有帮助。小任务仍可继续使用普通�
 
 按 `Esc` 可取消正在运行的工作流。在 Pi 的 fullscreen TUI 中，请在工作流详情内使用 `Ctrl+PageUp`、`Ctrl+PageDown` 和 `Ctrl+End`。
 
+## 单次调用
+
+日常任务继续使用普通模型，需要时在同一条消息中显式开启一次 deep：
+
+```text
+/ult review this change and verify the findings
+:ult: with opus investigate the cancellation race
+:ultracode: with anthropic/claude-opus-5 test the proposed design
+```
+
+`/ult [with <model>] <task>` 与消息开头的 `:ult:` / `:ultracode:` 标记临时选择 **deep** 深度。可选的 `with <model>` 切换的是**主代理**，不只是子代理；省略时保留当前模型，不会自动选择昂贵模型。
+
+模型来自 Pi 已认证的可用列表，没有硬编码模型名。优先匹配当前 provider，其中精确 ID 优先于部分匹配；本 provider 没有匹配时，才接受其他 provider 中的唯一匹配。未知或歧义名称在执行前被拒绝，可用完整 `provider/model-id` 消除歧义。
+
+整个逻辑运行**完全结束**（包括取消）后恢复之前的模型、思考档位和深度。重试、压缩及排队的后续任务仍属于该次覆盖，提交无关的低成本任务前请等待结束。运行期间拒绝新的单次调用，不会中途切换模型。重启或分支导航会恢复被中断的覆盖；不修改全局模型默认值，且保留运行期间用户显式修改的模型/思考档位（仍受 Pi 的模型能力 clamp 限制）。
+
+所选模型只是实质性子任务的偏好，不强制所有子代理使用同一模型；低成本发现/汇总和显式子模型仍可使用。Deep 不强制委派，也不会提升父代理 effort。切换模型可能因现有会话的冷 prompt cache 产生额外费用。
+
+标记必须位于消息开头，正文提到它不会触发。内联调用保留图片附件，slash 命令参数只传文本。运行中显式选择其他非 deep 深度会被保留；再次选择已激活的 deep 无法与临时模式区分，结束后仍恢复之前的深度。
+
 ## 分析深度
 
 深度决定**要调查和验证什么**，不是模型 effort，也不是代理数量或调查轮数配额：

@@ -10,6 +10,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { createWorkflowTool, type WorkflowToolDeps } from "../src/workflow/tool.ts";
 import { UltracodeMode, type ThinkingPreferenceStore } from "../src/mode.ts";
 import { registerCommands } from "../src/commands.ts";
+import { registerOneShot } from "../src/one-shot.ts";
 import { UltracodePreferences, type UltracodePreferenceStore } from "../src/preferences.ts";
 import { WorkflowRegistry } from "../src/workflow/registry.ts";
 import { workflowEffortContext } from "../src/workflow/effort-context.ts";
@@ -146,4 +147,6 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
       delete sections.ultracode_effort;
     }
   });
+
+  registerOneShot(pi, mode);
 }
