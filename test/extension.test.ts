@@ -243,7 +243,7 @@ test("extension registers the workflow tool, commands, and flag", () => {
   );
   assert.equal(depthCompletions.includes("on"), false);
   assert.ok(state.commands.has("workflows"));
-  assert.ok(state.commands.has("ult"));
+  assert.equal(state.commands.has("ult"), false, "one-shot is a :ult marker, not a command");
   assert.ok(state.flags.has("ultracode"));
   assert.ok(state.shortcuts.has("f6"));
   assert.ok(state.events.has("session_start"));

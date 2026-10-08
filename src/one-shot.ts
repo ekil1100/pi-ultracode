@@ -6,7 +6,7 @@ import type { UltracodeModeName } from "./depth.ts";
 import type { ThinkingLevel } from "./thinking.ts";
 
 export const ONE_SHOT_ENTRY_TYPE = "ultracode-one-shot";
-const USAGE = "Usage: /ult [with <model>] <task> or :ult: [with <model>] <task>";
+const USAGE = "Usage: :ult [with <model>] <task>, anywhere in the message outside `code`";
 type ModelRef = { provider: string; id: string; name?: string };
 interface RequestState {
   version: 1;
@@ -27,12 +27,49 @@ const sameModel = (a: ModelRef | undefined, b: ModelRef | undefined) =>
 const ref = (model: ModelRef | undefined): ModelRef | undefined =>
   model && { provider: model.provider, id: model.id };
 
+// `:ult` or `:ult:` as a whole token: not glued to a word, path, or another
+// colon before it (`a:ult`, `/:ult`, `::ult`), nor continued after it
+// (`:ultra`, `:ult-x`, `:ult.ts`, `:ult:x`); punctuation, quotes and brackets
+// around it are fine.
+export const ONE_SHOT_TOKEN = /(?<![\w:/\\-]):ult:?(?![\w/\\-]|[.:]\w)/gi;
+// A `with <model>` selector right after a marker; the model id stops before
+// trailing punctuation (`with opus,`).
+export const ONE_SHOT_SELECTOR = /^\s+with\s+([\w./@:-]*\w)/i;
+const CODE = /```[\s\S]*?(?:```|$)|`[^`\n]*`/g;
+
+export interface OneShotMarker {
+  start: number;
+  /** End of the marker and its selector, if any. */
+  end: number;
+  /** Index among all marker tokens, including quoted ones. */
+  nth: number;
+  model?: string;
+}
+
+/** Every marker outside inline code and fenced blocks. */
+export function findOneShotMarkers(text: string): OneShotMarker[] {
+  const code = [...text.matchAll(CODE)].map((m) => [m.index, m.index + m[0].length]);
+  return [...text.matchAll(ONE_SHOT_TOKEN)].flatMap((m, nth) => {
+    if (code.some(([a, b]) => m.index >= a && m.index < b)) return [];
+    const sel = ONE_SHOT_SELECTOR.exec(text.slice(m.index + m[0].length));
+    const end = m.index + m[0].length + (sel?.[0].length ?? 0);
+    return [{ start: m.index, end, nth, model: sel?.[1] }];
+  });
+}
+
+/** Removes every marker and its selector, leaving the task; the first selector picks the model. */
 export function parseOneShot(text: string): { model?: string; task: string } {
-  const body = text.trim();
-  if (!body) throw new Error(USAGE);
-  const match = /^with\s+(\S+)(?:\s+([\s\S]+))?$/i.exec(body);
-  if (/^with(?:\s|$)/i.test(body) && (!match || !match[2]?.trim())) throw new Error(USAGE);
-  return match ? { model: match[1], task: match[2]!.trim() } : { task: body };
+  const markers = findOneShotMarkers(text);
+  if (markers.some((m) => /^\s+with\s*$/i.test(text.slice(m.end)))) throw new Error(USAGE);
+  const task = markers
+    .reduceRight(
+      (rest, m) => `${rest.slice(0, m.start).trimEnd()} ${rest.slice(m.end).trimStart()}`,
+      text,
+    )
+    .trim();
+  if (!task) throw new Error(USAGE);
+  const model = markers.find((m) => m.model)?.model;
+  return model ? { model, task } : { task };
 }
 
 /** Current provider wins, exact ID beats substring, ambiguity never chooses a model. */
@@ -157,7 +194,7 @@ export function registerOneShot(pi: ExtensionAPI, mode: UltracodeMode): void {
       ).pipe(
         Effect.catch((error) =>
           attempt(() => {
-            ctx.ui.notify(`/ult restore failed: ${error.message}`, "error");
+            ctx.ui.notify(`:ult restore failed: ${error.message}`, "error");
             return false;
           }),
         ),
@@ -168,16 +205,16 @@ export function registerOneShot(pi: ExtensionAPI, mode: UltracodeMode): void {
     Effect.suspend(() => {
       if (!ctx.isIdle())
         return Effect.fail(
-          new Error("/ult requires an idle session. Wait or cancel the current run first."),
+          new Error(":ult requires an idle session. Wait or cancel the current run first."),
         );
       if (pending || changing)
         return Effect.fail(
           new Error(
-            "An /ult request is already pending. Wait for settlement or restart to recover it.",
+            "A :ult request is already pending. Wait for settlement or restart to recover it.",
           ),
         );
       if (!ctx.model)
-        return Effect.fail(new Error("Select your normal model with /model before using /ult."));
+        return Effect.fail(new Error("Select your normal model with /model before using :ult."));
       return restore(ctx).pipe(
         Effect.flatMap((ok) =>
           ok
@@ -201,7 +238,7 @@ export function registerOneShot(pi: ExtensionAPI, mode: UltracodeMode): void {
                 journal(); // Record durable intent before switching anything.
                 return { request, selected };
               })
-            : Effect.fail(new Error("Resolve the previous /ult restore failure first.")),
+            : Effect.fail(new Error("Resolve the previous :ult restore failure first.")),
         ),
         Effect.flatMap(({ request, selected }) =>
           Effect.acquireUseRelease(
@@ -234,26 +271,11 @@ export function registerOneShot(pi: ExtensionAPI, mode: UltracodeMode): void {
       );
     });
 
-  pi.registerCommand("ult", {
-    description: "One-shot deep mode: /ult [with <model>] <task>; restores prior mode/model",
-    handler: (args, ctx) =>
-      Effect.runPromise(
-        begin(args, ctx).pipe(
-          Effect.flatMap((task) =>
-            attempt(() => pi.sendUserMessage(task)).pipe(
-              Effect.catch((error) => restore(ctx).pipe(Effect.andThen(Effect.fail(error)))),
-            ),
-          ),
-          Effect.catch((error) => report(error, `/ult ${args}`, ctx)),
-        ),
-      ),
-  });
   pi.on("input", (event, ctx) => {
     if (event.source === "extension") return { action: "continue" };
-    const marker = /^\s*:(?:ult|ultracode):(?:\s|$)/i.exec(event.text);
-    if (marker)
+    if (findOneShotMarkers(event.text).length)
       return Effect.runPromise(
-        begin(event.text.slice(marker[0].length), ctx).pipe(
+        begin(event.text, ctx).pipe(
           Effect.map((text) => ({ action: "transform" as const, text, images: event.images })),
           Effect.catch((error) =>
             report(error, event.text, ctx).pipe(Effect.as({ action: "handled" as const })),

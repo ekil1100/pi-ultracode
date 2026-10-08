@@ -2,6 +2,7 @@ import { describe, expect, test } from "vite-plus/test";
 import {
   registerOneShot as registerUlt,
   parseOneShot as parseUlt,
+  findOneShotMarkers,
   resolveOneShotModel as resolveUltModel,
 } from "../src/one-shot.ts";
 import { UltracodeMode } from "../src/mode.ts";
@@ -12,9 +13,7 @@ const external = { provider: "other", id: "claude-fable-5-1", name: "Fable" };
 
 function setup(initialMode = "off", entries: any[] = [], initialModel = sonnet, actualMode?: any) {
   const handlers = new Map<string, Function[]>();
-  const commands = new Map<string, any>();
   const notices: string[] = [];
-  const sent: string[] = [];
   let currentModel: any = initialModel;
   let thinking = "high";
   let currentMode = initialMode;
@@ -51,8 +50,8 @@ function setup(initialMode = "off", entries: any[] = [], initialModel = sonnet, 
     on(name: string, handler: Function) {
       handlers.set(name, [...(handlers.get(name) ?? []), handler]);
     },
-    registerCommand(name: string, command: any) {
-      commands.set(name, command);
+    registerCommand(name: string) {
+      throw new Error(`unexpected command ${name}`);
     },
     appendEntry(customType: string, data: any) {
       entries.push({ type: "custom", customType, data: structuredClone(data) });
@@ -69,9 +68,6 @@ function setup(initialMode = "off", entries: any[] = [], initialModel = sonnet, 
       await emit("model_select", { model });
       return true;
     },
-    sendUserMessage(task: string) {
-      sent.push(task);
-    },
     getActiveTools: () => [],
     setActiveTools() {},
   };
@@ -87,9 +83,9 @@ function setup(initialMode = "off", entries: any[] = [], initialModel = sonnet, 
     },
   };
   registerUlt(pi, mode);
-  const command = (args: string) => commands.get("ult").handler(args, ctx);
   const input = (text: string, extra: any = {}) =>
     emit("input", { text, source: "interactive", ...extra });
+  const command = (args: string) => input(`:ult ${args}`);
   return {
     emit,
     command,
@@ -99,7 +95,6 @@ function setup(initialMode = "off", entries: any[] = [], initialModel = sonnet, 
     mode,
     entries,
     notices,
-    sent,
     get model() {
       return currentModel;
     },
@@ -123,12 +118,41 @@ function setup(initialMode = "off", entries: any[] = [], initialModel = sonnet, 
 
 describe("one-shot Ultracode", () => {
   test("parses multiline task and optional selector; rejects empty task", () => {
-    expect(parseUlt("with fable investigate\nthen test")).toEqual({
+    expect(parseUlt(":ult: with fable investigate\nthen test")).toEqual({
       model: "fable",
       task: "investigate\nthen test",
     });
-    expect(parseUlt("review changes")).toEqual({ task: "review changes" });
-    for (const text of ["", "with", "with fable"]) expect(() => parseUlt(text)).toThrow("Usage:");
+    expect(parseUlt(":ult review changes")).toEqual({ task: "review changes" });
+    for (const text of [":ult", ":ult: with", ":ult with fable"])
+      expect(() => parseUlt(text)).toThrow("Usage:");
+  });
+  test("markers count anywhere outside code, with punctuation around them", () => {
+    expect(parseUlt("review this change :ult")).toEqual({ task: "review this change" });
+    expect(parseUlt("please :ult: with fable inspect it")).toEqual({
+      model: "fable",
+      task: "please inspect it",
+    });
+    expect(parseUlt("fix :ult with fable, then :ult: with opus test")).toEqual({
+      model: "fable",
+      task: "fix , then test",
+    });
+    expect(parseUlt("the `:ult` form, then :ult go")).toEqual({
+      task: "the `:ult` form, then go",
+    });
+    expect(findOneShotMarkers("(:ult) a, :ult! b").map((m) => m.nth)).toEqual([0, 1]);
+    for (const text of [
+      "mention `:ult:` in docs",
+      "```\n:ult x\n```",
+      ":ultracode: x",
+      ":ultra x",
+      "a:ult x",
+      "::ult x",
+      ":ult.ts x",
+      ":ult-x y",
+      ":ult:x y",
+      "/ult x",
+    ])
+      expect(findOneShotMarkers(text)).toEqual([]);
   });
   test("short names prefer current provider; exact IDs disambiguate", () => {
     expect(resolveUltModel("fable", [sonnet, fable, external], "gateway")).toBe(fable);
@@ -140,10 +164,12 @@ describe("one-shot Ultracode", () => {
       resolveUltModel(fable.id, [fable, { ...fable, id: `${fable.id}-latest` }], "gateway"),
     ).toBe(fable);
   });
-  test("command selects Fable/deep then restores Sonnet/mode/thinking only at settlement", async () => {
+  test("marker selects Fable/deep then restores Sonnet/mode/thinking only at settlement", async () => {
     const s = setup("standard");
-    await s.command("with fable investigate");
-    expect(s.sent).toEqual(["investigate"]);
+    expect(await s.command("with fable investigate")).toMatchObject({
+      action: "transform",
+      text: "investigate",
+    });
     expect(s.model).toBe(fable);
     expect(s.mode.getMode()).toBe("deep");
     expect(s.thinking).toBe("medium");
@@ -170,10 +196,11 @@ describe("one-shot Ultracode", () => {
     await s.emit("agent_settled");
     expect(s.mode.getMode()).toBe("off");
   });
-  test("long alias works; marker inside prose and extension-injected task do not retrigger", async () => {
+  test("marker anywhere triggers; quoted marker and extension-injected task do not", async () => {
     const s = setup();
-    expect(await s.input("mention :ult: in documentation")).toEqual({ action: "continue" });
-    expect(await s.input(":ultracode: with fable inspect")).toMatchObject({
+    expect(await s.input("mention `:ult:` in documentation")).toEqual({ action: "continue" });
+    expect(await s.input(":ultracode: inspect")).toEqual({ action: "continue" });
+    expect(await s.input("inspect :ult: with fable")).toMatchObject({
       action: "transform",
       text: "inspect",
     });
@@ -186,8 +213,7 @@ describe("one-shot Ultracode", () => {
     const s = setup();
     expect(await s.input(":ult: with typo review")).toEqual({ action: "handled" });
     expect(s.editor).toBe(":ult: with typo review");
-    await s.command("with fable");
-    expect(s.sent).toEqual([]);
+    expect(await s.command("with fable")).toEqual({ action: "handled" });
     expect(s.entries).toEqual([]);
     expect(s.mode.getMode()).toBe("off");
     expect(s.model).toBe(sonnet);
@@ -207,8 +233,7 @@ describe("one-shot Ultracode", () => {
   test("authentication failure rolls back without sending task", async () => {
     const s = setup();
     s.setAuth(false);
-    await s.command("with fable review");
-    expect(s.sent).toEqual([]);
+    expect(await s.command("with fable review")).toEqual({ action: "handled" });
     expect(s.model).toBe(sonnet);
     expect(s.mode.getMode()).toBe("off");
     expect(s.entries.at(-1).data.active).toBe(false);
@@ -314,9 +339,8 @@ test("active-branch navigation recovers an interrupted one-shot", async () => {
 
 test("nested invocation cannot restore an override awaiting its first run", async () => {
   const s = setup();
-  await s.command("with fable first request");
-  await s.command("with external second request");
-  expect(s.sent).toEqual(["first request"]);
+  expect(await s.command("with fable first request")).toMatchObject({ text: "first request" });
+  expect(await s.command("with external second request")).toEqual({ action: "handled" });
   expect(s.model).toBe(fable);
   expect(s.mode.getMode()).toBe("deep");
   expect(await s.input(":ult: another request")).toEqual({ action: "handled" });
@@ -328,8 +352,7 @@ test("nested invocation cannot restore an override awaiting its first run", asyn
 test("a normal model must exist before a reversible one-shot", async () => {
   const s = setup();
   await s.pi.setModel(undefined);
-  await s.command("with fable review");
-  expect(s.sent).toEqual([]);
+  expect(await s.command("with fable review")).toEqual({ action: "handled" });
   expect(s.entries).toEqual([]);
   expect(s.notices.at(-1)).toContain("Select your normal model");
 });

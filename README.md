@@ -77,12 +77,12 @@ Press `Esc` to cancel a running workflow. In Pi's fullscreen TUI, use `Ctrl+Page
 Keep ordinary work on your normal model, and opt into deep mode for one request:
 
 ```text
-/ult review this change and verify the findings
+review this change and verify the findings :ult
 :ult: with opus investigate the cancellation race
-:ultracode: with anthropic/claude-opus-5 test the proposed design
+test the proposed design :ult with anthropic/claude-opus-5
 ```
 
-`/ult [with <model>] <task>` and the leading `:ult:` / `:ultracode:` markers temporarily select **deep** depth. The optional model selector switches the **main agent**, not just workflow children. Without it, the current model is retained; no expensive model is chosen implicitly.
+A `:ult` (or `:ult:`) marker anywhere in the message temporarily selects **deep** depth; the marker is removed and the rest of the message is the task. The optional model selector switches the **main agent**, not just workflow children. Without it, the current model is retained; no expensive model is chosen implicitly.
 
 Model names are resolved against Pi's authenticated available models. A unique match on the current provider takes priority; exact IDs beat partial matches within that provider. If there is no local match, a unique match on another provider is accepted. Ambiguous or unavailable names are rejected before work starts; use `provider/model-id` to disambiguate. Model IDs are not hardcoded.
 
@@ -90,7 +90,7 @@ The previous model, thinking level and depth are restored when the logical run *
 
 The selected model is a preference for substantive workflow children, not a forced override of every child. Cheap discovery/synthesis and explicit per-child models remain available. Deep depth still does not mandate delegation or increase the parent effort. Switching models may incur a cold prompt-cache charge for the existing conversation.
 
-Markers must lead the message; mentioning `:ult:` in prose does not trigger it. Inline invocations preserve attached images; slash-command arguments carry text only. If you explicitly change depth during the run, a non-deep selection is retained; reselecting the already-active deep depth is indistinguishable from the temporary mode and will still restore the previous depth.
+The marker must stand alone: punctuation, quotes and brackets may surround it, but `a:ult`, `:ult.ts` or `:ultra` do not count, and a marker inside backtick code spans or fenced blocks is ignored, so quoting it does not trigger it. A `with <model>` directly after a marker is the selector; the model id ends before trailing punctuation (`with opus,`). With several markers, all are removed and the first selector wins. Attached images are preserved. If you explicitly change depth during the run, a non-deep selection is retained; reselecting the already-active deep depth is indistinguishable from the temporary mode and will still restore the previous depth.
 
 ## Analysis depth
 
