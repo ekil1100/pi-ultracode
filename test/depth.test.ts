@@ -12,7 +12,13 @@ function harness(signal?: AbortSignal, jevAvailable = false) {
   const notifications: string[] = [];
   let activeTools = ["read"];
   const pi: any = {
-    on: (name: string, handler: any) => events.set(name, handler),
+    on: (name: string, handler: any) => {
+      const previous = events.get(name);
+      events.set(name, async (...args: any[]) => {
+        await previous?.(...args);
+        return handler(...args);
+      });
+    },
     registerCommand: (name: string, command: any) => commands.set(name, command),
     registerTool: () => {},
     registerFlag: () => {},

@@ -247,19 +247,20 @@ test("extension registers the workflow tool, commands, and flag", () => {
   );
   assert.equal(depthCompletions.includes("on"), false);
   assert.ok(state.commands.has("workflows"));
+  assert.equal(state.commands.has("ult"), false, "one-shot is a :ult marker, not a command");
   assert.ok(state.flags.has("ultracode"));
   assert.ok(state.shortcuts.has("f6"));
   assert.ok(state.events.has("session_start"));
   assert.ok(state.events.has("session_tree"));
   assert.equal(
     state.events.has("model_select"),
-    false,
-    "depth routing needs no model-change lifecycle handler",
+    true,
+    "one-shot restoration observes explicit model changes without changing depth routing",
   );
   assert.equal(
     state.events.has("thinking_level_select"),
-    false,
-    "parent effort remains user-controlled",
+    true,
+    "one-shot restoration preserves explicitly changed parent effort",
   );
   assert.ok(state.events.has("session_shutdown"));
   assert.ok(state.events.has("input"));
