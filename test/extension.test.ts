@@ -1,4 +1,5 @@
 import { test, vi } from "vite-plus/test";
+import { DEFAULT_SELECTOR_BACKEND } from "../src/selector-backend.ts";
 import assert from "node:assert/strict";
 import * as os from "node:os";
 import * as fs from "node:fs";
@@ -25,6 +26,8 @@ function extension(pi: any, extraDeps: Record<string, unknown> = {}): void {
   let defaultEnabled = false;
   ultracodeExtension(pi, {
     preferences: {
+      getSelectorBackend: () => ({ ...DEFAULT_SELECTOR_BACKEND }),
+      setSelectorBackend: () => {},
       getDefaultEnabled: () => defaultEnabled,
       setDefaultEnabled: (enabled: boolean) => {
         defaultEnabled = enabled;
@@ -233,6 +236,7 @@ test("extension registers the workflow tool, commands, and flag", () => {
     "default",
     "default on",
     "default off",
+    "model",
   ]);
   assert.deepEqual(
     state.commands
@@ -670,7 +674,13 @@ test("startup defaults respect saved modes across reload, resume, and fork", asy
   for (const reason of ["reload", "resume", "fork"]) {
     for (const mode of ["off", "focused", "standard", "deep", "auto"]) {
       const { pi, state } = makeMockPi();
-      extension(pi, { preferences: { getDefaultEnabled: () => true } });
+      extension(pi, {
+        preferences: {
+          getSelectorBackend: () => ({ ...DEFAULT_SELECTOR_BACKEND }),
+          setSelectorBackend: () => {},
+          getDefaultEnabled: () => true,
+        },
+      });
       state.entries.push({ type: "custom", customType: "ultracode-mode", data: { mode } });
       const { ctx } = makeCtx(state);
       await state.events.get("session_start")![0]({ reason }, ctx);
@@ -736,6 +746,8 @@ test("/ultracode default rejects invalid arguments and reports preference failur
   let writes = 0;
   extension(pi, {
     preferences: {
+      getSelectorBackend: () => ({ ...DEFAULT_SELECTOR_BACKEND }),
+      setSelectorBackend: () => {},
       getDefaultEnabled: () => {
         throw new Error("read failed");
       },
@@ -1306,9 +1318,17 @@ test("workflow tool forwards an explicit host child-effort fallback and injected
   const sessionDir = fs.mkdtempSync(path.join(os.tmpdir(), "uc-think-"));
   try {
     const modelRuntime = { marker: "shared-runtime", getModel: () => undefined };
-    let captured: { thinkingLevel?: string; modelRuntime?: unknown; projectTrusted?: boolean } = {};
+    const selectorBackend = { type: "chat", provider: "judge", id: "model" } as const;
+    let selectorReads = 0;
+    let captured: {
+      thinkingLevel?: string;
+      modelRuntime?: unknown;
+      projectTrusted?: boolean;
+      selectorBackend?: unknown;
+    } = {};
     const fakeRun = async (_script: string, options: any) => {
       captured.thinkingLevel = options.thinkingLevel;
+      captured.selectorBackend = options.selectorBackend;
       captured.modelRuntime = options.modelRuntime;
       captured.projectTrusted = options.projectTrusted;
       return {
@@ -1324,6 +1344,10 @@ test("workflow tool forwards an explicit host child-effort fallback and injected
     };
     const tool = createWorkflowTool({
       getThinkingLevel: () => "max",
+      getSelectorBackend: () => {
+        selectorReads++;
+        return selectorBackend;
+      },
       modelRuntime,
       runWorkflowFn: fakeRun as any,
     });
@@ -1343,6 +1367,8 @@ test("workflow tool forwards an explicit host child-effort fallback and injected
       "max",
       "explicit host fallback is forwarded to runWorkflow",
     );
+    assert.deepEqual(captured.selectorBackend, selectorBackend);
+    assert.equal(selectorReads, 1, "selector preference is captured once per workflow invocation");
     assert.equal(
       captured.modelRuntime,
       modelRuntime,

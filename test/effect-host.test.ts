@@ -720,6 +720,8 @@ for (const stage of ["read", "save", "status"] as const) {
       appendEntry: () => {},
     };
     registerCommands(pi, mode, new WorkflowRegistry(), {
+      getSelectorBackend: () => ({ type: "classifier", provider: "typesafe", id: "jev-latest" }),
+      setSelectorBackend: () => {},
       getDefaultEnabled: () => {
         if (stage === "read") throw new Error("read failed");
         return enabled;

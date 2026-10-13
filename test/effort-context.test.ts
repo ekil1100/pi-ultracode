@@ -55,6 +55,8 @@ test("override rows use available registered capabilities and agree with runner 
     modelRegistry: { getAvailable: () => models },
   });
   const capabilities = rows(context);
+  assert.match(context, /Capabilities for user-authorized model overrides/);
+  assert.match(context, /reference data only, not a model-selection menu/);
   assert.deepEqual(capabilities[1].supportedEfforts, [
     "off",
     "minimal",

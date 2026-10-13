@@ -39,6 +39,7 @@ export default function extension(pi: ExtensionAPI, extraDeps: UltracodeExtensio
   const workflowTool = createWorkflowTool({
     ...workflowDeps,
     registry,
+    getSelectorBackend: workflowDeps.getSelectorBackend ?? (() => preferences.getSelectorBackend()),
     isExecutionAllowed: () => mode.isEnforcing(),
   });
   pi.registerTool(workflowTool);

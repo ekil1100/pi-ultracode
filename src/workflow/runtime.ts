@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { Context, Deferred, Effect, Fiber, Queue, Result, Scope } from "effect";
 import type { JsonObject } from "@earendil-works/pi-ai";
 import { createJevBatch } from "../jev.ts";
+import type { SelectorBackend } from "../selector-backend.ts";
 import { parseWorkflowScript, type WorkflowMeta } from "./parser.ts";
 import { executeWorkflowScript, type ScriptExecutorHost } from "./script-executor.ts";
 import {
@@ -117,6 +118,8 @@ export interface WorkflowRunOptions {
   modelRuntime?: ModelRuntimeLike;
   model?: ModelLike;
   thinkingLevel?: ThinkingLevel;
+  /** Effort judge only; execution models remain unchanged. */
+  selectorBackend?: SelectorBackend;
   /** Inject a runner; scheduling-aware wrappers must declare supportsSchedulingHooks. */
   runner?: AgentRunner;
   journal?: RunJournal;
@@ -1222,7 +1225,12 @@ function initializeWorkflowRuntime(
   }
 
   function agentBatch(payloads: AgentPayload[]): Promise<unknown>[] {
-    const members = createJevBatch(payloads.length, workflowContext, childController.signal);
+    const members = createJevBatch(
+      payloads.length,
+      workflowContext,
+      childController.signal,
+      options.selectorBackend,
+    );
     return payloads.map((payload, index) => {
       // These fibers intentionally outlive a bounded drain if a native runner
       // ignores AbortSignal. Each owns its scope; the runtime tracks their exits.

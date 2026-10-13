@@ -36,6 +36,7 @@ import {
   runWorkflow,
   type WorkflowRunOptions,
 } from "./runtime.ts";
+import type { SelectorBackend } from "../selector-backend.ts";
 import type { AgentRunner, ModelRuntimeLike, ThinkingLevel } from "./agent-runner.ts";
 import { RunJournal, hashString, type JournalAgentRecord } from "./journal.ts";
 import { WorkflowRegistry } from "./registry.ts";
@@ -112,6 +113,8 @@ export interface WorkflowToolDeps {
    *  Each child session clamps it independently. A per-call `model: "X:level"`
    *  suffix or agentType `thinking:` override still wins. */
   getThinkingLevel?: () => ThinkingLevel | undefined;
+  /** Read once per workflow run so all batches use the same effort judge. */
+  getSelectorBackend?: () => SelectorBackend;
   /** Optional execution gate for mode-scoped registrations. Omit for standalone use. */
   isExecutionAllowed?: () => boolean;
   /** Test seam: inject a runner using the same scheduling contract as the runtime. */
@@ -628,6 +631,7 @@ function executeRun(run: ObservedWorkflow) {
         targetIdentity,
         signal: abort.controller.signal,
         thinkingLevel,
+        selectorBackend: deps.getSelectorBackend?.(),
         modelRegistry: ctx.modelRegistry as any,
         modelRuntime: deps.modelRuntime,
         model: ctx.model as any,

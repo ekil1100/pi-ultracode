@@ -63,6 +63,24 @@ test("effort selection avoids fixed defaults, keyword escalation, and mandatory 
   assert.doesNotMatch(policy, /high for substantive analysis or implementation/);
 });
 
+test("model inheritance is separate from effort selection and requires user authorization for overrides", () => {
+  assert.match(policy, /Inherit the current session's model for workflow children by default/);
+  assert.match(policy, /bare suffix such as model: ':high'/);
+  assert.match(
+    policy,
+    /only when the user explicitly requests it or explicitly authorizes model routing/,
+  );
+  assert.match(policy, /authorization requirement also applies to agentType model overrides/);
+  assert.match(
+    policy,
+    /capabilities describe supported effort levels, not permission to switch models/,
+  );
+  const guidelines = WORKFLOW_GUIDELINES.join("\n");
+  assert.match(guidelines, /For user-authorized model overrides, use exact provider\/model IDs/);
+  assert.match(guidelines, /model \(use a bare :level to set effort on the inherited model/);
+  assert.match(guidelines, /agentType .*check its model against the model-inheritance policy/);
+});
+
 test("all depth modes and workflow guidelines inject the same effort policy", () => {
   for (const line of WORKFLOW_EFFORT_GUIDELINES) {
     assert.equal(WORKFLOW_GUIDELINES.filter((entry) => entry === line).length, 1);
@@ -80,8 +98,9 @@ test("all depth modes and workflow guidelines inject the same effort policy", ()
   }
 });
 
-test("Jev policy uses native availability rather than an environment switch", () => {
-  assert.match(policy, /Pi reports typesafe\/jev-latest as an available classifier/);
-  assert.match(policy, /retained if Jev is unavailable or fails/);
+test("selector policy describes configurable judge and unavailable fallback", () => {
+  assert.match(policy, /configured by \/ultracode model/);
+  assert.match(policy, /default: typesafe\/jev-latest classifier/);
+  assert.match(policy, /retained if the selector is unavailable or fails/);
   assert.doesNotMatch(policy, /TYPESAFE_API_KEY/);
 });

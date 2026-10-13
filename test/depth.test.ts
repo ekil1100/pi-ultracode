@@ -1,4 +1,5 @@
 import { test, vi } from "vite-plus/test";
+import { DEFAULT_SELECTOR_BACKEND } from "../src/selector-backend.ts";
 import assert from "node:assert/strict";
 import extension from "../extensions/ultracode.ts";
 import { ANALYSIS_DEPTHS, DEPTH_CRITERIA, DEPTH_SELECTION_RULES } from "../src/depth.ts";
@@ -27,7 +28,14 @@ function harness(signal?: AbortSignal, jevAvailable = false) {
     appendEntry: (customType: string, data: unknown) =>
       entries.push({ type: "custom", customType, data }),
   };
-  extension(pi, { preferences: { getDefaultEnabled: () => false, setDefaultEnabled: () => {} } });
+  extension(pi, {
+    preferences: {
+      getSelectorBackend: () => ({ ...DEFAULT_SELECTOR_BACKEND }),
+      setSelectorBackend: () => {},
+      getDefaultEnabled: () => false,
+      setDefaultEnabled: () => {},
+    },
+  });
   const ctx: any = {
     cwd: process.cwd(),
     signal,

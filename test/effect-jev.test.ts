@@ -55,7 +55,7 @@ const response = (): ClassifierResult => ({
 function harness() {
   const available = vi.fn(() => Effect.runPromise(Effect.succeed([model])));
   const classify = vi.fn<JevRuntime["classify"]>(() => Effect.runPromise(Effect.sync(response)));
-  const runtime: JevRuntime = {
+  const runtime: Partial<JevRuntime> = {
     getAvailableOfType: available as JevRuntime["getAvailableOfType"],
     classify,
   };

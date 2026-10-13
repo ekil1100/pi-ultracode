@@ -33,7 +33,7 @@ export function workflowEffortContext(
     context.model
       ? `Default child: ${describe(context.model)}`
       : "Default child: unknown; Pi will resolve the child model at session creation.",
-    "Available model overrides (use exact provider/model identifiers; each row has its own supported efforts):",
+    "Capabilities for user-authorized model overrides (reference data only, not a model-selection menu; use exact provider/model identifiers):",
     ...(context.modelRegistry?.getAvailable() ?? []).map((model) => describe(model)),
     "An explicit agent model or agentType model uses that model's row, not the default child's efforts. Patterns resolve by exact provider/id, then exact id, then first substring match; unmatched patterns currently retain the default model. Prefer exact identifiers rather than relying on this fallback. Literal model IDs take priority over :level suffix parsing.",
     "Missing or unknown capability data is not evidence of support. Do not invent a supported set or borrow another model's levels; when capabilities are unknown, omit an automatic effort suffix and retain normal child configuration. An empty supportedEfforts list offers no selectable suffix. This snapshot does not change explicit user choices, parent effort, or no-suffix defaults.",
