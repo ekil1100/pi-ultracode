@@ -84,7 +84,7 @@ function harness(signal?: AbortSignal, jevAvailable = false) {
 }
 
 for (const jevAvailable of [false, true]) {
-  test(`auto uses parent routing regardless of native Jev availability: ${jevAvailable}`, async (t) => {
+  test(`auto uses parent routing regardless of native Jev availability: ${jevAvailable}`, async () => {
     const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
       throw new Error("Depth selection must not use the network");
     });
@@ -127,7 +127,7 @@ for (const jevAvailable of [false, true]) {
 }
 
 for (const mode of ["off", ...ANALYSIS_DEPTHS]) {
-  test(`${mode} never requests depth selection or overrides the fixed policy`, async (t) => {
+  test(`${mode} never requests depth selection or overrides the fixed policy`, async () => {
     const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
       throw new Error("Depth selection must not use the network");
     });

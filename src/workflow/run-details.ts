@@ -151,21 +151,6 @@ interface InternalTask extends WorkflowTaskDetail {
   omittedLiveBytes: number;
 }
 
-function emptyUsage(): WorkflowTaskUsage {
-  return {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadTokens: 0,
-    cacheWriteTokens: 0,
-    totalTokens: 0,
-    cost: 0,
-    turns: 0,
-    toolUses: 0,
-    retries: 0,
-    compactions: 0,
-  };
-}
-
 export function normalizeTaskUsage(
   value: AgentUsage | Partial<WorkflowTaskUsage> | undefined,
 ): WorkflowTaskUsage {

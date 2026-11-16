@@ -502,7 +502,7 @@ async function pipelineImpl(callSite, items, ...stages) {
 }
 
 function copyDenseDataArray(value, label) {
-  const output = new Array(value.length);
+  const output = [];
   for (let index = 0; index < value.length; index++) {
     const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
     if (!descriptor || !Object.hasOwn(descriptor, "value")) {
@@ -569,7 +569,7 @@ function createExecutionScope(input) {
     reservationIds: Array.isArray(input.reservationIds) ? input.reservationIds : [],
     scopePath: typeof input.scopePath === "string" ? input.scopePath : "$",
     counters: Object.create(null),
-    loopIterations: { ...(input.loopIterations ?? {}) },
+    loopIterations: { ...input.loopIterations },
     orchestrationState: input.orchestrationState ?? { active: 0 },
   };
   Object.defineProperty(scope, "currentPhase", {
@@ -744,6 +744,7 @@ function trackOrchestration(promise) {
     record.observed = true;
   };
   return Object.freeze({
+    // oxlint-disable-next-line unicorn/no-thenable -- Await and promise assimilation must mark orchestration as observed to detect detached host work.
     then(onFulfilled, onRejected) {
       observe();
       return promise.then(onFulfilled, onRejected);

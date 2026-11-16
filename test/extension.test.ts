@@ -132,11 +132,14 @@ async function runPromptHooks(
   );
   const errors: unknown[] = [];
   runner.onError((error) => errors.push(error));
-  const result = await runner.emitBeforeAgentStart("test", undefined, {
-    cwd: process.cwd(),
-    customPrompt: base,
-    sections,
-  });
+  const result = await runner.emitBeforeAgentStart(
+    { messageType: "user", prompt: "test" },
+    {
+      cwd: process.cwd(),
+      customPrompt: base,
+      sections,
+    },
+  );
   assert.deepEqual(errors, [], "Pi must dispatch the prompt hooks without errors");
   assert.equal(
     result.systemPromptOptions.forceSystemPrompt,
@@ -2312,7 +2315,7 @@ test("workflow tool rejects invalid maxAgents before artifacts", async () => {
   }
 });
 
-test("Pi ExtensionRunner always injects parent depth routing without network requests", async (t) => {
+test("Pi ExtensionRunner always injects parent depth routing without network requests", async () => {
   const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
     throw new Error("Depth selection must not use the network");
   });

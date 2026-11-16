@@ -290,7 +290,7 @@ test("workflow child resources exclude ambient orchestrators without dropping or
         if (!tools) {
           const codemode = session.agent.state.tools.find((tool) => tool.name === "codemode")!;
           const args = {
-            code: 'console.log(await tools.read({ path: "AGENTS.md" })); console.log(typeof tools.workflow, typeof models);',
+            code: 'console.log(await tools.read({ path: "AGENTS.md" })); console.log("workflow" in tools, typeof models);',
           };
           session.agent.state.messages.push({
             role: "assistant",
@@ -313,7 +313,7 @@ test("workflow child resources exclude ambient orchestrators without dropping or
           });
           const result = await codemode.execute("codemode-probe", args);
           assert.match(JSON.stringify(result.content), /Project child context/);
-          assert.match(JSON.stringify(result.content), /undefined undefined/);
+          assert.match(JSON.stringify(result.content), /false undefined/);
         }
       } finally {
         session.dispose();

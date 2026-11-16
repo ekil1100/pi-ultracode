@@ -933,14 +933,11 @@ test("workflow overlay renders responsive task stats and routes navigation in re
   snapshot = recompute(snapshot);
   registry.register("wf_overlay", snapshot, () => {}, details);
 
-  let renders = 0;
   let closed = 0;
   const tui: any = {
     mode: "regular",
     terminal: { columns: 120, rows: 40 },
-    requestRender: () => {
-      renders++;
-    },
+    requestRender: () => {},
   };
   const component = new WorkflowOverlayComponent({
     tui,

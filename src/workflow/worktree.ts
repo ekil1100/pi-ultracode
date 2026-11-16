@@ -355,7 +355,6 @@ function buildRawTree(input: RawTreeInput): RawTreeResult {
   const trackedPathKeys = new Set(trackedPaths.keys());
   const entries = new Map<string, RawTreeEntry>();
   for (const base of baseEntries) {
-    const key = base.path.toString("base64");
     if (base.mode === "160000") {
       setRawTreeEntry(entries, base);
       continue;

@@ -21,12 +21,7 @@ import {
   WORKFLOW_PROMPT_SNIPPET,
   WORKFLOW_TOOL_DESCRIPTION,
 } from "../prompts.ts";
-import {
-  DISPLAY_INPUT_LIMIT,
-  redactCommand,
-  safeDisplayText,
-  safeTranscriptText,
-} from "./display-text.ts";
+import { DISPLAY_INPUT_LIMIT, safeDisplayText, safeTranscriptText } from "./display-text.ts";
 import { parseWorkflowScript, normalizeScript } from "./parser.ts";
 import {
   ABSOLUTE_MAX_AGENTS,

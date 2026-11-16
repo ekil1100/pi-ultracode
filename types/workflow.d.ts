@@ -116,7 +116,7 @@ declare global {
   function pipeline<TItem = unknown, TResult = string>(
     items: TItem[],
     ...stages: Array<
-      (previous: unknown | null, original: TItem, index: number) => TResult | Promise<TResult>
+      (previous: unknown, original: TItem, index: number) => TResult | Promise<TResult>
     >
   ): Promise<Array<Awaited<TResult> | null>>;
 

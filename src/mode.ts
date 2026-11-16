@@ -40,6 +40,7 @@ export interface ThinkingPreferenceStore {
 }
 
 /** Public constructor retained for Pi hosts; state and operations live in closures. */
+// oxlint-disable-next-line typescript/no-unsafe-declaration-merging -- The constructor installs every factory member with Object.assign, preserving closure-bound methods.
 export interface UltracodeMode extends ReturnType<typeof makeUltracodeMode> {}
 export class UltracodeMode {
   constructor(workflowToolName: string) {

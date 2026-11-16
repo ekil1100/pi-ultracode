@@ -296,7 +296,7 @@ for (const failure of [
   { reason: "non-error host failure" },
   undefined,
 ]) {
-  test(`event failure preserves exact rejection identity: ${String(failure)}`, () => {
+  test(`event failure preserves exact rejection identity: ${failure instanceof Error ? failure.message : JSON.stringify(failure)}`, () => {
     const h = start({
       log: () => {
         throw failure;
@@ -402,6 +402,7 @@ test("ordered host events and batch starts preserve independent RPC completion",
         Effect.tap(() =>
           Effect.sync(() => {
             expect(order).toEqual(["phase", "batch:slow,fast", "log"]);
+            // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
             expect(h.host.agent).not.toHaveBeenCalled();
             expect(h.worker.postMessage.mock.calls).toEqual([
               [{ type: "rpcResult", id: 2, ok: true, value: "fast-result" }],
@@ -482,6 +483,7 @@ test("large batches preserve each RPC outcome without waiting for a slow sibling
                     },
               );
             }
+            // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
             expect(h.host.agent).not.toHaveBeenCalled();
             slow.reject(undefined);
             return external(() =>
@@ -761,7 +763,7 @@ for (const responsive of [false, true]) {
       Effect.scoped(
         Effect.forEach(
           Array.from({ length: 6 }, (_, i) => i),
-          (i) =>
+          () =>
             Effect.suspend(() => {
               if (responsive) message(h.worker, { type: "heartbeat", checkpoints: 0 });
               return external(() => vi.advanceTimersByTimeAsync(25)).pipe(Effect.map(() => {}));

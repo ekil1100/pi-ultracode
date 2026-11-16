@@ -368,7 +368,7 @@ for (const stopReason of ["error", "aborted"] as const) {
   });
 }
 
-test("Jev missing classifier preserves effort without a request", async (t) => {
+test("Jev missing classifier preserves effort without a request", async () => {
   const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
     throw new Error("Unexpected request");
   });

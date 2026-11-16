@@ -90,6 +90,7 @@ for (const failure of [false, true]) {
     const primary = { reason: "original non-Error rejection" };
     let options!: WorkflowRunOptions;
     let updates = 0;
+    // oxlint-disable-next-line typescript/unbound-method -- Capture the original method and invoke it below with an explicit receiver via call.
     const closeDetails = WorkflowRunDetails.prototype.close;
     vi.spyOn(WorkflowRunDetails.prototype, "close").mockImplementation(function (
       this: WorkflowRunDetails,
@@ -511,7 +512,7 @@ for (const failure of [false, true]) {
       Effect.scoped(
         Effect.forEach(
           Array.from({ length: 2 }, (_, i) => i),
-          (i) =>
+          () =>
             Effect.suspend(() => {
               const opening = openWorkflowOverlay(ctx, registry);
               return (
@@ -584,6 +585,7 @@ test("mode constructor exposes closure-backed methods without changing parent ef
       throw new Error("parent effort must remain unchanged");
     },
   };
+  // oxlint-disable-next-line typescript/unbound-method -- Detached calls verify that the public mode methods retain their closure-backed state.
   const { enable, suspend, restore, getMode } = mode;
   enable(pi, "standard");
   assert.deepEqual(tools, ["read", "workflow"]);
@@ -646,7 +648,7 @@ test("rewritten implementation uses combinators without catch clauses", () => {
 });
 
 for (const primary of [undefined, { reason: "observer failure" }]) {
-  test(`synchronous update failure preserves identity and disables later updates: ${String(primary)}`, (t) => {
+  test(`synchronous update failure preserves identity and disables later updates: ${JSON.stringify(primary)}`, (t) => {
     const { ctx, registry, controller } = fixture(t);
     const update = vi.fn(() => {
       throw primary;

@@ -9,11 +9,12 @@ initTheme("dark", false);
 import { createWorkflowTool } from "../src/workflow/tool.ts";
 import { DISPLAY_INPUT_LIMIT } from "../src/workflow/display-text.ts";
 
-const theme = {
+const plainTheme = {
   fg: (_color: string, text: string) => text,
   bold: (text: string) => text,
   bg: (_color: string, text: string) => text,
-} as Theme;
+};
+const theme = plainTheme as Theme;
 
 const tool = createWorkflowTool();
 function render(
@@ -60,6 +61,7 @@ test("workflow separates highlighted source from partial and final status", () =
   assert.equal(tool.renderShell, "self");
   assert.ok(call instanceof Container);
   assert.ok(call.children[2] instanceof Box);
+  // oxlint-disable-next-line eslint/no-control-regex -- The assertion verifies that syntax highlighting emits ANSI escape sequences.
   assert.match(call.render(120).join("\n"), /\u001b\[/);
   const snapshot = createSnapshot({ name: "demo", description: "Demo" }, "test-run");
   for (const isPartial of [true, false]) {
@@ -110,7 +112,7 @@ test("workflow result panels retain pending, success and failure colors", () => 
   ] as const) {
     const colors: string[] = [];
     const panelTheme = {
-      ...theme,
+      ...plainTheme,
       bg: (color: string, text: string) => {
         colors.push(color);
         return text;

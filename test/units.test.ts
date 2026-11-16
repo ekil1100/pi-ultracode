@@ -78,9 +78,10 @@ test("workflow value limits bound args, schemas, patterns, and structured output
     /workflow args.*plain JSON/i,
   );
   assert.throws(() => assertWorkflowArgsLimit({ value: -0 }), /negative zero is unsupported/i);
+  // oxlint-disable-next-line unicorn/no-new-array -- Sparse holes are required to verify that workflow arguments reject sparse arrays.
   assert.throws(() => assertWorkflowArgsLimit(new Array(1_000_000)), /arrays must not be sparse/);
   assert.throws(
-    () => assertWorkflowArgsLimit(new Array(65_537).fill(null)),
+    () => assertWorkflowArgsLimit(Array.from({ length: 65_537 }, () => null)),
     /exceeds 65536 JSON nodes/,
   );
   let sharedDag: unknown = "x";
@@ -1270,7 +1271,7 @@ test("suspend quiesces tools and prompts without changing parent effort", async 
   m.suspend(api);
   assert.deepEqual(s.active, ["read"], "repeated suspend removes externally restored workflow");
   const event = { systemPromptOptions: { sections: { ultracode: "stale", other: "keep" } } };
-  assert.equal(await m.beforeAgentStart(event), undefined);
+  assert.equal(m.beforeAgentStart(event), undefined);
   assert.deepEqual(event.systemPromptOptions.sections, { other: "keep" });
 });
 

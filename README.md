@@ -29,7 +29,7 @@ pi --ultracode
 
 > `pi-ultracode` registers a tool named `workflow`. If `pi-dynamic-workflows` is installed, remove it first with `pi remove npm:pi-dynamic-workflows`.
 
-**Pi ≥ 0.99.1**
+**Pi ≥ 0.99.1 · Verified with Pi 1.5.2**
 
 ## Core features
 

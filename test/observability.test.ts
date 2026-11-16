@@ -346,6 +346,7 @@ test("renderWorkflowLines strips terminal controls and ignores deprecated stream
   const text = renderWorkflowLines(recompute(snap), { now, showStream: true }).join("\n");
   assert.match(text, /worker/);
   assert.doesNotMatch(text, /LATEST|oldold|┊/);
+  // oxlint-disable-next-line eslint/no-control-regex -- Security assertions must detect leaked terminal control characters.
   assert.doesNotMatch(text, /spoofed|tool-spoof|name-spoof|\u001b|\u0007|\[2J/);
 });
 
@@ -419,6 +420,7 @@ test("public rendering redacts snapshot fields even when callers bypass construc
     },
   ];
   const text = renderWorkflowLines(recompute(snap), { showResultPreviews: true }).join("\n");
+  // oxlint-disable-next-line eslint/no-control-regex -- Security assertions must detect leaked terminal control characters.
   assert.doesNotMatch(text, /logsecret|previewsecret|label-spoof|\u202E|\u001b|\u0007/);
   assert.match(text, /\*\*\*/);
 });
@@ -828,6 +830,7 @@ test("late activity cannot repopulate a failed workflow snapshot", async () => {
   assert.equal(final.agents[0].activeTools, undefined);
   assert.equal(final.agents[0].streamTail, undefined);
   assert.equal(notifications.length, 1);
+  // oxlint-disable-next-line eslint/no-control-regex -- Security assertions must detect leaked terminal control characters.
   assert.doesNotMatch(notifications[0], /error-spoof|\u001b|\u0007/);
   fs.rmSync(sessionDir, { recursive: true, force: true });
 });
@@ -1102,8 +1105,11 @@ test("workflow sanitizes names in notifications and rejects unsafe resume ids", 
 return await agent('p')`;
 
   const result = await tool.execute("tc-name", { script } as any, undefined, undefined, ctx);
+  // oxlint-disable-next-line eslint/no-control-regex -- Security assertions must detect leaked terminal control characters.
   assert.doesNotMatch(notifications[0], /name-spoof|\u001b|\u0007/);
+  // oxlint-disable-next-line eslint/no-control-regex -- Security assertions must detect leaked terminal control characters.
   assert.doesNotMatch((result.content[0] as any).text, /name-spoof|\u001b|\u0007/);
+  // oxlint-disable-next-line eslint/no-control-regex -- Security assertions must detect leaked terminal control characters.
   assert.doesNotMatch((result.details as any).name, /name-spoof|\u001b|\u0007/);
 
   await assert.rejects(

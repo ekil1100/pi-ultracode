@@ -148,6 +148,7 @@ interface WorkflowOverlayInput {
 }
 
 /** Pi and SDK consumers retain the public constructor and synchronous Component API. */
+// oxlint-disable-next-line typescript/no-unsafe-declaration-merging -- The constructor installs every factory member with Object.assign, preserving the public Component constructor.
 export interface WorkflowOverlayComponent extends ReturnType<typeof makeWorkflowOverlay> {}
 export class WorkflowOverlayComponent implements Component {
   constructor(input: WorkflowOverlayInput) {
@@ -406,7 +407,6 @@ function makeWorkflowOverlay({
 
   function renderRunSelector(width: number, height: number): string[] {
     const runs = registry.list();
-    const inner = width - 2;
     const content: string[] = [
       theme.fg("accent", theme.bold("Workflow runs")),
       theme.fg("dim", "↑↓ select · Enter open · Esc close"),
@@ -876,5 +876,9 @@ function formatDuration(ms: number): string {
 }
 
 function isPrintableInput(data: string): boolean {
-  return data.length > 0 && !data.includes("\u001b") && [...data].every((char) => char >= " ");
+  if (data.length === 0 || data.includes("\u001b")) return false;
+  for (const char of data) {
+    if (char < " ") return false;
+  }
+  return true;
 }

@@ -9,7 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ThinkingLevel } from "./agent-runner.ts";
-import { DEFAULT_MAX_AGENTS, WorkflowPolicyError, normalizeMaxAgents } from "./admission.ts";
+import { WorkflowPolicyError, normalizeMaxAgents } from "./admission.ts";
 import {
   assertRegularArtifactFile,
   ensurePrivateArtifactDirectory,

@@ -217,8 +217,7 @@ test("Jev batch maps full prompts, actual models, subsets and existing workflow 
       if (index === 0) await lastInitialized.promise;
       if (index === 2) lastInitialized.resolve();
     },
-    respond: (request) =>
-      Response.json({ answers: { task_1: choice("medium"), task_0: choice("low") } }),
+    respond: () => Response.json({ answers: { task_1: choice("medium"), task_0: choice("low") } }),
   });
   const longPrompt = `Known upstream result: verified invariant. ${"full prompt ".repeat(2000)}`;
   const script = `export const meta = {

@@ -130,7 +130,7 @@ export interface ModelRegistryLike extends Partial<JevRuntime> {
   getRegisteredProviderIds?(): readonly string[];
   getRegisteredProviderConfig?(provider: string): unknown;
   /** Pi 0.81+ complete provider registration, distinct from legacy config providers. */
-  getRegisteredNativeProvider?(provider: string): any | undefined;
+  getRegisteredNativeProvider?(provider: string): any;
   getProviderAuthStatus?(provider: string): {
     configured: boolean;
     source?: string;

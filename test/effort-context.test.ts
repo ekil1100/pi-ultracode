@@ -154,7 +154,7 @@ test("capability snapshot refreshes registry contents without remote discovery",
   assert.equal(rows(workflowEffortContext(context)).length, 1);
 });
 
-test("three-level parent suffixes execute unchanged without an available classifier", async (t) => {
+test("three-level parent suffixes execute unchanged without an available classifier", async () => {
   const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => {
     throw new Error("Unexpected request");
   });

@@ -360,7 +360,9 @@ for (const property of [
           Effect.map((result) => {
             expect(result).toEqual({ ok: false, error: primary });
             if (!result.ok) expect(result.error).toBe(primary);
+            // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
             expect(h.session.dispose).toHaveBeenCalledTimes(1);
+            // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
             expect(h.session.prompt).not.toHaveBeenCalled();
             expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
           }),
@@ -436,7 +438,9 @@ for (const stage of ["select", "set-effort", "permit", "subscribe"] as const) {
           Effect.map((result) => {
             if (result.ok) throw new Error("Expected setup failure");
             expect(result.error).toBe(primary);
+            // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
             expect(h.session.dispose).toHaveBeenCalledTimes(1);
+            // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
             expect(h.session.prompt).not.toHaveBeenCalled();
             expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
           }),
@@ -455,7 +459,7 @@ for (const primary of [
     cause: new Error("Provider failed"),
   }),
 ]) {
-  test(`SDK rejection identity survives failing finalizers: ${String(primary)}`, () =>
+  test(`SDK rejection identity survives failing finalizers: ${primary instanceof Error ? primary.message : JSON.stringify(primary)}`, () =>
     Effect.runPromise(
       Effect.suspend(() => {
         const unsub = vi.fn(() => {
@@ -578,6 +582,7 @@ for (const first of ["prompt", "abort"] as const) {
                   ok: false,
                   error: { message: "Subagent was aborted" },
                 });
+                // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
                 expect(h.session.abort).toHaveBeenCalledTimes(1);
                 expect(h.events).toEqual(["subscribe", "unsubscribe", "dispose"]);
                 expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
@@ -625,6 +630,7 @@ test("an abort during async preflight keeps the session alive and blocks streami
             Effect.andThen(nextTurn),
             Effect.tap(() =>
               Effect.sync(() => {
+                // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
                 expect(h.session.dispose).not.toHaveBeenCalled();
               }).pipe(Effect.andThen(gate.resolve(undefined))),
             ),
@@ -635,6 +641,7 @@ test("an abort during async preflight keeps the session alive and blocks streami
                 error: { message: "Subagent was aborted" },
               });
               expect(stream).not.toHaveBeenCalled();
+              // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
               expect(h.session.dispose).toHaveBeenCalledTimes(1);
             }),
           ),
@@ -705,8 +712,11 @@ for (const stage of ["selection", "permit", "model-resolved", "subscription"] as
         ).pipe(
           Effect.map((result) => {
             expect(result).toMatchObject({ ok: false, error: { message: "Subagent was aborted" } });
+            // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
             expect(h.session.prompt).not.toHaveBeenCalled();
+            // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
             expect(h.session.abort).toHaveBeenCalledTimes(1);
+            // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
             expect(h.session.dispose).toHaveBeenCalledTimes(1);
             expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
           }),
@@ -802,6 +812,7 @@ test("a cancelled initialization waiter detaches while another joins the shared 
             Effect.map((survived) => {
               expect(survived).toMatchObject({ value: "done" });
               expect(create).toHaveBeenCalledTimes(1);
+              // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
               expect(h.session.dispose).toHaveBeenCalledTimes(1);
             }),
           ),
@@ -859,6 +870,7 @@ test("shared initialization preserves error identity for all waiters and retries
         Effect.andThen(h.run()),
         Effect.map(() => {
           expect(creates).toBe(2);
+          // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
           expect(h.session.dispose).toHaveBeenCalledTimes(1);
         }),
       );
@@ -899,6 +911,7 @@ test("a shared initialization failure after its only waiter cancels does not poi
             Effect.andThen(() =>
               Effect.sync(() => {
                 expect(creates).toBe(2);
+                // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
                 expect(h.session.dispose).toHaveBeenCalledTimes(1);
               }),
             ),
@@ -996,6 +1009,7 @@ test("cancellation telemetry includes final usage emitted during abort teardown"
                 usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10, cost: 0.5, turns: 1 },
               });
               expect(listener).toBeUndefined();
+              // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
               expect(h.session.dispose).toHaveBeenCalledTimes(1);
             }),
           ),
@@ -1084,6 +1098,7 @@ for (const malformed of [false, true]) {
               value: "done",
               usage: { inputTokens: 7, outputTokens: 3, totalTokens: 10, cost: 0.5, turns: 1 },
             });
+            // oxlint-disable-next-line typescript/unbound-method -- Mock assertions inspect the original function reference without invoking it.
             expect(h.session.dispose).toHaveBeenCalledTimes(1);
           }),
         );
